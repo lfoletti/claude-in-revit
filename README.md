@@ -1,14 +1,17 @@
 ```
- ██████ ██       █████  ██    ██ ██████  ███████     ██ ███    ██     ██████  ███████ ██    ██ ██ ████████ 
-██      ██      ██   ██ ██    ██ ██   ██ ██          ██ ████   ██     ██   ██ ██      ██    ██ ██    ██    
-██      ██      ███████ ██    ██ ██   ██ █████       ██ ██ ██  ██     ██████  █████   ██    ██ ██    ██    
-██      ██      ██   ██ ██    ██ ██   ██ ██          ██ ██  ██ ██     ██   ██ ██       ██  ██  ██    ██    
- ██████ ███████ ██   ██  ██████  ██████  ███████     ██ ██   ████     ██   ██ ███████   ████   ██    ██  
+   ________                __        _                         _ __ 
+  / ____/ /___ ___  ______/ /__     (_)___     ________ _   __(_) /_
+ / /   / / __ `/ / / / __  / _ \   / / __ \   / ___/ _ \ | / / / __/
+/ /___/ / /_/ / /_/ / /_/ /  __/  / / / / /  / /  /  __/ |/ / / /_  
+\____/_/\__,_/\__,_/\__,_/\___/  /_/_/ /_/  /_/   \___/|___/_/\__/  
 ```                                                                    
 
 `claude-in-revit` est une extension PyRevit pensée moins comme un tool conversationnel sur l'API Revit que comme un point de rencontre entre le modèle BIM et des corpus externes — réglementations, typologies architecturales, références projet — compilés sous forme de graphes. L'agent les traverse pour produire des réponses qu'aucune macro ne sortirait : audits de conformité circonstanciés avec citations, croisements multi-corpus, programmes argumentés contre référentiel. Le LLM y agit moins en exécuteur qu'en *liant* entre BIM, règle métier et corpus de référence — les capacités d'orchestration des modèles récents (chaînage d'outils, raisonnement sur corpus longs) rendent possible cette approche aujourd'hui.
 
-Trois Knowledge Graphs s'intercalent entre l'agent et le modèle Revit. Le **KG projet** maintient l'état BIM courant en NetworkX, synchronisé atomiquement à chaque mutation (transaction Revit + mutation graphe en tout-ou-rien — aucune divergence silencieuse tolérée). Le **KG logiciel** introspecte le catalogue d'outils lui-même et route les prompts vers le bon sous-ensemble (tier-2 conditionnel), pour ne pas saturer le contexte quand le catalogue dépasse ~80 tools. Le **KG corpus** indexe les référentiels Markdown : seuils et règles vivent dans le corpus, pas dans le code — d'où la portabilité multi-juridictions et la traçabilité de chaque citation dans les rapports. Ces trois couches alimentent un *diff context* envoyé au LLM (changements depuis le tour N-2), combiné au prompt caching Anthropic.
+Trois Knowledge Graphs s'intercalent entre l'agent et le modèle Revit : 
+- Le **KG projet** maintient l'état BIM courant en NetworkX, synchronisé atomiquement à chaque mutation (transaction Revit + mutation graphe en tout-ou-rien — aucune divergence silencieuse tolérée);
+- Le **KG logiciel** introspecte le catalogue d'outils lui-même et route les prompts vers le bon sous-ensemble (tier-2 conditionnel), pour ne pas saturer le contexte quand le catalogue dépasse ~80 tools;
+- Le **KG corpus** indexe les référentiels Markdown : seuils et règles vivent dans le corpus, pas dans le code — d'où la portabilité multi-juridictions et la traçabilité de chaque citation dans les rapports. Ces trois couches alimentent un *diff context* envoyé au LLM (changements depuis le tour N-2), combiné au prompt caching Anthropic.
 
 ## Architecture
 
