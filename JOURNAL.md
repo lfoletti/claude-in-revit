@@ -18,7 +18,7 @@
 
 ### Contexte & objectif
 
-Repo en pré-implémentation : seul `revit-planmaker-design.md` (~940 lignes,
+Repo en pré-implémentation : seul `DESIGN.md` (~940 lignes,
 spec verrouillée §12) et un venv Python 3.13 existaient. Pas d'accès Revit
 avant demain. Décision validée par l'utilisateur : **construire un slice
 vertical bout-en-bout avec Revit stubbé**, plutôt que de bétonner le schéma
@@ -43,7 +43,7 @@ Validées avec l'utilisateur via deux questions ciblées en début de session :
    pas de `match/case`, pas de `X | Y` (PEP 604), pas de `Self`, pas de
    `list[int]` direct (utiliser `typing.List[int]`).
 2. **Clé API via env var `ANTHROPIC_API_KEY`** pour le slice. Le câblage
-   `~/.config/planmaker/api_key` (§8 du design doc) viendra avec
+   `~/.config/claude-in-revit/api_key` (§8 du design doc) viendra avec
    `config.py` en Semaine 1 du V0.
 
 Choix techniques implicites :
@@ -51,7 +51,7 @@ Choix techniques implicites :
 - **Boucle multi-turn manuelle** plutôt que `client.beta.messages.tool_runner()`.
   Le dispatcher mute le KG dans une `kg.transaction()` atomique entre
   chaque tool call ; on veut la visibilité totale, pas un blackbox.
-- **Layout repo flat** : pas de `claude-planmaker.extension/` tant que pas
+- **Layout repo flat** : pas de `claude-in-revit.extension/` tant que pas
   d'accès Revit. `lib/` à la racine, importable à la fois par PyRevit
   (qui auto-injecte `lib/` dans `sys.path`) et par le harnais CLI local.
 - **Modèle par défaut Sonnet 4.6** (cohérent avec §3 du design doc).
@@ -379,9 +379,9 @@ réel via PyRevit) une fois l'accès Revit confirmé.
   bons tools sur des prompts type « crée un mur de 5m sur le RDC ».
 - Récupérer la version PyRevit / CPython3 demain et lever
   l'interdiction des features 3.10+ si possible.
-- Bootstrapper l'extension PyRevit (`claude-planmaker.extension/.tab/.panel/.pushbutton`)
+- Bootstrapper l'extension PyRevit (`claude-in-revit.extension/.tab/.panel/.pushbutton`)
   une fois l'accès Revit confirmé, en réutilisant `lib/` tel quel.
-- Ajouter `config.py` (clé API depuis `~/.config/planmaker/api_key`,
+- Ajouter `config.py` (clé API depuis `~/.config/claude-in-revit/api_key`,
   fallback env var).
 - Ajouter `kg_sync.py` (full re-scan Revit → reconstruct KG) +
   `revit_primitives.py` (transactions, lookups, conversions unités) +

@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "revit-planmaker"
+name = "claude-in-revit"
 version = "0.0.1"
 description = "Conversational LLM agent integrated with Autodesk Revit via PyRevit"
 requires-python = ">=3.8"

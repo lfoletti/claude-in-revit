@@ -179,7 +179,7 @@ doc = revit.doc
 uidoc = revit.uidoc
 ```
 **Doc pyRevit** : https://docs.pyrevitlabs.io/reference/pyrevit/
-**Gotcha** : `__revit__` n'existe que dans un script lancé par pyRevit. Pour les tests unitaires hors Revit, mocker via `lib/revit_planmaker/binding/_revit_stub.py`.
+**Gotcha** : `__revit__` n'existe que dans un script lancé par pyRevit. Pour les tests unitaires hors Revit, mocker via `lib/claude_in_revit/binding/_revit_stub.py`.
 
 ### `pyrevit.revit.Transaction` — context manager
 Wrapper qui appelle `Start` à l'entrée, `Commit` à la sortie, et **`RollBack` automatique sur exception**. C'est ce qu'on veut pour `@kg_synced`.

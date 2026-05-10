@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## État du repo
 
-Pré-implémentation. Aucun code à ce jour — uniquement `revit-planmaker-design.md` (document de conception vivant, ~940 lignes) et un venv Python 3.13. Le scaffolding suivra la structure décrite ci-dessous ; toute première contribution doit s'aligner sur le design doc avant d'inventer du code.
+Pré-implémentation. Aucun code à ce jour — uniquement `DESIGN.md` (document de conception vivant, ~940 lignes) et un venv Python 3.13. Le scaffolding suivra la structure décrite ci-dessous ; toute première contribution doit s'aligner sur le design doc avant d'inventer du code.
 
 ## Vision du produit
 
@@ -24,7 +24,7 @@ Huit use cases unifiés derrière ce même socle, dont UC8 (audit de conformité
 
 ```
 claude-in-revit.extension/
-├── claude-in-revit.tab/planmaker.panel/
+├── claude-in-revit.tab/agent.panel/
 │   ├── prompt.pushbutton/script.py        # UNIQUE entrée conversationnelle
 │   ├── globals.pushbutton/script.py
 │   └── refresh_kg.pushbutton/script.py
@@ -46,7 +46,7 @@ claude-in-revit.extension/
 ├── LLM.md / extension.json / README.md
 ```
 
-Pour le détail des sous-modules et de leurs responsabilités, voir `revit-planmaker-design.md` §3.
+Pour le détail des sous-modules et de leurs responsabilités, voir `DESIGN.md` §3.
 
 ## Concepts d'architecture à respecter
 
@@ -116,7 +116,7 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 
 ## Source de vérité
 
-`revit-planmaker-design.md` est le document vivant. Quand une décision d'implémentation diverge du doc, mettre à jour le doc dans le même commit (cf. note finale du doc). §11 liste les décisions ouvertes à trancher pendant le scaffolding ; §12 liste les décisions verrouillées.
+`DESIGN.md` est le document vivant. Quand une décision d'implémentation diverge du doc, mettre à jour le doc dans le même commit (cf. note finale du doc). §11 liste les décisions ouvertes à trancher pendant le scaffolding ; §12 liste les décisions verrouillées.
 
 ## Journal de développement
 

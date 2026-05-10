@@ -1,4 +1,4 @@
-# Revit Planmaker — Design Document
+# claude-in-revit — Design Document
 
 Agent LLM intégré à Autodesk Revit. L'utilisateur prompte en langage naturel,
 le LLM orchestre des outils Revit via tool use (Anthropic Claude API), produit
@@ -62,8 +62,8 @@ modèle de la KB réglementaire et §5 pour `compliance.py`.
 ### Entry point unique
 
 ```
-claude-planmaker.tab/
-└── planmaker.panel/
+claude-in-revit.tab/
+└── agent.panel/
     ├── prompt.pushbutton/        # UNIQUE entrée conversationnelle
     │   └── script.py
     ├── globals.pushbutton/       # config hors-LLM
@@ -79,9 +79,9 @@ reste de la logique est partagé.
 ### Arborescence complète
 
 ```
-claude-planmaker.extension/
-├── claude-planmaker.tab/
-│   └── planmaker.panel/
+claude-in-revit.extension/
+├── claude-in-revit.tab/
+│   └── agent.panel/
 │       ├── prompt.pushbutton/script.py
 │       ├── globals.pushbutton/script.py
 │       └── refresh_kg.pushbutton/script.py
@@ -98,7 +98,7 @@ claude-planmaker.extension/
 │   ├── revit_primitives.py    # transactions, lookups, conversions unités
 │   ├── context.py             # build context (KG queries + catalogue)
 │   ├── routing.py             # keyword routing tier-1 / tier-2
-│   ├── config.py              # ~/.config/planmaker/
+│   ├── config.py              # ~/.config/claude-in-revit/
 │   └── tools/
 │       ├── __init__.py        # auto-import + registry
 │       ├── input.py           # import_dwg, import_image, import_outline
@@ -186,8 +186,8 @@ historique action.
 - Resync : bouton `refresh_kg.pushbutton` ou tool `kg.refresh()`.
 
 **Persistence**
-- Local : `~/.config/planmaker/projects/<project_uuid>.kg.json`
-- Companion file : `<MonProjet>.planmaker.kg.json` à côté du `.rvt`, optionnel,
+- Local : `~/.config/claude-in-revit/projects/<project_uuid>.kg.json`
+- Companion file : `<MonProjet>.claude-in-revit.kg.json` à côté du `.rvt`, optionnel,
   pour partage entre collaborateurs.
 - Format JSON, compact mais lisible (debug facile).
 - Écriture après chaque action (= chaque modification du KG).
@@ -281,7 +281,7 @@ source: https://...     # URL ou référence papier
   - Tag `scope:` en début de section pour scope plus fin que le front-matter.
 
 **Localisation**
-- Globale : `~/.config/planmaker/compliance/<corpus_id>/*.md`
+- Globale : `~/.config/claude-in-revit/compliance/<corpus_id>/*.md`
 - Companion projet : `<MonProjet>.compliance/` à côté du `.rvt` pour les
   corpus spécifiques au site (ex : règlement communal applicable).
 - Au chargement, fusion globale + companion. Companion gagne en cas de
@@ -291,7 +291,7 @@ source: https://...     # URL ou référence papier
 - Table `règle_id → {scope, mots-clés, hash}`.
 - Mots-clés extraits du titre + premier paragraphe (V0). Embeddings
   vectoriels (V1+ si corpus > ~50 K tokens).
-- Persisté dans `~/.config/planmaker/compliance/.index.json`, invalidé
+- Persisté dans `~/.config/claude-in-revit/compliance/.index.json`, invalidé
   par hash.
 
 **Stratégie d'accès**
@@ -745,7 +745,7 @@ Heuristique sur le prompt avant appel :
 ### Hiérarchie des fichiers de config
 
 ```
-~/.config/planmaker/
+~/.config/claude-in-revit/
 ├── api_key                        # clé Anthropic, chmod 600
 ├── config.json                    # globals (Wall Types par défaut, etc.)
 ├── context.md                     # historique conversations cross-projet
@@ -753,16 +753,16 @@ Heuristique sur le prompt avant appel :
 │   ├── <uuid>.kg.json             # KG projet par projet
 │   └── <uuid>.context.md          # historique conversation projet
 └── extensions/
-    └── claude-planmaker/          # cache de l'extension PyRevit
+    └── claude-in-revit/          # cache de l'extension PyRevit
 ```
 
 ### Identifiant projet
-- Tentative 1 : paramètre partagé Revit `planmaker.project_uuid` créé au
+- Tentative 1 : paramètre partagé Revit `claude-in-revit.project_uuid` créé au
   premier run.
 - Fallback : hash de `Document.PathName`.
 
 ### Companion file optionnel
-- `<MonProjet>.planmaker.kg.json` à côté du `.rvt`.
+- `<MonProjet>.claude-in-revit.kg.json` à côté du `.rvt`.
 - Permet de partager le KG entre collaborateurs (commit dans Git, par exemple).
 - Synchronisation : si companion existe et plus récent que cache local, on
   charge le companion.
@@ -926,7 +926,7 @@ Décisions formellement validées :
 
 À valider pour UC8 (compliance) :
 - ⏳ Format corpus : Markdown + front-matter YAML
-- ⏳ Localisation : `~/.config/planmaker/compliance/` + companion projet
+- ⏳ Localisation : `~/.config/claude-in-revit/compliance/` + companion projet
 - ⏳ V1 full-text + cache, V2 RAG (seuil ~30 K tokens à confirmer)
 - ✅ Audit hybride : primitives Python déterministes (familles principales) + fallback LLM (longue traîne), résultat marqué par `method_id` versionné
 - ✅ `ProjectContext` (singleton KG) en V1 + `Compartment.affectation` (V2) + `Room.use_subcategory` (V1 optionnel) : modèle hiérarchique du contexte projet, provenance par champ

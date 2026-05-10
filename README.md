@@ -10,7 +10,7 @@ Une seule entrée conversationnelle (`prompt.pushbutton`) — pas de dispatch UI
 
 ```
 claude-in-revit.extension/
-├── claude-in-revit.tab/planmaker.panel/
+├── claude-in-revit.tab/agent.panel/
 │   ├── prompt.pushbutton/         # unique entrée conversationnelle
 │   ├── globals.pushbutton/        # variables projet (affectation, juridiction…)
 │   └── refresh_kg.pushbutton/     # re-sync forcée KG ↔ Revit
@@ -44,7 +44,7 @@ Pipeline d'un tour : `routing.py` analyse le prompt et active les groupes tier-2
 
 Pré-implémentation. Le repo contient :
 
-- [`revit-planmaker-design.md`](revit-planmaker-design.md) — document de conception vivant (~940 lignes), source de vérité
+- [`DESIGN.md`](DESIGN.md) — document de conception vivant (~940 lignes), source de vérité
 - [`CLAUDE.md`](CLAUDE.md) — instructions de travail pour Claude Code
 - [`JOURNAL.md`](JOURNAL.md) — journal de développement daté (décisions, phases, bugs)
 - [`REVIT_API_NOTES.md`](REVIT_API_NOTES.md) — notes sur l'API Revit

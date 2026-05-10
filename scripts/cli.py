@@ -34,7 +34,7 @@ def bootstrap_kg(kg: ProjectKG) -> None:
 
 def build_system_prompt(kg: ProjectKG) -> str:
     return (
-        "You are a Revit planmaker assistant — slice prototype.\n\n"
+        "You are a claude-in-revit assistant — slice prototype.\n\n"
         "You operate on a project's Knowledge Graph (KG) via tools. The KG\n"
         "mirrors what would normally be Revit elements but stays in memory +\n"
         "JSON for now (no Revit binding in this slice).\n\n"
