@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dev artefacts
+*.log
+.env
+.env.local
+
+# Slice scratch data — local KG dumps from CLI runs
+scratch_kg/
+*.kg.json
+
+# Claude Code local settings (per-user permissions)
+.claude/settings.local.json
