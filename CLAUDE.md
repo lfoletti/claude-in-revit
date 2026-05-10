@@ -23,8 +23,8 @@ Huit use cases unifiés derrière ce même socle, dont UC8 (audit de conformité
 ## Arborescence cible (extension PyRevit)
 
 ```
-claude-planmaker.extension/
-├── claude-planmaker.tab/planmaker.panel/
+claude-in-revit.extension/
+├── claude-in-revit.tab/planmaker.panel/
 │   ├── prompt.pushbutton/script.py        # UNIQUE entrée conversationnelle
 │   ├── globals.pushbutton/script.py
 │   └── refresh_kg.pushbutton/script.py
@@ -53,7 +53,7 @@ Pour le détail des sous-modules et de leurs responsabilités, voir `revit-planm
 Ces points sont des décisions formellement validées (§12 du design doc). Ne pas les remettre en cause sans raison explicite.
 
 ### 1. KG projet first-class dès V0
-- Maintenu en parallèle du modèle Revit, persisté en JSON dans `~/.config/planmaker/projects/<uuid>.kg.json` (+ companion file optionnel à côté du `.rvt`).
+- Maintenu en parallèle du modèle Revit, persisté en JSON dans `~/.config/claude-in-revit/projects/<uuid>.kg.json` (+ companion file optionnel à côté du `.rvt`).
 - **Idempotence/atomicité** : toute écriture passe par un décorateur `@kg_synced` qui ouvre la transaction Revit, mute Revit, mute KG, commit ; si l'un échoue, on rollback l'autre. Aucune divergence silencieuse tolérée.
 - Soft delete par défaut (flag `deleted_at_turn=N`), purge auto à 50 tours.
 - Historique granularité **par action**, pas par tour.
@@ -81,7 +81,7 @@ routing.py (analyse prompt → groupes tier-2)
 - Trim history après 3 tours (résumé compact des plus anciens).
 
 ### 5. UC8 — Audit de conformité (architecture hybride)
-- **Corpus** : fichiers Markdown + front-matter YAML (`id`, `title`, `jurisdiction`, `version`, `scope`, `source`). Stockage `~/.config/planmaker/compliance/<corpus_id>/` + companion projet possible.
+- **Corpus** : fichiers Markdown + front-matter YAML (`id`, `title`, `jurisdiction`, `version`, `scope`, `source`). Stockage `~/.config/claude-in-revit/compliance/<corpus_id>/` + companion projet possible.
 - **Hybride** : primitives Python déterministes (familles principales, `method_id` versionné `_vN`) + fallback LLM signalé `method: "llm_inferred_v1"` (moindre confiance). Les seuils viennent du corpus, pas du code (portabilité multi-juridictions).
 - **`ProjectContext`** (singleton du KG, V1) + `Compartment.affectation` (V2) + `Room.use_subcategory` (V1, optionnel) : modèle de scope hiérarchique. Chaque champ a sa provenance (`source`, `confidence`, `set_at_turn`).
 - Chaque primitive déclare `requires_context=[...]` ; `compliance.audit()` calcule l'union et appelle `gather_context()` (interview ciblée) pour combler les gaps avant de tourner.
