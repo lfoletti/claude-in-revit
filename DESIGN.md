@@ -62,7 +62,7 @@ modèle de la KB réglementaire et §5 pour `compliance.py`.
 ### Entry point unique
 
 ```
-claude-in-revit.tab/
+LLM.tab/
 └── agent.panel/
     ├── prompt.pushbutton/        # UNIQUE entrée conversationnelle
     │   └── script.py
@@ -80,7 +80,7 @@ reste de la logique est partagé.
 
 ```
 claude-in-revit.extension/
-├── claude-in-revit.tab/
+├── LLM.tab/
 │   └── agent.panel/
 │       ├── prompt.pushbutton/script.py
 │       ├── globals.pushbutton/script.py

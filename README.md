@@ -13,7 +13,7 @@ Une seule entrée conversationnelle (`prompt.pushbutton`) — pas de dispatch UI
 
 ```
 claude-in-revit.extension/
-├── claude-in-revit.tab/agent.panel/
+├── LLM.tab/agent.panel/
 │   ├── prompt.pushbutton/         # unique entrée conversationnelle
 │   ├── globals.pushbutton/        # variables projet (affectation, juridiction…)
 │   └── refresh_kg.pushbutton/     # re-sync forcée KG ↔ Revit

@@ -5,7 +5,9 @@ Run from the repo root:
 or:
     python scripts/cli.py    # uses the path-fixup block below
 
-Requires ANTHROPIC_API_KEY in the environment.
+Requires an Anthropic API key, resolved by `lib.config.get_api_key()`:
+either `~/.config/claude-in-revit/api_key` (canonical) or the
+`ANTHROPIC_API_KEY` env var (fallback).
 """
 from __future__ import annotations
 
@@ -14,9 +16,13 @@ import sys
 from pathlib import Path
 
 # Allow `python scripts/cli.py` from repo root without `pip install -e .`.
+# `lib/` now lives inside the PyRevit extension bundle, so we insert that
+# directory (not the repo root) onto sys.path — mirrors what PyRevit does at
+# runtime, so the same `from lib import ...` imports resolve identically.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_LIB_HOST = _REPO_ROOT / "claude-in-revit.extension"
+if str(_LIB_HOST) not in sys.path:
+    sys.path.insert(0, str(_LIB_HOST))
 
 from lib.llm_api import LLMClient  # noqa: E402
 from lib.project_kg import ProjectKG  # noqa: E402

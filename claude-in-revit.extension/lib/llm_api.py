@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import anthropic
 
+from . import config
 from .llm_protocol import dispatch_tool_use, tools_as_anthropic_payload
 from .project_kg import ProjectKG
 
@@ -69,8 +70,10 @@ class LLMClient:
         thinking: str = "disabled",  # "disabled" | "adaptive"
         effort: Optional[str] = DEFAULT_EFFORT,
         max_iterations: int = 16,
+        api_key: Optional[str] = None,
     ) -> None:
-        self.client = anthropic.Anthropic()
+        resolved_key = api_key if api_key is not None else config.get_api_key()
+        self.client = anthropic.Anthropic(api_key=resolved_key)
         self.model = model
         self.max_tokens = max_tokens
         self.thinking = thinking

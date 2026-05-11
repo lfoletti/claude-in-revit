@@ -14,6 +14,446 @@
 
 ---
 
+## 2026-05-11 — Baseline versions + `lib/config.py`
+
+### Contexte & objectif
+
+Premier jour avec accès Revit/PyRevit, donc on lève l'incertitude de la
+décision #1 d'hier (compat 3.8 retenue par défaut) et on pose la première
+brique « infra » de la Semaine 1 V0 (§9 du design doc) : un loader de clé
+API propre, qui décale `lib/llm_api.py` d'une dépendance à `os.environ`
+vers le canal canonique `~/.config/claude-in-revit/api_key` (§8 du design
+doc).
+
+Repo fraîchement cloné sur ce poste — pas de venv hérité, à
+reprovisionner. Profil Windows corporate (`HOMEDRIVE=U:` redirigé vers
+`\\BAOI-FILES01`), traité en début de session côté `~/.gitconfig`
+(setx HOME=C:\Users\lauro + credential.helper=manager) — sans rapport
+direct avec ce repo mais nécessaire pour pousser ensuite.
+
+### Décisions
+
+1. **Baseline Python = 3.12** (au lieu de 3.8). Sondage local :
+   - Revit 2025 (25.0.2.419), PyRevit 5.0.0.25034 (Master), engine
+     DEFAULT 2712, **CPython 3.12.3** embarqué
+     (`bin/cengines/CPY3123/python.exe`, `python312.dll`).
+   - Venv locale construite avec Python 3.12.7 (Anaconda déjà
+     présent, détecté par `uv`).
+   - On lève l'auto-restriction du 2026-05-10 sur `match/case`,
+     `X | Y` (PEP 604), `Self`, `list[int]`, `tomllib`, exception
+     groups. `from __future__ import annotations` reste en place
+     dans les fichiers existants — pas de refactor cosmétique.
+   - `pyproject.toml` → `requires-python = ">=3.12"`.
+
+2. **Précédence API key : fichier puis env var**, validée par l'intuition
+   « fichier = état stable, env var = override ad hoc ». Le design doc
+   §8 traite le fichier comme canonique sans figer l'ordre ; en cas de
+   doute futur (CI, .env), l'env var permet l'override naturel sans
+   toucher au fichier — mais quand le fichier est posé il gagne.
+   *À reconsidérer* si quelqu'un veut un override env-var-first façon
+   Anthropic SDK natif.
+
+3. **`uv` comme outil de provisioning** (installé via winget,
+   user-scope). Détecte automatiquement les Python existants
+   (Anaconda 3.12.7 ici), zéro download. Le `pip install -e .[dev]`
+   passe par `uv pip install` mais le venv reste un venv standard
+   utilisable par `python -m pytest` ensuite — pas de lock-in.
+
+### Phase 1 — Versions baseline
+
+Fichiers modifiés :
+
+- `pyproject.toml` : `requires-python = ">=3.8"` → `>=3.12`.
+- `CLAUDE.md` :
+  - Section *État du repo* mise à jour : pré-impl → slice validé
+    (renvoi à l'entrée 2026-05-10).
+  - Section *Stack cible* : versions Revit 2025 / PyRevit 5.0 / engine
+    2712 / CPython 3.12.3 listées, paragraphe ajouté sur la baseline
+    Python 3.12 et la fenêtre de features autorisées (10-12).
+
+Pas de refactor des fichiers slice : le `from __future__ import
+annotations` est inoffensif et son retrait dans une session « versions »
+diluerait le diff. À traiter au cas par cas si nécessaire.
+
+### Phase 2 — `lib/config.py`
+
+**Objectif** : centraliser la résolution de la clé API et préparer
+l'accueil de `config.json`, `context.md`, `projects/`, `extensions/`
+(§8 du design doc) sans les implémenter tant que personne ne les
+consomme.
+
+Choix de design :
+
+- **Résolveurs en fonctions** (`config_dir()`, `api_key_file()`),
+  *pas* en constantes module-level. `Path.home()` est évalué à chaque
+  appel — testable via `monkeypatch.setattr(Path, "home", ...)` sans
+  toucher à `os.environ["HOME"]`, et robuste face à un éventuel
+  re-rooting de HOME en cours d'exécution (que PyRevit ne fait pas
+  aujourd'hui mais qui ne coûte rien à supporter).
+- **`ConfigError(RuntimeError)`** dédiée : la consigne est de
+  faire échouer la résolution avec un message actionnable
+  (chemin attendu + nom de la variable d'env), pas de laisser
+  `anthropic.AuthenticationError` partir en mi-tour.
+- **Fichier d'abord, env var ensuite** (décision 2 ci-dessus). Fichier
+  vide → erreur explicite (pas de fallback silencieux env var,
+  considéré comme bug de config).
+- **`.strip()`** systématique des deux côtés — un fichier collé depuis
+  le portal contient souvent une newline finale, un env var collé
+  depuis un copier-coller peut avoir des espaces accidentels.
+
+### Phase 3 — Intégration dans `LLMClient`
+
+- `lib/llm_api.py` : `LLMClient.__init__` reçoit un `api_key:
+  Optional[str] = None` ; si None, appel à `config.get_api_key()`.
+  La clé est passée explicitement à `anthropic.Anthropic(api_key=...)`
+  — préféré au pattern « set `os.environ` puis appeler `Anthropic()` »
+  qui dépose une variable d'env globale spookey.
+- `scripts/cli.py` : docstring mise à jour pour pointer vers les deux
+  canaux de résolution (fichier + env var). Aucun changement de
+  comportement à l'appel : `LLMClient()` continue de fonctionner.
+
+### Phase 4 — Tests
+
+`tests/test_config.py` (8 tests) :
+
+- Cas heureux : fichier présent → clé renvoyée ; whitespace strippé.
+- Fallback : fichier absent, env var posée → clé renvoyée.
+- Précédence : fichier + env tous deux posés → fichier gagne.
+- Erreurs : fichier vide (uniquement whitespace), tout absent, env var
+  vide / whitespace-only.
+- Sanity : `config_dir()` / `api_key_file()` pointent bien sous le
+  `fake_home` du fixture.
+
+Fixture `fake_home` autouse : `monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))`
+puis `monkeypatch.delenv(ENV_VAR_NAME, raising=False)` pour partir
+d'un état neutre. `_write_key()` helper crée la sous-arborescence
+`~/.config/claude-in-revit/` dans le tmp et y écrit le contenu
+demandé.
+
+### Validation
+
+- Venv reprovisionnée from scratch : `uv venv --python 3.12` →
+  Python 3.12.7 ; `uv pip install -e ".[dev]"` (anthropic, networkx,
+  pytest, pytest-mock + transitifs).
+- `pytest -v` → **35 passed en 3.32s** (27 anciens + 8 nouveaux,
+  aucun warning, aucun test cassé).
+- Pas de test live API ce coup-ci : `config.get_api_key()` est
+  trivial mécaniquement et le flow Anthropic a été validé hier.
+  À refaire dès qu'un changement touche `LLMClient.run_turn` ou le
+  payload tools.
+
+### Phase 5 — Bootstrap extension PyRevit (restructure)
+
+**Objectif** : passer du layout slice plat à la structure cible §3 du
+design doc, sans casser le harnais hors-Revit.
+
+Inventaire local d'abord, pour lever toute hypothèse :
+
+- Revit 2025 (25.0.2.419), pyRevit 5.0.0.25034 (Master), engine
+  DEFAULT 2712 (= IronPython 2.7.12), CPython 3.12.3 embarqué.
+- Le default engine est **IronPython 2.7** — il faut donc explicitement
+  flagger CPython sur nos scripts. Le canal officiel (lu dans
+  `extensions/pyRevitCore.extension/.../Settings.smartbutton/SettingsWindow.xaml`)
+  est le directive **`#! python3`** en première ligne du `script.py`.
+  Pas via `bundle.yaml` (qui n'accepte que `engine.persistent` et
+  `engine.full_frame`), ni via suffixe de dossier.
+
+Restructure faite :
+
+- `lib/` (à la racine) → `claude-in-revit.extension/lib/` via
+  `Move-Item`. Pas de `git mv` parce que `config.py` et
+  `tests/test_config.py` ne sont pas encore tracked ; git fera le
+  rename detection au commit via similarity index.
+- `claude-in-revit.extension/extension.json` : metadata standard
+  (`name`, `description`, `author`, `url`, `type: extension`,
+  `author_profile`). Calqué sur l'`extension.json` du `pyRevitCore`.
+- `claude-in-revit.extension/LLM.tab/agent.panel/`
+  (renommé en `LLM.tab` en fin de session pour un libellé d'onglet
+  court dans la ribbon Revit ; auparavant `claude-in-revit.tab`)
+  créé avec 3 `*.pushbutton/` (prompt, globals, refresh_kg). Chaque
+  pushbutton a un `bundle.yaml` (`title`, `tooltip`, `author`) et un
+  `script.py` shebang-flagué CPython.
+- `pyproject.toml` : `[tool.setuptools.packages.find].where =
+  ["claude-in-revit.extension"]` et
+  `[tool.pytest.ini_options].pythonpath = ["claude-in-revit.extension"]`
+  pour que le venv local trouve toujours `lib` comme package à la
+  même profondeur.
+- `scripts/cli.py` : le path-fixup pointe maintenant sur
+  `<repo>/claude-in-revit.extension/` (au lieu du repo root), pour
+  miroir exact du runtime pyRevit.
+
+`uv pip install -e ".[dev]"` rerun pour rafraîchir l'editable install
+après le move ; pytest → **35 passed** en 0.75s, aucun fichier touché
+dans `lib/` ou `tests/`.
+
+Enregistrement avec pyRevit :
+
+- `pyrevit extensions paths add C:\Users\lauro\Documents\IT\claude-in-revit`
+  (ajoute le repo comme search path, le scan trouvera l'extension
+  child). Réversible via `paths forget`.
+- `pyrevit env` confirme :
+  `claude-in-revit | Type: UIExtension | Repo: "" | Installed: "C:\Users\lauro\Documents\IT\claude-in-revit\claude-in-revit.extension"`.
+- `pyrevit extensions search claude-in-revit` retourne le match.
+
+### Phase 6 — Découverte : pyRevit met `lib/` sur sys.path, pas la racine
+
+Avant de promettre que `from lib import config` marche dans le
+pushbutton, plongée dans le source pyRevit. Deux fichiers décisifs :
+
+- `pyrevitlib/pyrevit/extensions/genericcomps.py:158-164` :
+  pour chaque composant (extension, tab, panel, pushbutton), si
+  `<comp>/lib/` existe, c'est *ce dossier-là* (pas le parent) qui est
+  ajouté à `module_paths`. Et `module_paths` est propagé vers tous les
+  sous-composants (lignes 445-462 — `add_module_path` itère sur les
+  enfants).
+- `pyrevitlib/pyrevit/loader/sessionmgr.py:562-588` :
+  les `sys_paths` du script runtime sont construits à partir de ces
+  `module_paths`. Pour un pushbutton, sys.path reçoit
+  `<extension>/lib/`, le `bin/` du composant si présent, et le
+  répertoire du pushbutton lui-même — **pas la racine de l'extension**.
+
+**Conséquence** :
+
+- `import config` (top-level) : OK (config.py est à la racine du
+  sys.path entry `<extension>/lib/`).
+- `from lib import config` : **KO** dans pyRevit (lib n'est pas un
+  package atteignable depuis sys.path).
+- `from .config import ...` (intra-`lib/`) : **KO** aussi (pas de
+  contexte de package pour les top-level modules de `lib/`).
+
+Notre code slice utilise *partout* `from .module import ...` et `from
+lib import ...` (tests, cli, et imports internes dans `llm_api.py`).
+Deux options évaluées :
+
+- **Path A** : refactor lib/ vers bare imports (10 fichiers touchés —
+  llm_api, llm_protocol, project_kg, tools/__init__, tools/*.py, tests,
+  cli, pyproject). Tests et pyRevit utilisent alors le même style.
+- **Path B** : fixup `sys.path.insert(0, <extension>)` au top du
+  `script.py` du pushbutton. 3 lignes par pushbutton, lib intact, tests
+  intacts. *Inconvénient* : nos tests locaux ne reflètent plus
+  exactement l'import-path pyRevit ; risque de petits bugs d'import qui
+  ne se voient qu'à l'exécution dans Revit.
+
+**Décision** : Path B pour ce soir, validé avec l'utilisateur. Path A
+restera ouvert comme dette à régler quand l'inconvénient devient
+réel. Le fixup est placé dans `prompt.pushbutton/script.py` (le seul
+qui importe de `lib/` aujourd'hui) ; `globals.pushbutton` et
+`refresh_kg.pushbutton` n'en ont pas besoin tant qu'ils sont stubs
+(YAGNI). Quand ils consommeront `lib/`, on rajoutera le fixup.
+
+### Validation Phase 5-6
+
+- `pytest -q` après le move + reinstall editable → **35 passed** en
+  0.75s. Aucune régression.
+- `pyrevit extensions search claude-in-revit` → 1 match. `pyrevit env`
+  liste l'extension sous "Installed Extensions" avec type UIExtension
+  et chemin correct.
+
+### Phase 7 — Premier test runtime + bug `pyrevit.forms`
+
+Premier clic sur "Prompt" dans Revit 2025. L'extension est bien chargée
+(l'onglet et le bouton apparaissent, l'engine CPython est bien
+sélectionné — le traceback montre `PyRevitLabs.PyRevit.Runtime.CPythonEngine.Execute`).
+Le script tourne, mais plante immédiatement :
+
+```
+"pyrevit.forms" is not currently supported under CPython
+  File "...\pyrevit\forms\__init__.py", line 27
+  raise PyRevitCPythonNotSupported('pyrevit.forms')
+```
+
+**Cause racine** : `pyrevit.forms` est une couche IronPython qui utilise
+des composants .NET/WPF non portés sur CPython/PythonNet. C'est une
+limitation connue de pyRevit (pas un bug de notre code). Le bug est
+côté hypothèse — j'ai posé `from pyrevit import forms` par habitude
+slice CLI sans vérifier la compat CPython.
+
+**Fix** : tous les pushbuttons passent à `Autodesk.Revit.UI.TaskDialog`,
+qui est l'API Revit native, toujours accessible via PythonNet dans
+pyRevit. Plus de dépendance sur `pyrevit.forms`. À l'usage la signature
+est différente (`TaskDialog.Show(title, message)` au lieu de
+`forms.alert(message, title=)`), donc petit lift mais pas grave.
+
+**Côté positif du crash** : il confirme TROIS choses importantes du
+bootstrap, avant même que `lib.config` ne soit testé :
+
+1. L'extension est bien chargée par pyRevit (la ribbon a poussé).
+2. Le directive `#! python3` est honoré — c'est bien le CPython engine
+   qui exécute (sinon l'erreur aurait été un SyntaxError IronPython
+   sur nos f-strings ou type hints).
+3. Le `script.py` est trouvé et son contenu exécuté jusqu'à la ligne
+   25 (l'import qui a planté).
+
+Donc la mécanique « extension + CPython + chargement de script » est
+*validée par ce crash*. Le path-fixup `sys.path` et `lib.config` n'ont
+pas encore été exercés, mais c'était l'étape *après* l'import qui a
+échoué — la prochaine tentative ira plus loin.
+
+**Documentation** : trois conventions ajoutées dans `CLAUDE.md`
+("pyRevit pushbuttons — gotchas CPython") pour ne pas refaire la même
+erreur : `pyrevit.forms` interdit, path fixup obligatoire pour
+`lib.*`, shebang `#! python3` obligatoire en ligne 1.
+
+### Validation Phase 7
+
+Reclic "Prompt" après la mise à jour des trois `script.py` →
+**TaskDialog s'affiche correctement**, confirmation utilisateur en fin
+de session (*« effectivement c'est passé »*). La chaîne complète est
+donc validée bout-en-bout :
+
+- Extension chargée par pyRevit ✓
+- Engine CPython 3.12.3 sélectionné via `#! python3` ✓
+- Path fixup `sys.path` opérationnel, `from lib import config`
+  résout correctement depuis le pushbutton ✓
+- `lib.config.get_api_key()` lit bien
+  `C:\Users\lauro\.config\claude-in-revit\api_key` depuis le runtime
+  pyRevit ✓
+- `Autodesk.Revit.UI.TaskDialog` accessible sans `clr.AddReference`
+  préalable (pyRevit pre-load des assemblies Revit dans le CPython
+  embarqué) ✓
+
+Foulée renaming en clôture : l'onglet **`claude-in-revit.tab`** →
+**`LLM.tab`** (libellé court dans la ribbon). Pas d'autre impact que
+le changement de nom de dossier + propagation dans `CLAUDE.md`,
+`README.md`, `DESIGN.md`. À reloader côté Revit pour que le ribbon
+prenne le nouveau nom (Reload depuis la ribbon pyRevit ou redémarrer
+Revit).
+
+**Si futur crash** :
+
+- `ImportError` sur `Autodesk.Revit.UI` → pas vu en pratique
+  (l'assembly est pre-loaded par pyRevit), mais si ça arrivait il
+  faudrait un `import clr; clr.AddReference("RevitAPIUI")` avant.
+- `ImportError` sur `lib.config` → le path fixup est mal calé ;
+  inspecter `__file__` dans le script et recompter les niveaux de
+  `os.path.dirname`.
+- `ConfigError` → vérifier `~/.config/claude-in-revit/api_key`
+  (mais ça a été validé via `get_api_key()` dans le CLI plus tôt
+  dans la session, donc improbable).
+
+### Phase 8 — `lib/revit_primitives.py` (foundation)
+
+**Objectif** : poser la première brique Revit-API du V0 Semaine 1, sur
+laquelle s'appuieront `kg_sync.py` et la réécriture des tools fakes
+slice (`walls_create`, `catalog_list_*`) en tools Revit réels. Scope
+volontairement restreint pour éviter d'engloutir une session.
+
+Contenu :
+
+- **`transaction(doc, name)`** — context manager qui ouvre une
+  `Autodesk.Revit.DB.Transaction`, commit sur succès, rollback sur
+  exception (avec re-raise pour préserver la stack trace). Garde-fous
+  `HasStarted()` / `HasEnded()` contre les double-end states.
+- **Conversions d'unités** — `meters_to_internal()`,
+  `internal_to_meters()`, et les équivalents `sqm_*` pour les
+  surfaces. Utilisent **`UnitTypeId.Meters` / `SquareMeters`** (API
+  post-2022, ForgeTypeId style). Le vieux `DisplayUnitType` est
+  délibérément évité — déprécié depuis Revit 2022, à fortiori cassé
+  dans certains contextes 2024+.
+- **Collectors** — `collect_by_category()`,
+  `collect_types_by_category()` génériques + raccourcis `walls()`,
+  `wall_types()`, `levels()`. `list(...)` autour des collectors parce
+  que les `FilteredElementCollector` Revit sont des itérateurs one-shot
+  (re-itérer renvoie silencieusement zéro résultat — piège classique).
+- **`levels()` utilise `OfClass(Level)` et non `OfCategory(OST_Levels)`** :
+  le filter par catégorie n'a pas un comportement stable pour les
+  Levels en 2024+, alors que `OfClass` est documenté comme la voie
+  fiable.
+
+Choix de design :
+
+- **Module Revit-only** : imports `Autodesk.Revit.DB.*` au top-level,
+  sans try/except ni stubbing. Conséquence : le module n'est pas
+  importable depuis le venv local (pas de PythonNet, pas de Revit
+  assemblies). Pour les tests, on **n'importera pas ce module** — il
+  n'apparaîtra que dans les call paths déclenchés depuis un pushbutton.
+- **Pas de `clr.AddReference` explicite** : pyRevit pre-load les
+  assemblies Revit dans le CPython embarqué avant d'exécuter le script,
+  donc les `from Autodesk.Revit.DB import ...` résolvent
+  directement. Si on devait un jour exécuter du code hors pushbutton
+  (e.g. unit test sous Revit), il faudrait ajouter `clr.AddReference("RevitAPI")`.
+- **Retours bruts** : les collectors retournent des `Element` Revit,
+  pas des dicts. La conversion vers le schéma KG sera dans
+  `kg_sync.py` — séparation de responsabilités, on évite que ce
+  module connaisse le schéma du graphe.
+
+### Validation Phase 8
+
+- `pytest -q` → **35 passed** en 0.76s. Le nouveau module n'est
+  importé par aucun test (donc aucune `ImportError` due aux imports
+  Autodesk.Revit.DB hors-Revit) — confirmé par la pass clean.
+- Validation runtime à venir : sera exercée à la première utilisation
+  réelle dans `kg_sync.py` ou dans la réécriture de `walls_create`.
+
+### État final & reste à faire
+
+**Acquis cette session :**
+
+- Baseline Python 3.12 verrouillée et documentée ✓
+- `lib/config.py` : `get_api_key()`, `config_dir()`, `api_key_file()`,
+  `ConfigError` ✓
+- `LLMClient` autonome (plus de couplage implicite à `os.environ`) ✓
+- Venv reprovisionnée via `uv` (workflow `uv venv` + `uv pip install
+  -e .[dev]`) ✓
+- Structure cible extension PyRevit en place
+  (`claude-in-revit.extension/lib/` + `LLM.tab/agent.panel/` +
+  3 pushbuttons) ✓
+- Repo enregistré comme search path pyRevit ; sanity check « Prompt »
+  validée bout-en-bout dans Revit 2025 ✓
+- `lib/revit_primitives.py` : `transaction()` context manager, unit
+  conversions m↔feet & m²↔sqft, collectors walls/wall_types/levels ✓
+- 35 tests verts (avant le move, après le move, et après
+  revit_primitives.py) ✓
+
+**Dette créée :**
+
+- Path B pour l'import-path : fixup `sys.path` dans
+  `prompt.pushbutton/script.py`. À garder en tête si on ajoute un
+  nouveau pushbutton qui consomme `lib/` — il lui faut le même fixup.
+  Plus propre à terme : refactor `lib/` vers des bare imports
+  (Path A), mais reporté.
+
+**Reste pour la Semaine 1 V0 (§9 du design doc), dans l'ordre :**
+
+1. **`kg_sync.py` + décorateur `@kg_synced`** : full re-scan Revit →
+   reconstruction du KG projet, conversion `Element` → noeud KG
+   (`revit_primitives.py` retourne du brut, ce module fait le mapping
+   vers le schéma de `project_kg.py`). Le décorateur compose
+   `revit_primitives.transaction(doc, name)` et
+   `kg.transaction()` pour assurer l'atomicité §4.1 — rollback
+   symétrique des deux côtés si l'un des deux pète.
+2. **Réécriture des tools fakes en tools Revit réels** : `walls_create`,
+   `catalog_list_levels`, `catalog_list_wall_types`, etc. — en utilisant
+   `revit_primitives.*` + `@kg_synced`. Les tools slice restent
+   utilisables pour les tests hors-Revit ; à voir si on les garde
+   en parallèle ou si on injecte un fake-doc dans les tests.
+3. **Câbler le vrai flow LLM dans `prompt.pushbutton`** : prompt input
+   form (option simple : `Microsoft.VisualBasic.Interaction.InputBox`
+   via PythonNet — moche mais zéro dépendance ; option propre : WPF
+   custom). Persistance de l'historique de conversation entre clics
+   (CPython3 chaque clic = process neuf, donc disque obligatoire —
+   fichier dans `~/.config/claude-in-revit/projects/<uuid>.context.md`
+   §8).
+4. **Choix de l'identifiant projet** : §8 du design doc liste deux
+   options (paramètre partagé Revit `claude-in-revit.project_uuid`,
+   ou hash de `Document.PathName`). À trancher au moment de wirer la
+   persistance du KG dans le pushbutton.
+5. Petite dette laissée par 2026-05-10 : `ProjectKG.load(path)` ne
+   peuple pas `persist_path`. À fixer quand on touchera le module
+   pour les besoins de `kg_sync.py`.
+
+**Risques (§10 du design doc) :**
+
+- Le rollback symétrique Revit ↔ KG dans `@kg_synced` est *le* point
+  délicat de l'atomicité §4.1. Hier on a posé `kg.transaction()`
+  (snapshot deepcopy + restauration sur exception) ; côté Revit on
+  utilise les `Transaction` natives. La séquence « rollback Revit
+  d'abord, puis KG » vs. « KG d'abord, puis Revit » a des conséquences
+  différentes si la 2ᵉ rollback échoue — à documenter explicitement
+  dans le décorateur.
+
+---
+
 ## 2026-05-10 — Slice vertical V0 : KG + dispatcher + LLM end-to-end
 
 ### Contexte & objectif

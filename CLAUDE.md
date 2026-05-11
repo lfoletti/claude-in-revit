@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## État du repo
 
-Pré-implémentation. Aucun code à ce jour — uniquement `DESIGN.md` (document de conception vivant, ~940 lignes) et un venv Python 3.13. Le scaffolding suivra la structure décrite ci-dessous ; toute première contribution doit s'aligner sur le design doc avant d'inventer du code.
+Slice vertical hors-Revit validé (voir entrée 2026-05-10 de `JOURNAL.md`) : `lib/project_kg.py`, `lib/llm_protocol.py`, `lib/llm_api.py`, 5 tools tier-1 fakes, CLI REPL, 27 tests verts, test live Sonnet 4.6 OK. Source de vérité : `DESIGN.md` (~940 lignes). Toute nouvelle contribution doit s'aligner sur le design doc avant d'inventer du code.
 
 ## Vision du produit
 
@@ -14,17 +14,20 @@ Huit use cases unifiés derrière ce même socle, dont UC8 (audit de conformité
 
 ## Stack cible
 
-- **PyRevit** (CPython3, pas IronPython) — extension hébergeant les pushbuttons.
+- **Autodesk Revit 2025** (25.0.2.419).
+- **PyRevit 5.0.0.25034** (Master), engine DEFAULT 2712, **CPython 3.12.3** embarqué (`bin/cengines/CPY3123/`). CPython3, pas IronPython.
 - **Anthropic Claude API** via tool use ; Sonnet 4.6 par défaut, Haiku 4.5 pour triage des opérations triviales.
 - **NetworkX** pour les Knowledge Graphs en mémoire.
 - **ezdxf** pour parser DWG/DXF.
-- Python 3.13 dans `.venv/` (déjà provisionné).
+- Python 3.13 dans `.venv/` locale (outillage, tests hors-Revit).
+
+Baseline Python du projet : **≥ 3.12** (`pyproject.toml`). Features 3.10-3.12 autorisées : `match/case`, `X | Y` (PEP 604), `Self`, `list[int]` direct, `tomllib`, exception groups. La convention `from __future__ import annotations` reste utilisée dans les fichiers existants (sans contrainte sur les nouveaux).
 
 ## Arborescence cible (extension PyRevit)
 
 ```
 claude-in-revit.extension/
-├── claude-in-revit.tab/agent.panel/
+├── LLM.tab/agent.panel/
 │   ├── prompt.pushbutton/script.py        # UNIQUE entrée conversationnelle
 │   ├── globals.pushbutton/script.py
 │   └── refresh_kg.pushbutton/script.py
@@ -113,6 +116,12 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 - **Convention de nommage Revit** : Family Types préfixés `LLM_*` (ou `MUR_*`) pour faciliter le filtrage du catalogue. Mentionné comme risque/mitigation §10.
 - **Citations réglementaires** : format `<corpus_id>#<ancre>` (ex : `rcv-2024#hauteur-sous-plafond`, `aeai-2015#dpi-15-15-§3.2`). Toujours inclure `version` du corpus dans le rapport.
 - **Disclaimer audit UC8** : « assistance, pas validation réglementaire » — à inclure en tête de chaque rapport généré.
+
+### pyRevit pushbuttons — gotchas CPython
+
+- **`pyrevit.forms` est IronPython-only** : il lève `PyRevitCPythonNotSupported` sous CPython. Pour afficher un dialog depuis nos scripts (qui sont taggés `#! python3` → CPython 3.12), utiliser **`Autodesk.Revit.UI.TaskDialog`** directement (API Revit, disponible nativement via PythonNet dans pyRevit). Voir JOURNAL.md 2026-05-11 (bootstrap phase) pour le découvert.
+- **Path fixup `sys.path` requis dans `script.py`** quand on importe `lib.*` : pyRevit met `<extension>/lib/` sur sys.path mais pas la racine de l'extension. Sans le fixup, `from lib import config` échoue avec `ImportError`. Voir le préambule de `prompt.pushbutton/script.py` pour le template. Dette : refactor lib/ vers bare imports pour aligner local↔runtime (Path A du journal, reporté).
+- **Shebang `#! python3`** sur la ligne 1 de chaque `script.py` : sélectionne l'engine CPython au lieu du default IronPython 2.7. Sans ce directive, nos f-strings, type hints PEP 604, etc. partent en SyntaxError.
 
 ## Source de vérité
 

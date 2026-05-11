@@ -1,0 +1,8 @@
+{
+    "name": "claude-in-revit",
+    "description": "Conversational LLM agent integrated with Autodesk Revit. One prompt button, ~50 tools, project KG synced atomically with the BIM model.",
+    "author": "Lauro Foletti",
+    "author_profile": "https://github.com/lfoletti",
+    "url": "https://github.com/lfoletti/claude-in-revit",
+    "type": "extension"
+}
