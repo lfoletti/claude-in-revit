@@ -179,6 +179,119 @@ def test_dispatch_rolls_back_kg_on_tool_exception(tmp_path):
     assert kg.find_by_type("Level") == pre_levels
 
 
+def test_dispatch_passes_doc_to_doc_aware_tool():
+    captured = {}
+
+    @llm_protocol.tool(name="probe")
+    def probe(kg: ProjectKG, doc, msg: str) -> dict:
+        """Probe doc injection.
+
+        Args:
+            msg: any message
+        """
+        captured["doc"] = doc
+        captured["msg"] = msg
+        return {"got_doc_is_none": doc is None}
+
+    kg = ProjectKG("p")
+    sentinel = object()
+    result = llm_protocol.dispatch_tool_use(
+        tool_name="probe",
+        tool_input={"msg": "hi"},
+        tool_use_id="t1",
+        kg=kg,
+        doc=sentinel,
+    )
+    assert result["is_error"] is False
+    assert captured["doc"] is sentinel
+    assert captured["msg"] == "hi"
+
+
+def test_dispatch_does_not_inject_doc_into_kg_only_tool():
+    """A tool without `doc` in its signature receives only kg + user kwargs."""
+    @llm_protocol.tool(name="probe_kg_only")
+    def probe_kg_only(kg: ProjectKG, msg: str) -> dict:
+        """Probe.
+
+        Args:
+            msg: any message
+        """
+        return {"echoed": msg}
+
+    kg = ProjectKG("p")
+    # Caller may still pass doc — the dispatcher just ignores it for tools
+    # that don't declare it (no TypeError on unexpected kwarg).
+    result = llm_protocol.dispatch_tool_use(
+        tool_name="probe_kg_only",
+        tool_input={"msg": "hi"},
+        tool_use_id="t1",
+        kg=kg,
+        doc=object(),
+    )
+    assert result["is_error"] is False
+
+
+def test_doc_aware_tool_excludes_doc_from_schema():
+    """`doc` is a hidden context param like `kg` — never in input_schema."""
+    @llm_protocol.tool(name="doc_aware")
+    def doc_aware(kg: ProjectKG, doc, name: str) -> dict:
+        """A doc-aware tool.
+
+        Args:
+            name: a name
+        """
+        return {}
+
+    entry = llm_protocol._REGISTRY["doc_aware"]  # noqa: SLF001
+    schema = entry.input_schema
+    assert "doc" not in schema["properties"]
+    assert "kg" not in schema["properties"]
+    assert set(schema["properties"].keys()) == {"name"}
+
+
+def test_dispatch_error_content_is_compact_no_full_traceback():
+    """Failed tool calls used to dump a full traceback into
+    `content` (5K+ tokens for .NET exceptions). Now we ship only
+    `<ExceptionType>: <message>`, capped at ~400 chars."""
+    @llm_protocol.tool(name="explodes_loud")
+    def explodes_loud(kg: ProjectKG) -> dict:
+        """Just raises."""
+        raise RuntimeError("kaboom — details: " + "x" * 1000)
+
+    kg = ProjectKG("p")
+    result = llm_protocol.dispatch_tool_use(
+        tool_name="explodes_loud",
+        tool_input={},
+        tool_use_id="t1",
+        kg=kg,
+    )
+    assert result["is_error"] is True
+    content = result["content"]
+    # Type prefix retained.
+    assert content.startswith("RuntimeError:")
+    # No traceback — single line, no `File "..."` markers.
+    assert "Traceback" not in content
+    assert "File " not in content
+    # Length capped.
+    assert len(content) <= 500
+
+
+def test_dispatch_error_short_message_passes_through():
+    @llm_protocol.tool(name="explodes_short")
+    def explodes_short(kg: ProjectKG) -> dict:
+        """Just raises with a short message."""
+        raise ValueError("nope")
+
+    kg = ProjectKG("p")
+    result = llm_protocol.dispatch_tool_use(
+        tool_name="explodes_short",
+        tool_input={},
+        tool_use_id="t1",
+        kg=kg,
+    )
+    assert result["content"] == "ValueError: nope"
+
+
 def test_dispatch_serializes_non_string_results_via_json():
     @llm_protocol.tool(name="returns_dict")
     def returns_dict(kg: ProjectKG) -> dict:

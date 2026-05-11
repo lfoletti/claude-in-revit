@@ -34,6 +34,9 @@ from pathlib import Path
 CONFIG_SUBPATH = Path(".config") / "claude-in-revit"
 API_KEY_FILENAME = "api_key"
 ENV_VAR_NAME = "ANTHROPIC_API_KEY"
+PROJECTS_SUBDIR = "projects"
+KG_FILE_SUFFIX = ".kg.json"
+HISTORY_FILE_SUFFIX = ".history.json"
 
 
 class ConfigError(RuntimeError):
@@ -48,6 +51,33 @@ def config_dir() -> Path:
 def api_key_file() -> Path:
     """Return the path to the on-disk API key file."""
     return config_dir() / API_KEY_FILENAME
+
+
+def projects_dir() -> Path:
+    """Return `~/.config/claude-in-revit/projects/` (per-project KG cache).
+
+    Not auto-created here — `ProjectKG.persist()` materialises the parent
+    on first write via `mkdir(parents=True, exist_ok=True)`.
+    """
+    return config_dir() / PROJECTS_SUBDIR
+
+
+def kg_path_for(project_id: str) -> Path:
+    """Return the on-disk KG path for a given project_id."""
+    return projects_dir() / "{}{}".format(project_id, KG_FILE_SUFFIX)
+
+
+def history_path_for(project_id: str) -> Path:
+    """Return the on-disk Anthropic conversation history path.
+
+    Sits alongside the KG file: each click of `prompt.pushbutton` runs in
+    a fresh CPython process, so the conversation must be persisted to
+    disk to survive between turns (§8 of DESIGN.md mentions a
+    `.context.md` companion; for V0 we use a JSON sidecar that mirrors
+    the Anthropic `messages=` payload directly — Markdown rendering can
+    come later when we want human readability).
+    """
+    return projects_dir() / "{}{}".format(project_id, HISTORY_FILE_SUFFIX)
 
 
 def get_api_key() -> str:

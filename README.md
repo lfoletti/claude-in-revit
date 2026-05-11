@@ -34,6 +34,8 @@ claude-in-revit.extension/
 └── LLM.md                          # prompt système versionné
 ```
 
+Le CPython embarqué de pyRevit est une *distribution embeddable* : `python312._pth` désactive `site` par défaut, donc pas de `site-packages` ni de pip out-of-the-box, stdlib uniquement. Les dépendances runtime (`anthropic`, `networkx`, plus tard `ezdxf`, etc.) s'installent par un setup one-shot : décommenter `import site` dans `%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\python312._pth`, bootstrap pip via `get-pip.py`, puis `pip install …`. Détails de la procédure dans `CLAUDE.md` (§ « pyRevit pushbuttons — gotchas CPython »). Couvre nativement les wheels avec extensions C (`pydantic_core`, `jiter`), ce qui n'aurait pas été le cas d'un schéma de vendoring pure-Python.
+
 Pipeline d'un tour : `routing.py` analyse le prompt et active les groupes tier-2 nécessaires ; `context.py` compose le payload (KG diff depuis le tour N-2, catalogue filtré, tier-1 toujours chargé) ; `llm_api.py` appelle Anthropic en multi-turn tool use ; le dispatcher exécute les `tool_use` reçus en boucle jusqu'à `stop_reason="end_turn"`. Toute écriture passe par un décorateur `@kg_synced` qui ouvre une transaction Revit, mute Revit puis le KG, et rollback les deux si l'un échoue — aucune divergence silencieuse tolérée.
 
 ## Stack

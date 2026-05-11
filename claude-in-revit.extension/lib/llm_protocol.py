@@ -5,9 +5,15 @@ Tools live in `lib/tools/*.py`. Each is a plain function decorated with
 `Similar:`, `Args:`) and the type hints to build the JSON schema the Anthropic
 API expects in `tools=[...]`.
 
-Convention: a tool's first parameter is always `kg: ProjectKG` — passed by
-the dispatcher, hidden from the LLM-facing schema. Remaining parameters become
-the tool's input schema.
+Hidden context parameters (passed by the dispatcher, hidden from the
+LLM-facing schema):
+- `kg: ProjectKG` — required, must be the first parameter.
+- `doc` — optional second parameter for Revit-touching tools. If the tool
+  declares it, the dispatcher injects the live Revit `Document` (or `None`
+  when running hors-Revit, e.g. CLI / tests). Tools should branch on
+  `doc is None` to provide a KG-only fallback.
+
+Remaining parameters become the tool's `input_schema` for the API.
 """
 from __future__ import annotations
 
@@ -16,7 +22,6 @@ import json
 import re
 import sys
 import textwrap
-import traceback
 import typing
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -191,16 +196,19 @@ def tool(
                 )
             )
 
-        # Hidden context parameter — first positional, always `kg`. Skipped in
-        # the LLM-facing schema; injected by the dispatcher at call time.
-        ctx_param = params[0]
-        if ctx_param.name != "kg":
+        # Hidden context parameters — first must be `kg`, optional second
+        # is `doc` for Revit-touching tools. Both are skipped in the
+        # LLM-facing schema and injected by the dispatcher at call time.
+        if params[0].name != "kg":
             raise TypeError(
                 "Tool {} first param must be named 'kg' (got '{}')".format(
-                    tool_name, ctx_param.name
+                    tool_name, params[0].name
                 )
             )
-        user_params = params[1:]
+        if len(params) >= 2 and params[1].name == "doc":
+            user_params = params[2:]
+        else:
+            user_params = params[1:]
 
         # `from __future__ import annotations` (used everywhere in this repo)
         # turns annotations into strings; resolve them once via get_type_hints
@@ -304,11 +312,18 @@ def dispatch_tool_use(
     tool_input: Dict[str, Any],
     tool_use_id: str,
     kg: ProjectKG,
+    doc: Any = None,
 ) -> Dict[str, Any]:
     """Execute a tool_use and return a tool_result content block.
 
-    Mutations run inside `kg.transaction()` — any exception rolls the KG back
-    and surfaces an `is_error: true` result to the LLM.
+    Mutations run inside `kg.transaction()` — any exception rolls the KG
+    back and surfaces an `is_error: true` result to the LLM.
+
+    `doc` is passed only to tools that declared it as their second
+    parameter (after `kg`). Tools that don't declare `doc` keep their
+    pre-Revit signature and aren't affected. Callers running hors-Revit
+    (CLI, pytest) leave `doc=None` and Revit-aware tools take their
+    KG-only fallback branch.
     """
     registry = get_registry()
     entry = registry.get(tool_name)
@@ -320,9 +335,14 @@ def dispatch_tool_use(
             "is_error": True,
         }
 
+    call_kwargs: Dict[str, Any] = dict(tool_input)
+    call_kwargs["kg"] = kg
+    if "doc" in inspect.signature(entry.fn).parameters:
+        call_kwargs["doc"] = doc
+
     try:
         with kg.transaction():
-            result = entry.fn(kg=kg, **tool_input)
+            result = entry.fn(**call_kwargs)
         # Result must be JSON-serialisable. Tools should return dicts.
         return {
             "type": "tool_result",
@@ -334,8 +354,30 @@ def dispatch_tool_use(
         return {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
-            "content": "{}: {}\n{}".format(
-                type(e).__name__, str(e), traceback.format_exc(limit=3)
-            ),
+            "content": _compact_tool_error(e),
             "is_error": True,
         }
+
+
+_TOOL_ERROR_MAX_CHARS = 400
+
+
+def _compact_tool_error(exc: BaseException) -> str:
+    """Compact `tool_result.content` for an exception — type + truncated msg.
+
+    Why : .NET / PythonNet exceptions (the typical Revit-side failures)
+    have multi-line messages with namespaces and parameter dumps that
+    can easily push 5000+ tokens *per failed call*. Multiplied by N
+    retries × accumulated in the conversation history, this dominates
+    the per-turn token bill (saw 100 K input tokens after 2 retries
+    on 2026-05-11). The LLM doesn't need the full .NET trace to
+    correct course — exception type + first ~400 chars of the message
+    is enough.
+
+    The full traceback is still emitted to the pyRevit log via the
+    defensive shell in `prompt.pushbutton` for human debugging.
+    """
+    msg = str(exc)
+    if len(msg) > _TOOL_ERROR_MAX_CHARS:
+        msg = msg[:_TOOL_ERROR_MAX_CHARS] + "…[truncated]"
+    return "{}: {}".format(type(exc).__name__, msg)

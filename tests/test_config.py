@@ -70,3 +70,17 @@ def test_empty_env_is_treated_as_missing(fake_home, monkeypatch):
 def test_paths_resolve_under_fake_home(fake_home):
     assert config.config_dir() == fake_home / ".config" / "claude-in-revit"
     assert config.api_key_file() == fake_home / ".config" / "claude-in-revit" / "api_key"
+
+
+def test_projects_dir_resolves_under_fake_home(fake_home):
+    assert config.projects_dir() == fake_home / ".config" / "claude-in-revit" / "projects"
+
+
+def test_kg_path_for_appends_suffix(fake_home):
+    expected = fake_home / ".config" / "claude-in-revit" / "projects" / "abc123.kg.json"
+    assert config.kg_path_for("abc123") == expected
+
+
+def test_history_path_for_appends_suffix(fake_home):
+    expected = fake_home / ".config" / "claude-in-revit" / "projects" / "abc123.history.json"
+    assert config.history_path_for("abc123") == expected

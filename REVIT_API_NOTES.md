@@ -54,6 +54,7 @@ Itérateur filtré sur le modèle. Chainable : `.OfClass(typeof(Wall)).WhereElem
 - `OfCategory(BuiltInCategory.OST_Walls)` — filtre par catégorie BIM
 - `WhereElementIsNotElementType()` / `WhereElementIsElementType()` — séparer instances vs types
 **Gotcha** : un collector sans aucun filtre lance `InvalidOperationException` à l'itération.
+**Gotcha — classes API-only** : certaines classes (`ModelCurve`, `DetailCurve`, `AnnotationSymbol`, `SpatialElement`, ...) existent dans l'API mais pas dans le native object model — `OfClass(ModelCurve)` part en `ArgumentException` avec un message qui pointe vers la solution : « *Try using <ParentClass> instead, and then postprocessing* ». Pour `ModelCurve`/`DetailCurve`, le parent native est `CurveElement` ; collecter via `OfClass(CurveElement)` puis splitter via `isinstance(e, ModelCurve)` côté Python. Découvert 2026-05-11 (Phase 13 du journal session 2).
 
 ### `BuiltInCategory`
 Enum géant. Ceux qui nous concernent V0 : `OST_Walls`, `OST_Levels`, `OST_Doors`, `OST_Windows`, `OST_Rooms`, `OST_Floors`, `OST_StructuralColumns`.

@@ -44,9 +44,39 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
         "required": {"name", "total_thickness"},
         "optional": {"layers_summary"},
     },
+    # Architectural OR structural column (distinguished by `kind`).
+    # `position` is `[x, y]` in metres in the level plane; vertical
+    # placement is handled by the base level + a top offset = `height`.
+    "Column": {
+        "required": {"level_ref", "type_ref", "position", "height", "kind"},
+        "optional": set(),
+    },
+    # FamilySymbol of a column family, distinguished from generic family
+    # types so the agent doesn't confuse "Generic Column 200x200" with a
+    # door family. `kind` mirrors the host categories.
+    "ColumnType": {
+        "required": {"family_name", "type_name", "kind"},
+        "optional": set(),
+    },
     "FamilyType": {
         "required": {"family_name", "type_name"},
         "optional": {"dimensions"},
+    },
+    # 3D model lines (`Autodesk.Revit.DB.ModelCurve`). Useful as
+    # geometric anchors — "trace des murs sur ces lignes", "mesure
+    # cette ligne". V0 supports straight Line geometry only; arcs and
+    # splines are skipped during full_rescan.
+    "ModelLine": {
+        "required": {"p1", "p2", "length"},
+        "optional": set(),
+    },
+    # View-bound 2D detail lines (`Autodesk.Revit.DB.DetailCurve`).
+    # Stored without their view binding in V0 — the agent sees their
+    # endpoints but doesn't know which plan / section they live in.
+    # When `View` becomes a KG node type, we'll attach the link.
+    "DetailLine": {
+        "required": {"p1", "p2", "length"},
+        "optional": set(),
     },
 }
 
@@ -66,7 +96,12 @@ CREATED_AT = "created_at_turn"
 MODIFIED_AT = "modified_at_turn"  # list[int]
 DELETED_AT = "deleted_at_turn"    # int or None
 
-_RESERVED_ATTRS: Set[str] = {"_type", CREATED_AT, MODIFIED_AT, DELETED_AT}
+# Framework-managed attr posed by `kg_sync.bind()` after a Revit element is
+# created or rescanned. Set directly via `set_revit_id()`, not through
+# `add_node`/`modify_node` (bypasses schema validation).
+REVIT_ID = "_revit_id"            # int (long) or absent
+
+_RESERVED_ATTRS: Set[str] = {"_type", CREATED_AT, MODIFIED_AT, DELETED_AT, REVIT_ID}
 
 
 class ProjectKG:
@@ -186,6 +221,52 @@ class ProjectKG:
                 "Edge endpoints must exist: {} -> {}".format(src, dst)
             )
         self._g.add_edge(src, dst, key=edge_type, _type=edge_type, **attrs)
+
+    # ----- Revit binding -----------------------------------------------
+
+    def set_revit_id(self, llm_id: str, revit_id: int) -> None:
+        """Stamp a Revit ElementId.Value on a KG node.
+
+        Bypasses node-type schema validation: `_revit_id` is framework-managed,
+        not declared per node type. Persisted as part of `to_dict()`/`from_dict()`
+        roundtrip — see kg_sync.py for the trade-off note (Revit doc discourages
+        persisting ElementId between sessions; we rely on full_rescan at
+        session start to reconcile).
+        """
+        if llm_id not in self._g:
+            raise KeyError(llm_id)
+        self._g.nodes[llm_id][REVIT_ID] = int(revit_id)
+
+    def get_revit_id(self, llm_id: str) -> Optional[int]:
+        """Return the bound Revit ElementId.Value, or None if unbound."""
+        if llm_id not in self._g:
+            raise KeyError(llm_id)
+        return self._g.nodes[llm_id].get(REVIT_ID)
+
+    def find_by_revit_id(self, revit_id: int) -> Optional[str]:
+        """Reverse lookup: return the llm_id bound to a Revit ElementId.Value."""
+        target = int(revit_id)
+        for nid, attrs in self._g.nodes(data=True):
+            if attrs.get(REVIT_ID) == target:
+                return nid
+        return None
+
+    # ----- Topology reset (used by kg_sync.full_rescan) -----------------
+
+    def _clear_topology(self) -> None:
+        """Drop all nodes, edges, and llm_id counters.
+
+        Keeps `turn`, `action_log`, `project_id`, and `persist_path` intact —
+        the hybrid `full_rescan` semantics (decided 2026-05-11): node graph is
+        rebuilt from Revit, but the conversational timeline (turn counter +
+        history) stays continuous so `diff_since()` keeps working across a
+        mid-session refresh.
+
+        Callers should append a single `rescan` entry to the action log so
+        the timeline reflects the boundary.
+        """
+        self._g = nx.MultiDiGraph()
+        self._counters = {}
 
     # ----- Queries ------------------------------------------------------
 

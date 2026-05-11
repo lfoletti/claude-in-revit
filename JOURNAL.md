@@ -14,6 +14,860 @@
 
 ---
 
+## 2026-05-11 (session 2) — `kg_sync.py` + `@kg_synced` + extension de `project_kg`
+
+### Contexte & objectif
+
+Item #1 du « reste à faire » de la session 1 du jour : poser `kg_sync.py`,
+le morceau critique de la Semaine 1 V0 (§9 du design doc), qui fait le
+pont entre `revit_primitives.py` (collecteurs Revit bruts) et
+`project_kg.py` (schéma KG typé). Trois sous-livrables : binding KG ↔
+Revit, `full_rescan(doc, kg)`, décorateur `@kg_synced(name)` qui apparie
+les deux transactions §4.1.
+
+Pas de Revit ouvert cette session — toute la validation est faite hors
+process. Les chemins Revit-réels (`full_rescan` qui scrute le doc,
+`revit_id_of` qui construit un `ElementId`) sont exercés à la prochaine
+session quand on cliquera sur `refresh_kg.pushbutton`.
+
+### Décisions
+
+1. **`_revit_id` comme attr réservé du KG** (au même rang que `_type`,
+   `created_at_turn`, `deleted_at_turn`). Posé via `kg.set_revit_id(llm_id,
+   element_id)` qui **bypass la validation schéma** par node type, à
+   l'image de `soft_delete` qui pose `_deleted_at_turn` sans passer par
+   `modify_node`. Évite d'ajouter `revit_id` aux `optional` de chaque
+   entrée de `NODE_TYPES` (10+ types à terme — bruit de plomberie).
+   `_revit_id` ride along dans le roundtrip `to_dict`/`from_dict` sans
+   modif puisque les attrs nœud sont sérialisés génériquement.
+
+2. **`full_rescan` hybride** — choisi par l'utilisateur après proposition
+   en trois variantes. Vide nœuds/edges/counters, **garde `turn` et
+   `action_log`**. Justification : la timeline conversationnelle ne doit
+   pas être coupée par un refresh en milieu de session ; `diff_since()`
+   continue à fonctionner. Une seule entrée `rescan` est appendée au
+   log (vs N entrées `create` qui pollueraient pour rien).
+
+3. **Ordre des transactions imbriquées** : KG externe, Revit interne.
+   Justification : le snapshot KG est pris avant que Revit ne touche le
+   document. Sur exception, l'inner `revit_primitives.transaction`
+   rollback Revit en premier, puis l'outer `kg.transaction()` restore
+   le snapshot. La séquence inverse (Revit externe) laisserait une
+   fenêtre où `kg.persist()` peut écrire un état que Revit refuse ensuite
+   au commit.
+   *Drift résiduel accepté* : `kg.persist()` échoue après le commit
+   Revit — Revit a la donnée, le disque pas. Couvert par le bouton
+   `refresh_kg` (§10 mitigation KG drift), pas par du 2PC.
+
+4. **ElementId persisté dans le JSON** malgré la note REVIT_API_NOTES
+   « ne pas persister un ElementId entre sessions Revit ». Trade-off V0
+   conscient : `full_rescan` est idempotent → un mismatch session-vs-disque
+   est résolu en un clic refresh. Si le mismatch devient un problème
+   réel, ajout d'un session-id stamp + invalidation auto à charger ;
+   pas la peine d'over-engineer maintenant.
+
+5. **Lazy imports dans `kg_sync.py`** — top-level n'importe pas
+   `revit_primitives` ni `Autodesk.Revit.DB`. Chaque fonction
+   Revit-touching fait son `from . import revit_primitives as rp`
+   localement. Conséquence : le module est importable sous pytest, et
+   les tests sur `bind`/`llm_id_of`/`@kg_synced` peuvent
+   `monkeypatch.setitem(sys.modules, "lib.revit_primitives", stub)` au
+   lieu de devoir installer PythonNet + RevitAPI.dll.
+
+### Phase 1 — Extension de `project_kg.py`
+
+Trois ajouts :
+
+- `REVIT_ID = "_revit_id"` ajouté à `_RESERVED_ATTRS`.
+- `set_revit_id(llm_id, revit_id) / get_revit_id(llm_id) /
+  find_by_revit_id(revit_id)` posent et lisent directement
+  `node[REVIT_ID]`, KeyError si nœud inconnu, lookup linéaire O(N) sur
+  l'inverse (acceptable pour les tailles cibles, §10 risque NetworkX).
+- `_clear_topology()` privé pour `full_rescan` : reset
+  `_g = MultiDiGraph()` et `_counters = {}`, mais ne touche pas à
+  `_turn`, `_action_log`, `project_id`, `persist_path`. Sémantique
+  hybride décidée plus haut.
+
+### Phase 2 — `lib/kg_sync.py`
+
+Trois groupes :
+
+- **Helpers stateless** (`_extract_revit_id`, `bind`, `revit_id_of`,
+  `llm_id_of`). `_extract_revit_id` accepte `Element` (via `.Id`),
+  `ElementId` (via `.Value` ou `.IntegerValue` pre-2024), ou int brut.
+  C'est la couche qui couvre le breaking change 2024 sur ElementId
+  noté dans REVIT_API_NOTES — un seul endroit à mettre à jour si
+  on monte en version Revit ou si Autodesk recasse ce contrat.
+- **Convertisseurs Element → attrs** (`_level_to_attrs`,
+  `_wall_type_to_attrs`, `_wall_to_attrs`). Conversions m↔feet ici
+  pour que le KG ne voie jamais d'unités internes Revit. `_wall_to_attrs`
+  lit `WALL_USER_HEIGHT_PARAM` (cf. REVIT_API_NOTES § Phase 2) ; les
+  murs courbés tombent sur les endpoints de la chord (TODO documenté
+  pour la phase géométrie).
+- **`full_rescan(doc, kg)`** scanne dans l'ordre Level → WallType →
+  Wall (les Walls dépendent des deux premiers via `at_level` et
+  `is_type`). Les walls dont le `LevelId` ou le `WallType` n'est pas
+  mappable (lien externe, catégorie filtrée) sont **skip silencieusement**
+  plutôt que d'inventer des refs — quand on touchera l'UI on remontera
+  ces skip dans le summary.
+- **`@kg_synced(name_or_fn)`** supporte les deux formes (`@kg_synced` et
+  `@kg_synced("nom")`). Lazy import de `revit_primitives` *dans le
+  wrapper*, pas à la décoration, pour rester testable.
+
+### Phase 3 — Tests
+
+5 tests ajoutés à `tests/test_project_kg.py` : roundtrip
+`set/get_revit_id`, KeyError sur nœud inconnu, reverse lookup, survie
+persistence, `_clear_topology` qui préserve turn + log.
+
+10 tests dans `tests/test_kg_sync.py` :
+
+- 4 sur `_extract_revit_id` (int, ElementId via `.Value`, Element via
+  `.Id.Value`, fallback `.IntegerValue` pre-2024).
+- 2 sur `bind` + `llm_id_of` (accepte un objet Element-like, reverse
+  lookup retourne None si non-mappé).
+- 4 sur `@kg_synced` : commit/persist OK ; rollback symétrique sur
+  exception dans le body ; forme bare `@kg_synced` sans args (utilise
+  `fn.__name__`) ; commit-time failure (raised par la transaction Revit
+  mockée *après* le yield) ⇒ KG snapshot quand même restauré.
+
+Fixture `fake_revit_primitives` qui injecte un `types.ModuleType` dans
+`sys.modules["lib.revit_primitives"]` avec une `transaction()`
+trackante. Le lazy import dans `_wrap` ramasse le stub sans difficulté.
+
+### Validation
+
+- `pytest -q` → **50 passed en 0.97s** (35 baseline + 15 nouveaux).
+  Aucune régression sur les tests existants malgré la modif de
+  `project_kg.py` (ajout dans `_RESERVED_ATTRS`, trois nouvelles
+  méthodes, un nouveau helper privé).
+- Pas de test Revit-réel cette session. À faire à la prochaine ouverture
+  de Revit : clic sur `Refresh KG` doit (i) ne plus afficher le
+  TaskDialog « not implemented yet », (ii) appeler
+  `kg_sync.full_rescan(doc, kg)` et afficher le summary
+  `{levels, wall_types, walls}`.
+
+### Phase 4 — Câblage `refresh_kg.pushbutton` + identifiant projet
+
+Continuation directe : item #1 du reste à faire devient livrable dans la
+foulée. Permet de boucler la chaîne « clic bouton → rescan Revit → KG
+persisté sur disque » bout-en-bout pour la prochaine session Revit.
+
+**Décision identifiant projet** : on prend la branche fallback du §8
+seule (hash 16-hex de `doc.PathName`), sans la tentative #1 (param Revit
+partagé `claude-in-revit.project_uuid`). Justification : créer un
+shared parameter file, le binder à `ProjectInformation`, gérer le
+roundtrip de la valeur est substantiel — pas justifié tant qu'on n'a
+pas un cas d'usage où `Save As` orphelinerait un KG existant.
+Documenté dans la docstring de `project_id_for` ; à reconsidérer si on
+hit ce cas en pratique. Document unsaved → fallback sur `doc.Title`
+préfixé `"title:"` pour éviter une collision théorique avec un PathName
+qui contiendrait littéralement « title:Sandbox ».
+
+**`lib/config.py`** : ajout de `projects_dir()` et `kg_path_for(project_id)`.
+Constantes `PROJECTS_SUBDIR="projects"`, `KG_FILE_SUFFIX=".kg.json"` —
+alignées avec §8. Pas d'auto-création du dossier ici : c'est
+`ProjectKG.persist()` qui le fait au premier write via
+`mkdir(parents=True, exist_ok=True)`.
+
+**`lib/kg_sync.py`** : deux helpers ajoutés en haut du module (avant les
+binding helpers).
+
+- `project_id_for(doc)` : SHA-256 de `doc.PathName.strip()` (16 hex
+  chars), fallback `"title:<Title>"` si pas sauvé. SHA-256 truncated
+  est universellement dispo, deterministe, et 64 bits d'entropie sont
+  largement suffisants pour la taille de portefeuille cible.
+- `open_or_create(doc)` : `ProjectKG.load(path)` si le fichier existe,
+  sinon `ProjectKG(project_id, persist_path=path)`. Le KG retourné a
+  toujours `persist_path` peuplé (la dette du 2026-05-10 est gérée par
+  la construction explicite — `load()` passe déjà `persist_path` via
+  `from_dict`, donc la dette est résorbée).
+
+**`refresh_kg.pushbutton/script.py`** : enlève le placeholder
+TaskDialog, ajoute le path-fixup `sys.path` (même pattern que
+`prompt.pushbutton`), récupère `doc` via `__revit__.ActiveUIDocument`
+avec garde contre `None` (cas « aucun projet ouvert »), `open_or_create`
++ `full_rescan`, affiche le summary `{levels, wall_types, walls}` +
+le `project_id` + le `persist_path`. Wrappé en `try/except` parce que
+les erreurs Revit lors du rescan ne doivent pas laisser pyRevit
+afficher son traceback technique — un TaskDialog lisible suffit pour
+l'instant.
+
+### Tests Phase 4
+
+2 tests ajoutés à `test_config.py` :
+- `projects_dir()` résolvent bien sous `fake_home`.
+- `kg_path_for("abc123")` produit `…/projects/abc123.kg.json`.
+
+5 tests ajoutés à `test_kg_sync.py` (avec fixture `fake_home` locale
+qui monkeypatche `Path.home`) :
+- `project_id_for` déterministe pour le même PathName, indépendant du
+  Title.
+- Deux PathName différents → ids différents.
+- Doc unsaved → fallback sur Title, et l'id reste cohérent malgré du
+  whitespace dans PathName.
+- `open_or_create` sans fichier → KG vide avec `persist_path` set,
+  rien sur disque tant qu'on ne persiste pas.
+- `open_or_create` avec fichier existant → KG chargé, turn et nœuds
+  restaurés.
+
+Fixture `FakeDoc` minimal — juste `PathName` + `Title`. Le doc Revit
+réel n'est pas importable hors-Revit, et `project_id_for` /
+`open_or_create` ne lisent rien d'autre.
+
+### Validation Phase 4
+
+- `pytest -q` → **57 passed en 0.99s** (50 → +7 nouveaux). Aucune
+  régression.
+- Validation runtime à venir : clic « Refresh KG » dans Revit doit
+  afficher le summary chiffré et écrire le fichier
+  `~/.config/claude-in-revit/projects/<id>.kg.json`.
+
+### Phase 5 — Vendoring de `networkx` (bug `No module named 'networkx'`)
+
+Premier clic sur « Refresh KG » dans Revit : `ImportError: No module
+named 'networkx'` au niveau de `lib/project_kg.py:17` (lui-même tiré
+par `lib/kg_sync.py` chargé depuis le pushbutton).
+
+**Cause racine** : le CPython embarqué de pyRevit
+(`%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\python.exe`) est une
+**distribution embeddable** — son `python312._pth` désactive `site`
+par défaut (`import site` commenté), donc pas de `site-packages`, pas
+de pip d'office, stdlib uniquement. La `.venv/` locale a bien networkx
+mais elle n'est pas exposée au runtime pyRevit. Pas un bug de notre
+code, un trou dans le bootstrap d'environnement runtime.
+
+**Trois options évaluées avec l'utilisateur** :
+
+1. Bootstrap pip dans le CPython embarqué (décommenter `import site`
+   dans `python312._pth`, get-pip.py, `pip install networkx`).
+   Per-machine setup, élimine le poids vendoring.
+2. **Vendor networkx dans le repo** sous `lib/_vendor/`. Zero-setup,
+   bumps la taille (~13 MB). Choisi.
+3. Remplacer networkx par un wrapper maison (~50 lignes). Élimine la
+   dépendance, mais on devra la réintroduire en V1 pour les primitives
+   compliance (Dijkstra fuite incendie §10).
+
+**Décision : vendoring.** networkx 3.6.1 est pure-Python, zéro
+dépendance runtime (`Requires-Dist` vide hors extras). 10.85 MB sur
+disque. Copié de
+`.venv\Lib\site-packages\networkx` → `claude-in-revit.extension\lib\_vendor\networkx\`
+via PowerShell `Copy-Item -Recurse`.
+
+**Bootstrap dans `lib/__init__.py`** : à l'import du package `lib`,
+append (pas insert) `lib/_vendor/` à `sys.path`. Append plutôt que
+insert pour qu'en local le venv résolve en premier — le lockfile
+pyproject reste autoritative en dev, le `_vendor/` n'est qu'un
+fallback runtime pour pyRevit.
+
+**Setuptools** : `pyproject.toml` reçoit
+`exclude = ["lib._vendor*"]` dans `[tool.setuptools.packages.find]`
+pour ne pas embarquer networkx dans le wheel `claude-in-revit`. Le
+fait que `_vendor/` n'ait pas d'`__init__.py` (de toute façon) suffirait
+en pratique, mais l'exclusion explicite documente l'intention.
+
+**Documentation** ajoutée dans `CLAUDE.md` (nouvelle ligne dans la
+section pyRevit gotchas CPython, avec contrainte « pure Python
+uniquement » et mention de l'alternative pip-in-embedded) et `README.md`
+(architecture étendue, paragraphe sur le rationale).
+
+### Validation Phase 5
+
+- `pytest -q` → **57 passed en 0.89s**, aucune régression. Le venv
+  continue à résoudre networkx depuis `site-packages`, le vendoring
+  est transparent en dev.
+- Sanity check du fallback : `python` avec `site-packages` retiré du
+  sys.path → `import lib; import networkx` résout vers
+  `…/lib/_vendor/networkx/__init__.py`. Reproduit l'environnement
+  pyRevit en miniature.
+- Validation runtime à venir : reclic sur « Refresh KG » dans Revit
+  doit cette fois afficher le summary (au lieu de l'ImportError).
+
+### Phase 6 — Durcissement runtime du pushbutton + politique Save-first
+
+Deuxième clic sur « Refresh KG » après le vendoring : **NRE générique
+Revit** (« Object reference not set to an instance of an object »), et
+sur un projet vide une « erreur de stream » remontée par l'utilisateur.
+La NRE fuit *par-dessus* notre `try/except Exception` initial — soit
+elle surgit avant le try, soit l'exception .NET ne subclasse pas
+`Exception` selon le wrap PythonNet courant.
+
+Trois durcissements en réponse :
+
+1. **`full_rescan` atomique + try/except par élément.** Le scan est
+   maintenant enveloppé dans `kg.transaction()` (snapshot pris avant
+   `_clear_topology`, restauration sur exception → jamais de KG
+   à moitié vidé). Chaque conversion `Level/WallType/Wall` tourne dans
+   un `try/except Exception` isolé : un curtain wall avec `Width = 0`,
+   un wall sans `LocationCurve`, un type filtré non-mappable, etc.
+   incrémentent `skipped[<type>]` au lieu de tuer le scan. Le summary
+   porte maintenant `{"levels", "wall_types", "walls", "skipped":{...}}`
+   et le TaskDialog l'affiche si non-zéro. Persistance déléguée à
+   `transaction.__exit__()` (suppression du `kg.persist()` explicite).
+
+2. **`refresh_kg.pushbutton` defensive shell.** Restructure en
+   `_main()` appelé sous un `try / except BaseException`, avec
+   `traceback.format_exc()` injecté dans le TaskDialog d'erreur.
+   `BaseException` plutôt qu'`Exception` parce que PythonNet wrappe
+   parfois les .NET exceptions hors-hiérarchie Python `Exception`.
+   Imports déplacés *à l'intérieur* du try (un `ImportError` doit
+   s'afficher en clair, pas comme NRE Revit). Gardes explicites sur
+   `__revit__` (via `globals().get(...)`), `ActiveUIDocument`,
+   `Document` — chacun produit un message diagnostic distinct.
+
+3. **Politique Save-first** (validée par l'utilisateur). Si
+   `doc.PathName == ""`, le pushbutton refuse avec un message qui
+   pointe vers Fichier → Enregistrer sous. Justification : le
+   fallback Title-based de `project_id_for` est techniquement
+   fonctionnel mais (a) l'id migre au moment du Save (orphelinage
+   du KG sur disque), (b) tous les brouillons Revit s'appellent
+   `Project1` par défaut → collisions probables, (c) §8 du design
+   doc fait du PathName l'identifiant canonique. Politique
+   strictement plus simple à raisonner pour V0.
+
+### Validation Phase 6
+
+- `pytest -q` → **57 passed en 0.92s**. `full_rescan` n'est pas testé
+  directement (Revit-only) mais la nouvelle signature et le wrap dans
+  `kg.transaction()` ne cassent rien des chemins testés.
+- Validation runtime à venir : trois scénarios à tester en Revit :
+  (a) clic sans projet ouvert → message « aucun document actif »,
+  (b) clic sur brouillon non sauvé → message « sauvegarde d'abord »,
+  (c) clic sur projet sauvé même vide → summary avec compteurs
+  (probablement 2 levels par défaut, 1-2 wall types template, 0 walls).
+  Le cas qui produisait la NRE et l'erreur de stream doit maintenant
+  remonter un traceback Python lisible dans le TaskDialog rouge si
+  reproduit.
+
+### Phase 7 — Bug `__revit__` invisible via `globals().get(...)`
+
+Après `pyrevit caches clear 2025` + restart Revit, le defensive shell
+de la Phase 6 a fait son boulot : on a un TaskDialog rouge avec
+**Python traceback complet** au lieu de la NRE Revit générique. Diagnostic :
+
+```
+RuntimeError: __revit__ global not available — pyRevit didn't inject
+the UIApplication into this script's globals.
+  File "<string>", line 117, in <module>
+  File "<string>", line 51, in _main
+```
+
+**Cause racine** : sous CPython, pyRevit injecte `__revit__` dans le
+*namespace de résolution de noms* (built-ins ou équivalent), pas dans
+le `dict` `globals()` du module. Donc `globals().get("__revit__")`
+retourne `None` alors que le bare-name `__revit__` résoudrait
+correctement. C'est un comportement spécifique au runtime CPython de
+pyRevit ; sous IronPython, `__revit__` est effectivement dans
+`globals()`. Ma garde défensive « propre » était paradoxalement
+moins compatible que le pattern direct.
+
+**Fix** : bare-name access avec `try/except NameError`, et fallback
+explicite sur `from pyrevit import HOST_APP; uiapp = HOST_APP.uiapp`
+si jamais l'injection a vraiment échoué. Le fallback documenté dans
+le code commente le pourquoi pour ne pas refaire l'erreur.
+
+**Documentation** : nouvelle ligne dans `CLAUDE.md`
+("gotchas CPython") :
+> `__revit__` sous CPython est en bare-name, pas dans `globals()` —
+> `globals().get("__revit__")` retourne `None` même quand l'injection a
+> eu lieu. Pattern correct : `uiapp = __revit__` (entouré d'un
+> `try/except NameError`). Fallback : `from pyrevit import HOST_APP;
+> uiapp = HOST_APP.uiapp`.
+
+### Validation Phase 7
+
+- `pytest -q` → **57 passed** (sanity ; le fix ne touche que le
+  pushbutton runtime, qui n'est pas testé hors-Revit).
+- **Validation runtime ✓** : « Refresh KG » sur un petit projet
+  (1 niveau, 1 carré de 4 murs Mur 1, + le type curtain wall par
+  défaut) :
+  - Summary affiché : `Levels: 1 / Wall types: 2 / Walls: 4`,
+    `project_id=172b17c1507be3d5`, `Persisted to: …\172b17c1507be3d5.kg.json`.
+  - KG sur disque inspecté : 7 nœuds, 8 edges (`at_level` +
+    `is_type` par mur), `_revit_id` stampé sur chaque nœud, action_log
+    avec une entrée `rescan` + summary inline. Géométrie cohérente :
+    carré ~1.4 × 1.4 m, h=4 m, p1/p2 en mètres comme attendu.
+  - Le `Mur-rideau 1` (curtain wall) a remonté
+    `total_thickness=0.025` sans déclencher le skip — `.Width` n'a
+    pas raised malgré la nature spéciale du type. Le filet de sécurité
+    per-element try/except n'a pas eu à s'activer cette fois.
+  - Artifact FP mineur observé : `total_thickness=0.20000000000000004`
+    au lieu de `0.2` (round-trip feet↔meters). À arrondir si la
+    sérialisation gagne en lisibilité ailleurs, pas urgent.
+- **Chaîne complète validée** : pyRevit → CPython → defensive shell →
+  `kg_sync.open_or_create` → `full_rescan` (collectors Revit →
+  convertisseurs → KG NetworkX → transaction atomique) → persistence
+  JSON → TaskDialog summary. Le « morceau critique kg_sync.py »
+  fonctionne bout-en-bout.
+
+### Phase 8 — `walls_create` Revit-réel + dispatcher doc-aware
+
+Item #2 du reste-à-faire : la réécriture des tools fakes. Bilan
+scope :
+- `catalog_list_*` : déjà KG-only, fonctionne tel quel. Le KG est
+  populé par `full_rescan` côté Revit, par le seed CLI côté local —
+  même schéma, deux sources.
+- `query_find_by_name`, `aggregations_count` : KG-only, aucun
+  changement.
+- `walls_create` : seul tool qui *mute* le modèle, donc seul à
+  réécrire pour la branche Revit.
+
+**Param contextuel `doc` reconnu par `@tool`.** Extension symétrique
+au `kg` existant : le décorateur autorise un 2e paramètre nommé
+`doc` (et seulement à cette position), qu'il exclut du schema
+LLM-facing. Le dispatcher `dispatch_tool_use` accepte un kwarg
+`doc=None` et l'**injecte uniquement si le tool le déclare** (via
+`inspect.signature`). Tools KG-only inchangés (signature
+`(kg, *user_params)`), tools doc-aware = `(kg, doc, *user_params)`.
+
+**`walls_create` doc-aware** :
+- `doc is None` (CLI / pytest) → chemin KG pur, `revit_id: None` dans
+  la réponse — l'absence est explicite, pas implicite.
+- `doc is not None` → résout `level_eid`/`wt_eid` via
+  `kg.get_revit_id` *avant* d'importer `revit_primitives`
+  (sinon un test hors-Revit avec sentinel `doc=object()` partirait
+  en `ModuleNotFoundError: 'Autodesk'` au lieu du `ValueError`
+  attendu). Construit `XYZ`/`Line.CreateBound` en pieds, appelle
+  `Wall.Create(doc, line, wt, lvl, height, 0.0, False, False)`
+  (overload §Phase 1 REVIT_API_NOTES), enveloppé dans
+  `rp.transaction(doc, "walls.create")` qui inclut *aussi* la
+  mutation KG + le bind ElementId. Le KG outer-transaction posé par
+  le dispatcher fournit la rollback symétrique en cas d'exception.
+
+**Helper `_record_in_kg`** factorise la mutation KG (add_node + 2
+edges) pour ne pas dupliquer entre les deux branches. Lisible.
+
+### Tests Phase 8
+
+5 tests nouveaux, tous passent en local sans Revit :
+
+- 3 dans `test_llm_protocol.py` :
+  - `test_dispatch_passes_doc_to_doc_aware_tool` — sentinel passé à
+    travers, capturé dans le tool.
+  - `test_dispatch_does_not_inject_doc_into_kg_only_tool` — tool
+    sans `doc` reçoit pas de `doc=` kwarg même si le caller le
+    passe (pas de TypeError unexpected-kwarg).
+  - `test_doc_aware_tool_excludes_doc_from_schema` — `doc`
+    n'apparaît pas dans `input_schema.properties`, ni `kg`.
+- 2 dans `test_tools.py` :
+  - `test_walls_create_revit_path_requires_revit_binding` — appel
+    avec `doc=object()` sans binding ⇒ `ValueError "no Revit
+    binding"`, KG inchangé.
+  - `test_walls_create_kg_only_path_returns_revit_id_none` — chemin
+    sans doc remonte explicitement `revit_id: None` dans la
+    réponse.
+
+### Validation Phase 8
+
+- `pytest -q` → **62 passed en 0.86s** (57 → +5). Aucune régression
+  sur les anciens tests `walls_create` (KG-only par défaut).
+- Validation runtime à venir : depuis le `prompt.pushbutton` (quand
+  on le câblera) ou en lançant ad hoc depuis Revit. Premier test
+  réel : refresh_kg puis appel direct à `walls_create` via une
+  invocation simulée pour vérifier qu'un mur Revit est bien créé
+  avec son ElementId stamped dans le KG.
+
+### Phase 9 — `prompt.pushbutton` câblé au vrai flow LLM
+
+Dernier item Semaine 1 V0. Quatre sous-livrables, tous KG-only-testables :
+
+**`LLMClient.run_turn` accepte `doc=None`** et le forward à
+`dispatch_tool_use(..., doc=doc)`. Le dispatcher dispatche à son tour
+selon que le tool déclare `doc` ou pas (Phase 8). La CLI continue à
+fonctionner sans changement (signature backward-compat, `doc` en kwarg).
+
+**Sérialisation historique JSON** (`lib/llm_api.py`) — la conversation
+Anthropic mélange des dicts (user prompts, tool_results qu'on fabrique)
+et des objets pydantic v2 (assistant ContentBlocks renvoyés par
+l'API). `serialize_history(history)` walk chaque turn et convertit via
+`.model_dump()` ; les dicts existants sont laissés en place. Defensive
+wrap `{"type": "text", "text": str(...)}` pour les objets inattendus
+plutôt que de planter en JSON. Pas de désérialisation symétrique
+nécessaire : l'API Anthropic accepte les dicts en `messages=`
+directement.
+
+`save_history(history, path)` écrit *atomiquement* via
+`tmp.replace(path)` (renommage sur même filesystem = tout-ou-rien).
+`load_history(path)` retourne `[]` si le fichier n'existe pas — le
+premier clic d'un projet ne fait pas d'erreur.
+
+**`config.history_path_for(project_id)`** posé alongside
+`kg_path_for`. Suffix `.history.json` (séparé du `.kg.json`). Pas
+de `.context.md` Markdown comme évoqué §8 du DESIGN — V0 utilise
+le format API-natif ; le Markdown human-readable peut venir plus
+tard si on veut une UI de relecture.
+
+**`prompt.pushbutton/script.py`** réécrit du sanity-check au vrai
+flow, héritant des patterns durcis des Phases 4 / 6 / 7 :
+- Defensive shell (BaseException + traceback).
+- `__revit__` bare-name avec fallback `pyrevit.HOST_APP`.
+- Save-first (PathName non vide).
+- Garde supplémentaire : si KG sans `Level` ET sans `WallType`,
+  refuse en pointant vers « Refresh KG ». Évite de spend des
+  tokens sur un catalogue vide.
+
+Input prompt : `Microsoft.VisualBasic.Interaction.InputBox` via
+PythonNet (`clr.AddReference("Microsoft.VisualBasic")`). Single-line,
+moche, *fonctionnel*. Une UI WPF multi-ligne avec markdown rendering
+de la réponse pourra venir en Phase 10 ou V1.
+
+Display : TaskDialog avec text LLM + tools utilisés + tokens / stop.
+
+### Tests Phase 9
+
+8 tests nouveaux, tous passent sans Revit ni clé API :
+
+- `test_config.py` +1 : `history_path_for` résout sous `fake_home`.
+- `test_llm_api.py` (nouveau fichier, 7 tests) :
+  - `serialize_history` passe les strings, dumpe les blocks via
+    `.model_dump`, préserve les dicts intacts, defensive-wrappe les
+    objets exotiques.
+  - `save_history` + `load_history` roundtrip avec mix de SDK blocks
+    et tool_result dicts.
+  - Empty file → `load_history` renvoie `[]`.
+  - Save atomicité (pas de `.tmp` traînant après un write réussi).
+
+Stubs pydantic via `_FakeBlock(payload)` exposant `.model_dump()` —
+permet de tester sans dépendre de la version exacte du SDK Anthropic.
+
+### Validation Phase 9
+
+- `pytest -q` → **70 passed en 9.88s** (62 → +8). Le slowdown (de
+  ~1s à ~10s) vient du `import anthropic` top-level dans `llm_api.py`,
+  one-shot par run pytest, acceptable. Si gênant, déférer en lazy
+  import (option YAGNI pour V0).
+- Validation runtime à venir : clic « Prompt » avec un projet sauvé
+  + KG rescaned, prompt type « liste les niveaux et types de mur »
+  pour tester un flow read-only avant d'essayer une mutation
+  (`walls_create`).
+
+### Phase 10 — Pivot vendoring → pip-in-embedded + retrait `lib/_vendor/`
+
+Premier clic « Prompt » dans Revit : `ImportError: No module named
+'anthropic'`. Même famille que la Phase 5 (networkx), mais cette fois
+la voie « vendor pure-Python sous `lib/_vendor/` » ne suffit plus :
+anthropic a deux dépendances avec **extensions C natives** (`jiter`
+en Rust, `pydantic_core` en Rust), inscopiables au vendoring
+pure-Python qu'on avait choisi.
+
+Inspection du dépendance-graph anthropic via la venv locale :
+
+| Package        | Version  | Pure Python ? |
+|----------------|----------|---------------|
+| httpx          | 0.28.1   | ✓             |
+| pydantic       | 2.13.4   | ✓             |
+| jiter          | 0.14.0   | ✗ (Rust)      |
+| pydantic_core  | 2.46.4   | ✗ (Rust)      |
+| anyio          | 4.9.0    | ✓             |
+| distro         | 1.9.0    | ✓             |
+| sniffio        | 1.3.1    | ✓             |
+| typing-extensions | 4.14.1| ✓             |
+| docstring-parser  | (req) | ✓             |
+
+**Décision avec l'utilisateur** : retirer entièrement le vendoring et
+adopter **pip dans le CPython embarqué** comme voie unique. Raisons :
+- Vendoring pure-Python n'absorbe pas les Rust/C extensions — limite
+  fondamentale, pas un workaround à perfectionner.
+- Pip-in-embedded est la solution standard recommandée par Python
+  pour les distributions embeddable (et c'était déjà l'« alternative »
+  documentée Phase 5).
+- Setup per-machine acceptable une fois et pour toutes — couvre tous
+  les futurs ajouts de deps (ezdxf, numpy si compliance, etc.) sans
+  rejouer le débat.
+- Cohérence : une seule voie d'installation, pas deux mécanismes
+  parallèles à maintenir.
+
+### Setup réalisé
+
+1. `python312._pth` : décommenté `import site`. Ligne de commentaire
+   actualisée pour pointer vers ce journal.
+2. `curl -sSL https://bootstrap.pypa.io/get-pip.py -o $TEMP/get-pip.py`.
+3. `python.exe get-pip.py` → pip 26.1.1 installé.
+4. `python.exe -m pip install anthropic networkx` → installe 16
+   wheels au total :
+   `annotated-types 0.7.0 / anthropic 0.100.0 / anyio 4.13.0 /
+   certifi 2026.4.22 / distro 1.9.0 / docstring_parser 0.18.0 /
+   h11 0.16.0 / httpcore 1.0.9 / httpx 0.28.1 / idna 3.14 /
+   jiter 0.14.0 (cp312-win_amd64) / pydantic 2.13.4 /
+   pydantic_core 2.46.4 (cp312-win_amd64) / sniffio 1.3.1 /
+   typing_extensions 4.15.0 / typing-inspection 0.4.2 /
+   networkx 3.6.1`.
+5. Sanity check :
+   `python.exe -c "import anthropic, networkx, pydantic; ..."` → OK,
+   `pydantic.BaseModel.model_dump` accessible (chemin utilisé par
+   `serialize_history`).
+
+### Retrait `lib/_vendor/`
+
+- `claude-in-revit.extension/lib/_vendor/networkx/` supprimé (10.85 MB).
+- `claude-in-revit.extension/lib/__init__.py` vidé (plus de bootstrap
+  `_vendor` sur `sys.path` — le mécanisme tombe).
+- `pyproject.toml` : retrait de `exclude = ["lib._vendor*"]` dans
+  `[tool.setuptools.packages.find]` — la règle n'a plus d'objet.
+- `pytest -q` après cleanup → **70 passed en 3.43s**. Pas de
+  régression : le venv local résout networkx via ses propres
+  site-packages, le retrait du fallback est transparent.
+
+### Documentation actualisée
+
+- **`CLAUDE.md`** (section « pyRevit pushbuttons — gotchas CPython ») :
+  remplacé le bullet vendoring par un bullet pip-in-embedded clair,
+  avec procédure de setup en 4 étapes (`_pth` → `get-pip.py` → install
+  → restart). Le vendoring n'est plus mentionné comme voie viable —
+  une ligne explique qu'on l'a écarté à cause des extensions C.
+- **`README.md`** : retiré `lib/_vendor/` de l'arbo `lib/`,
+  remplacé le paragraphe rationale par un paragraphe pip-in-embedded
+  pointant vers CLAUDE.md pour la procédure détaillée.
+
+### Validation Phase 10
+
+- `pytest -q` → **70 passed en 3.43s**, aucune régression.
+- Validation runtime à venir : reclic « Prompt » sur projet sauvé
+  + KG rescaned doit maintenant passer le `import anthropic` et
+  exécuter le vrai flow LLM end-to-end.
+
+### Phase 11 — Trio de mutations walls : delete + move + set_height
+
+Démarrage Semaine 2 V0 (§9 du DESIGN doc — géométrie complète,
+UC2/UC3). `walls_create` ayant fonctionné bout-en-bout en runtime,
+on étend `walls.py` avec les trois mutations universelles :
+
+- `walls_delete(llm_id)` : `Document.Delete(ElementId)` côté Revit +
+  `kg.soft_delete(llm_id)` côté KG. Soft delete par défaut conformément
+  §4.1 du design doc — le nœud reste avec `deleted_at_turn=N` posé,
+  exclu des queries par défaut mais préservé pour la traçabilité.
+- `walls_move(llm_id, dx, dy)` : `ElementTransformUtils.MoveElement`
+  côté Revit + `kg.modify_node` qui décale `p1`/`p2`. La `length`
+  n'est pas touchée (translation rigide → invariante).
+- `walls_set_height(llm_id, height_m)` : `wall.get_Parameter(
+  BuiltInParameter.WALL_USER_HEIGHT_PARAM).Set(height_ft)` côté Revit
+  + `kg.modify_node` côté KG. Vérifie le retour booléen de `param.Set`
+  (peut renvoyer False si le paramètre est contraint par `Top
+  Constraint` ; on lève alors un message actionnable).
+
+**Pattern partagé** factorisé en `_require_live_wall(kg, llm_id)` :
+existence, `_type == "Wall"`, non soft-deleted. Centralise les
+préconditions et donne un message d'erreur uniforme pour la branche
+d'erreur (« not a Wall », « already soft-deleted »).
+
+Tous trois suivent la même architecture que `walls_create` (Phase 8) :
+- `doc is None` → mutation KG uniquement (CLI / pytest, et utile pour
+  des essais hors-Revit).
+- `doc is not None` → résolution `revit_id` avant les imports
+  Revit (sinon test hors-Revit avec sentinel partirait en
+  ImportError), puis `rp.transaction(doc, name)` enveloppe l'appel
+  Revit *et* la mutation KG — rollback symétrique garanti par le
+  `kg.transaction()` outer posé par le dispatcher.
+
+**Naming Anthropic** : Anthropic refuse les points dans les noms de
+tools (`^[a-zA-Z0-9_-]{1,64}$`), donc `walls_delete` / `walls_move` /
+`walls_set_height`. Le design doc utilise `walls.delete` en prose ;
+on garde le schema underscore-only pour l'API.
+
+### Tests Phase 11
+
+8 tests nouveaux dans `test_tools.py` :
+
+- 3 sur `walls_delete` : soft-delete réussit côté KG (Wall absent des
+  queries par défaut, présent avec `include_deleted=True`) ; refus
+  double-delete (`already soft-deleted`) ; chemin Revit unbound.
+- 2 sur `walls_move` : translation p1/p2 OK côté KG (length
+  inchangée) ; chemin Revit unbound (KG untouched).
+- 2 sur `walls_set_height` : modif height OK côté KG ; chemin Revit
+  unbound.
+- 1 cross-tool : pointer un des trois verbes sur un `llm_id` qui
+  n'est pas un Wall (passé un `level_001`) doit échouer avec
+  "not a Wall" — exerce `_require_live_wall` sur les trois.
+
+Fixture `kg_with_wall` qui dérive de `kg_with_seed` et ajoute un
+Wall (p1=[0,0], p2=[5,0], h=2.7) via les API KG directes — évite
+de devoir relancer `walls_create` pour chaque test, plus rapide et
+plus prévisible.
+
+### Validation Phase 11
+
+- `pytest -q` → **78 passed en 2.83s** (70 → +8). Aucune régression
+  sur les tests existants.
+- Validation runtime à venir : trois prompts à enchaîner en Revit :
+  1. « supprime le mur wall_001 » → mur disparaît dans Revit + KG
+     soft-deleted.
+  2. « déplace wall_002 de 2 m vers l'est » → mur translaté visuellement
+     + p1/p2 KG décalés.
+  3. « passe la hauteur de wall_003 à 3.5 m » → mur grandit
+     visuellement + KG.height=3.5.
+
+### Phase 12 — UX : intégration de la sélection active Revit
+
+Question utilisateur 2026-05-11 : « et pour intégrer les
+identifications de base comme la sélection active ? » — UX critique :
+sans contexte de sélection, l'utilisateur doit ré-épeler le llm_id
+de chaque élément (« supprime wall_003 » au lieu de « supprime ça »
+après avoir cliqué le mur dans Revit).
+
+**Approche retenue : injection dans le system prompt, pas de tool
+dédié.** Le LLM voit la liste des llm_ids sélectionnés en
+contexte ambient et peut les passer directement aux tools (`walls_delete`,
+`walls_move`, etc.) comme refs habituelles. Un tool
+`selection_get_active` serait redondant pour les cas usuels et
+demanderait un round-trip API supplémentaire à chaque turn.
+
+**Helper `kg_sync.active_selection_llm_ids(uidoc, kg)`** :
+- Lit `uidoc.Selection.GetElementIds()` (renvoyant un
+  `ICollection<ElementId>`).
+- Résout chaque ElementId vers son llm_id via `kg.find_by_revit_id`
+  (réutilise le `_extract_revit_id` qui gère le breaking change
+  `Value`/`IntegerValue` 2024).
+- Retourne `(llm_ids, unbound_count)`. Le compteur unbound signale
+  les éléments sélectionnés non mappés dans le KG — typiquement des
+  pré-existants avant un Refresh KG, ou des types qu'on ne modélise
+  pas encore (doors/rooms/etc.). UX : on l'expose dans le system
+  prompt pour que le LLM puisse suggérer un Refresh KG.
+- Tolère `uidoc is None` et `uidoc.Selection is None` (renvoie
+  `([], 0)`) pour ne pas forcer le pushbutton à pré-guarder.
+
+**Wiring dans `prompt.pushbutton`** :
+- Snapshot de la sélection *avant* d'ouvrir le formulaire de prompt
+  WinForms (`ShowDialog` peut voler le focus et faire perdre la
+  sélection Revit — capture préventive avant la modal).
+- `_format_selection_line(ids, unbound)` construit une ligne unique
+  pour le system prompt :
+  - `Sélection active : aucune` si rien.
+  - `Sélection active : 2 mappé(s) — wall_001, wall_003` sinon.
+  - `Sélection active : 1 mappé(s) — wall_001 ; 2 non mappé(s) (lance
+    Refresh KG pour les voir)` si mix.
+- Bloc d'instruction ajouté au system prompt :
+  > Si la requête utilise des démonstratifs (« ce mur », « ces »,
+  > « this/these ») ou des pronoms implicites (« supprime-le »,
+  > « déplace-les »), prends les llm_ids de la *sélection active*
+  > comme cibles par défaut sans redemander de précision.
+
+### Tests Phase 12
+
+5 tests dans `test_kg_sync.py` (stubs `_FakeUIDoc` /
+`_FakeSelection` / `_FakeElementId`) :
+- Sélection vide → `([], 0)`.
+- `uidoc is None` → `([], 0)` (pas de crash).
+- Élément bindé → llm_id résolu correctement.
+- Mix bindé/non-bindé → llm_ids des bindés + counter unbound.
+- Ordre préservé : si Revit renvoie `[wt_eid, level_eid]`, l'output
+  préserve `[wt_llm_id, level_llm_id]`.
+
+### Validation Phase 12
+
+- `pytest -q` → **83 passed en 2.84s** (78 → +5).
+- Validation runtime à venir : ouvrir un projet sauvé, **cliquer un
+  mur dans Revit avant de cliquer Prompt**, taper « supprime ce mur »
+  → LLM doit appeler `walls_delete(llm_id=<sélection>)` sans
+  redemander de précision.
+
+### Identifications restantes à intégrer (au fil des besoins)
+
+Sélection est l'identification UX la plus immédiate. D'autres
+candidats à câbler si le besoin émerge :
+- **Vue active** (`uidoc.ActiveView`) — utile pour contextualiser
+  les requêtes spatiales (« sur ce plan », « dans cette coupe »).
+- **Niveau actif / workplane** — pour les créations « à mon
+  niveau ».
+- **Phase Revit courante** — pour les workflows multi-phases.
+- **Nom / chemin du projet** — pour la cohérence d'identité dans
+  les rapports.
+
+Pas urgent en V0. À traiter quand un cas concret le réclame.
+
+### État final & reste à faire
+
+**Acquis session 2 (sessions de l'après-midi cumulées) :**
+
+- `lib/project_kg.py` étendu : `_revit_id` réservé, set/get/find,
+  `_clear_topology` ✓
+- `lib/kg_sync.py` créé : binding helpers, convertisseurs Level/WallType/Wall,
+  `full_rescan` atomique + per-element skip, `@kg_synced`,
+  `project_id_for`, `open_or_create` ✓
+- `lib/config.py` étendu : `projects_dir`, `kg_path_for` ✓
+- `lib/llm_protocol.py` étendu : `@tool` reconnaît `doc`, dispatcher
+  l'injecte conditionnellement ✓
+- `lib/tools/walls.py` réécrit : `walls_create` doc-aware (Revit +
+  KG-only fallback), helper `_record_in_kg` ✓
+- `refresh_kg.pushbutton` câblé + defensive shell + politique
+  Save-first + fix `__revit__` bare-name ✓
+- `lib/_vendor/networkx/` (10.85 MB) + bootstrap `lib/__init__.py` ✓
+- Documentation vendoring + `__revit__` gotcha dans CLAUDE.md + README.md ✓
+- `lib/llm_api.py` étendu : `run_turn(doc=...)`, `serialize_history`,
+  `save_history`, `load_history` ✓
+- `lib/config.py` étendu (Phase 9) : `history_path_for` ✓
+- `prompt.pushbutton` câblé : open_or_create KG + load history +
+  InputBox + run_turn + save history + TaskDialog summary ✓
+- 70 tests verts (35 nouveaux), aucune régression ✓
+
+**Reste à valider en runtime :**
+
+1. **Read-only prompt** : « liste les niveaux et types de mur » →
+   LLM appelle `catalog_list_levels` + `catalog_list_wall_types`,
+   formate la réponse. Permet de valider le wiring sans risquer
+   une mutation Revit.
+2. **Mutation prompt** : « crée un mur de 5 m sur le Niveau 1
+   partant de (0, 0) vers l'est, hauteur 2.7 m » → Wall apparaît
+   dans Revit + KG, `revit_id` stamped, action_log loggué.
+3. **Multi-turn** : 2e clic dans la foulée → history rechargée
+   depuis disque, LLM se souvient des llm_ids créés.
+
+**Dette / optionnel :**
+
+- Arrondi FP (`round(x, 6)`) dans `kg_sync` convertisseurs pour des
+  JSON nets (`0.2` au lieu de `0.20000000000000004`).
+- UI WPF multi-ligne pour le prompt input + rendering Markdown de
+  la réponse (`Interaction.InputBox` VB6 est fonctionnel mais
+  cosmétiquement vintage).
+- Trim history après N tours (§7 mentionne 3) — V0 laisse
+  l'historique grossir indéfiniment.
+- `LLM.md` versionné (système prompt) — actuellement inline dans
+  `prompt.pushbutton`. À sortir quand on aura plus de 20 lignes
+  de contenu système.
+
+**Semaines 2-5 V0 (§9) à venir :**
+
+- Géométrie complète : `walls_modify`, `walls_delete`, openings
+  (door / window), rooms, levels, transforms (move / rotate /
+  mirror / copy).
+- I/O : `dwg_reader.py` + tools input.* / bulk.*.
+
+**Reste pour la Semaine 1 V0 (mise à jour) :**
+
+1. **Validation runtime de `refresh_kg`** : à exercer dans Revit.
+   Premier KG sur disque attendu sous
+   `C:\Users\lauro\.config\claude-in-revit\projects\<16hex>.kg.json`.
+2. **Réécriture des tools fakes en tools Revit réels** : `walls_create`
+   passe à `Wall.Create(doc, line, wallType.Id, level.Id, height, 0,
+   False, False)` enveloppé dans `@kg_synced("walls.create")`. Les
+   tools `catalog_list_*` deviennent un re-read du KG (plus de seed
+   local). Implique de gérer la coexistence test-vs-runtime : les
+   tools fakes seed le KG côté CLI, les tools réels lisent le KG
+   rescané côté Revit. Une solution : injecter `doc` dans le dispatcher
+   et faire des tools `doc-aware` qui no-op le seed en présence d'un
+   doc Revit.
+3. **Câbler le vrai flow LLM dans `prompt.pushbutton`** : prompt input
+   form + persistance de l'historique entre clics (§8 :
+   `<uuid>.context.md`). Inchangé.
+
+**Dette créée :**
+
+- Convertisseurs Element→attrs limités à 3 types (Level, WallType,
+  Wall). Door/Window/Room/FamilyType à compléter en Semaines 2-3 quand
+  les tools géométrie élargiront le scope.
+- Murs courbés tombent sur la chord. À fixer au moment des `walls_modify`
+  / `walls_move` (la modification d'un arc demande de toute façon une
+  représentation différente que p1/p2).
+- Persistance d'`_revit_id` à travers les sessions Revit (cf. décision
+  4). À reconsidérer si on observe des collisions en production.
+
+**Risques (§10 du design doc) :**
+
+- Le drift `persist() fails after Revit commit` reste théoriquement
+  ouvert ; mitigé par `refresh_kg`. La fenêtre est étroite (un disque
+  doit raser pendant le `json.dump`), donc V0 acceptable.
+
+---
+
 ## 2026-05-11 — Baseline versions + `lib/config.py`
 
 ### Contexte & objectif
@@ -315,9 +1169,20 @@ donc validée bout-en-bout :
 Foulée renaming en clôture : l'onglet **`claude-in-revit.tab`** →
 **`LLM.tab`** (libellé court dans la ribbon). Pas d'autre impact que
 le changement de nom de dossier + propagation dans `CLAUDE.md`,
-`README.md`, `DESIGN.md`. À reloader côté Revit pour que le ribbon
-prenne le nouveau nom (Reload depuis la ribbon pyRevit ou redémarrer
-Revit).
+`README.md`, `DESIGN.md`.
+
+**Gotcha empirique** : un Reload depuis la ribbon pyRevit ne suffit pas
+après un rename de tab — au prochain clic d'un bouton de la nouvelle
+tab, Revit balance *« Échec de la commande externe — This property
+must be set before runtime is initialized »*. Cause racine probable :
+le cache d'assembly pyRevit (`%APPDATA%\pyRevit\Master\Logs\` + DLLs
+générées par session) garde encore une référence à l'ancien nom de
+tab, et le re-link au moment du clic échoue. **Fix : redémarrer Revit
+complètement**. Confirmé en session — après restart, tous les boutons
+de l'onglet LLM fonctionnent. À retenir : tout rename de dossier
+`.tab/.panel/.pushbutton/.extension` doit s'accompagner d'un Revit
+restart (et idéalement d'un `pyrevit caches clear 2025` si Revit
+était ouvert pendant le rename).
 
 **Si futur crash** :
 

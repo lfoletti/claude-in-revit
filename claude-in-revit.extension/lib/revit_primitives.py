@@ -32,9 +32,12 @@ from contextlib import contextmanager
 
 from Autodesk.Revit.DB import (  # noqa: F401  (Element re-exported for callers)
     BuiltInCategory,
+    CurveElement,
+    DetailCurve,
     Element,
     FilteredElementCollector,
     Level,
+    ModelCurve,
     Transaction,
     UnitTypeId,
     UnitUtils,
@@ -138,3 +141,55 @@ def levels(doc):
     is the documented stable filter for Level lookups.
     """
     return list(FilteredElementCollector(doc).OfClass(Level).ToElements())
+
+
+def _curve_elements(doc):
+    """All `CurveElement` instances (parent class of ModelCurve / DetailCurve).
+
+    Why this indirection: Revit refuses `OfClass(ModelCurve)` and
+    `OfClass(DetailCurve)` at runtime with `ArgumentException` —
+    *"element type that exists in the API, but not in Revit's native
+    object model"*. The official workaround (per the exception message
+    itself) is to filter on `CurveElement` (their concrete parent in the
+    native model) and post-filter in Python via `isinstance`.
+    """
+    return list(FilteredElementCollector(doc).OfClass(CurveElement).ToElements())
+
+
+def model_lines(doc):
+    """All `ModelCurve` instances (3D model lines).
+
+    Returns subclasses too (`ModelLine`, `ModelArc`, `ModelHermiteSpline`,
+    …) — V0 callers filter to straight `Line` geometry via `.GeometryCurve`
+    at conversion time and skip the rest.
+    """
+    return [e for e in _curve_elements(doc) if isinstance(e, ModelCurve)]
+
+
+def detail_lines(doc):
+    """All `DetailCurve` instances (view-bound 2D detail lines).
+
+    Subclass-inclusive (same rationale as `model_lines`). Detail curves
+    are view-specific — the KG drops the view binding for V0; the agent
+    gets endpoints but doesn't know which view the line was drawn in.
+    """
+    return [e for e in _curve_elements(doc) if isinstance(e, DetailCurve)]
+
+
+def columns(doc):
+    """All column instances (architectural + structural).
+
+    Returns elements from both `OST_Columns` (architectural) and
+    `OST_StructuralColumns` (structural). The caller distinguishes
+    them via `Category.Id.Value` at conversion time.
+    """
+    arch = collect_by_category(doc, BuiltInCategory.OST_Columns)
+    struct = collect_by_category(doc, BuiltInCategory.OST_StructuralColumns)
+    return arch + struct
+
+
+def column_types(doc):
+    """All column FamilySymbols (architectural + structural)."""
+    arch = collect_types_by_category(doc, BuiltInCategory.OST_Columns)
+    struct = collect_types_by_category(doc, BuiltInCategory.OST_StructuralColumns)
+    return arch + struct

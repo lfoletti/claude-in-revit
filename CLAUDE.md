@@ -122,6 +122,16 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 - **`pyrevit.forms` est IronPython-only** : il lève `PyRevitCPythonNotSupported` sous CPython. Pour afficher un dialog depuis nos scripts (qui sont taggés `#! python3` → CPython 3.12), utiliser **`Autodesk.Revit.UI.TaskDialog`** directement (API Revit, disponible nativement via PythonNet dans pyRevit). Voir JOURNAL.md 2026-05-11 (bootstrap phase) pour le découvert.
 - **Path fixup `sys.path` requis dans `script.py`** quand on importe `lib.*` : pyRevit met `<extension>/lib/` sur sys.path mais pas la racine de l'extension. Sans le fixup, `from lib import config` échoue avec `ImportError`. Voir le préambule de `prompt.pushbutton/script.py` pour le template. Dette : refactor lib/ vers bare imports pour aligner local↔runtime (Path A du journal, reporté).
 - **Shebang `#! python3`** sur la ligne 1 de chaque `script.py` : sélectionne l'engine CPython au lieu du default IronPython 2.7. Sans ce directive, nos f-strings, type hints PEP 604, etc. partent en SyntaxError.
+- **`__revit__` sous CPython est en bare-name, pas dans `globals()`** : `globals().get("__revit__")` retourne `None` même quand l'injection a eu lieu — pyRevit met le nom dans les built-ins / le namespace de résolution, pas dans le dict `globals()` du module. Pattern correct : `uiapp = __revit__` (entouré d'un `try/except NameError` si on veut un diagnostic explicite). Fallback documenté : `from pyrevit import HOST_APP; uiapp = HOST_APP.uiapp`. Découvert 2026-05-11 (journal Phase 7 session 2).
+- **Dépendances tierces : pip dans le CPython embarqué (voie unique)**. Le CPython embarqué de pyRevit (`%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\`) est une distribution *embeddable* : `python312._pth` désactive `site` par défaut, donc pas de `site-packages`, pas de pip, stdlib uniquement out-of-the-box. On bootstrap pip une fois par poste et on installe les deps normalement. Couvre nativement les wheels avec extensions C (`pydantic_core`, `jiter`, plus tard `numpy`/`scipy` si compliance en a besoin) — ce qui élimine la voie « vendoring » qui ne marche que pour les paquets pure-Python.
+- **Setup pip dans le CPython embarqué** (à faire une fois par poste/dev) :
+  1. Décommenter `import site` dans `%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\python312._pth`.
+  2. `curl -sSL https://bootstrap.pypa.io/get-pip.py -o "%TEMP%\get-pip.py"`
+  3. `"%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\python.exe" "%TEMP%\get-pip.py"`
+  4. `"%APPDATA%\pyRevit-Master\bin\cengines\CPY3123\python.exe" -m pip install anthropic networkx` (ajouter d'autres deps de runtime au fil de leur arrivée — ezdxf, etc.).
+  - Validation : `python.exe -c "import anthropic, networkx; print(anthropic.__version__, networkx.__version__)"`.
+  - Restart Revit après l'install pour que la nouvelle table site-packages soit vue par les scripts.
+  - Versions runtime cibles, alignées avec `pyproject.toml` : voir le journal pour le snapshot exact en cours.
 
 ## Source de vérité
 
