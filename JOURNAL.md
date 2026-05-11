@@ -221,11 +221,33 @@ transforms `elements_*` héritent.
     + tests unitaires des helpers.
   - 225 → 228 : refactor walls + tests structure de réponse drift
     sur `walls_set_height` / `walls_move` en KG-only.
-- **Validation runtime à venir** sur le projet test : refaire le
-  scénario qui a déclenché le bug (toutes les fenêtres sill=0.80
-  head=2.20 avec types mixtes) — vérifier que la réponse signale
-  drift sur `window_016`, et que le KG mirror sill=1.45 (au lieu de
-  0.80) après les mutations.
+
+### Validation runtime — confirmée le soir même
+
+Re-scénario sur le projet test, **20 fenêtres mixées sur 4 types
+familiaux**, prompt « passe toutes les fenêtres à sill=0.80,
+head=2.20 ». Résultat :
+
+- **`drift=False` sur les 20** — l'invariant tient. Le LLM n'a pas
+  enchaîné les deux setters à l'aveugle (ce qui aurait fait drift
+  sur les 4 types dont `opening_height ≠ 1.40 m`) ; il a choisi
+  d'abord de **changer la hauteur d'ouverture côté type**.
+- Séquence exécutée : 4 × `openings_create_type_variant` (une variante
+  par famille avec `opening_height=1.40 m`) → 20 × `openings_set_type`
+  (swap chaque fenêtre vers sa nouvelle variante) → 20 ×
+  `openings_set_sill_height(0.80)` (la contrainte type devient
+  cohérente, head suit à 2.20 sans recompute parasite).
+- Le LLM **verbalise la stratégie** dans sa réponse utilisateur :
+  « La clé était d'abord changer le type avec la bonne hauteur
+  d'ouverture (1,40 m), puis de setter l'allège ». La sémantique
+  encodée dans `openings_set_type` / `_create_type_variant` (et les
+  `drift_note` des sessions précédentes) suffit à l'orienter — pas
+  besoin de règle système supplémentaire.
+- Coût : 4 round-trips API (87 K input / 3.8 K output, cache_read
+  31 K / cache_write 35 K). ~44 tool calls. Le cache write élevé
+  reflète les `tool_result` qui empilent à chaque round-trip (le
+  préfixe statique se cache bien, c'est l'historique de tour qui
+  grossit).
 
 ### Couverture de la discipline post-session 5
 
@@ -293,6 +315,25 @@ unidirectionnelle).
    Coût acceptable (un Element fetch + un appel converter) mais
    surveillable sur des bulk size > 100. Optimisation tardive si
    le profil le réclame.
+4. **Setters multi-objets manquants** (révélé par la validation
+   runtime — voir ci-dessus, ~44 tool calls pour 20 fenêtres).
+   Symétrique au pattern `*_create_many` livré session 4, on
+   gagnerait à exposer :
+   - `openings_set_type_many(items=[{llm_id, new_family_type_ref}, …])`
+   - `openings_set_sill_height_many(items=[{llm_id, sill_height_m},
+     …])` (et `_head_height_many` par symétrie)
+   - Variante filter-based : `openings_set_sill_height_bulk(filter={…},
+     sill_height_m=…)` qui résout le filtre côté KG et applique en
+     un appel. Le filtre serait `{level_ref, type_ref,
+     host_wall_ref, llm_id_prefix, …}` avec match all-of-fields.
+   - Idem pour `walls_set_height_many` et `walls_move_many`
+     (configurations courantes : aligner toutes les fenêtres d'un
+     niveau, lever la hauteur d'une série de murs).
+   Estimation gain : ~40 tool_use blocks → ~2 tool_use blocks sur le
+   scénario du soir. Cache hit rate meilleur, latence /20. À chiffrer
+   après l'arrivée de `rooms` qui pourrait aussi en bénéficier
+   (`rooms_set_use_subcategory_many` pour le scope hiérarchique
+   compliance §4.5).
 
 **Suite immédiate (§9 DESIGN, Semaines 2-3 V0 restant)** :
 - `rooms.py` : create, recompute_boundaries, set_name, get_area +
