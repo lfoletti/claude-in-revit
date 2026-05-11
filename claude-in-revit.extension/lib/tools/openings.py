@@ -545,6 +545,70 @@ def create_many(
     return bulk_summary(llm_ids)
 
 
+# Threshold below which we consider a re-read value to match the
+# requested one — half a millimetre tolerates the feet↔metres
+# round-trip without flagging false drifts.
+_DRIFT_EPSILON_M = 5e-4
+
+
+def _read_sill_head_m(element: Any) -> Dict[str, Optional[float]]:
+    """Read both sill / head heights from a Revit Door / Window. Returns
+    `{sill_height_m, head_height_m}` with None for any param not exposed
+    on the family. Caller must be inside an open Revit transaction.
+    """
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter
+
+    out: Dict[str, Optional[float]] = {
+        "sill_height_m": None,
+        "head_height_m": None,
+    }
+    sill = element.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+    if sill is not None:
+        try:
+            out["sill_height_m"] = rp.internal_to_meters(sill.AsDouble())
+        except Exception:  # noqa: BLE001
+            out["sill_height_m"] = None
+    head = element.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+    if head is not None:
+        try:
+            out["head_height_m"] = rp.internal_to_meters(head.AsDouble())
+        except Exception:  # noqa: BLE001
+            out["head_height_m"] = None
+    return out
+
+
+def _drift_note(
+    requested_field: str,
+    requested_value: float,
+    actual_sill: Optional[float],
+    actual_head: Optional[float],
+) -> Optional[str]:
+    """Build a human-readable drift note when Revit recomputed the value
+    away from what we asked. Returns None if no drift, or if the
+    actual value isn't readable.
+
+    The note explains the Revit constraint to the LLM in plain language
+    so it can warn the user rather than parrot the demanded value.
+    """
+    actual_value = actual_sill if requested_field == "sill_height" else actual_head
+    if actual_value is None:
+        return None
+    if abs(actual_value - requested_value) <= _DRIFT_EPSILON_M:
+        return None
+    # The committed sill/head differs from the requested one — Revit
+    # used the family's opening_height (type-level) to recompute the
+    # other endpoint, and the param we set ended up overridden.
+    return (
+        "Revit a commit {actual:.3f} m au lieu de {req:.3f} m demandé. "
+        "La famille de cet élément a une hauteur d'ouverture fixée par "
+        "le type ; tu peux probablement obtenir la valeur visée en "
+        "changeant de type via openings_set_type (cherche un type dont "
+        "dimensions.height_m = head − sill voulus) ou en créant une "
+        "variante via openings_create_type_variant."
+    ).format(actual=actual_value, req=requested_value)
+
+
 @tool(name="openings_set_sill_height", tier=1)
 def set_sill_height(
     kg: ProjectKG,
@@ -555,10 +619,22 @@ def set_sill_height(
     """Règle la hauteur d'allège (`INSTANCE_SILL_HEIGHT_PARAM`) d'une porte
     ou d'une fenêtre.
 
+    **Couplage sill ↔ head côté Revit.** La hauteur d'ouverture
+    `head − sill` est presque toujours un paramètre de TYPE (fixé par
+    le FamilySymbol). Setter le sill décale donc automatiquement le
+    head. Si l'utilisateur veut sill ET head indépendants, il faut
+    changer de type (`openings_set_type`) ou dupliquer le type avec
+    une hauteur d'ouverture compatible (`openings_create_type_variant`).
+    Quand Revit refuse silencieusement de tenir la valeur demandée
+    (cas où sill + opening_height violerait le contour), le champ
+    `drift` du résultat est True et une `drift_note` explique le
+    contournement.
+
     Concepts: allège, sill, hauteur, modification, porte, fenêtre
     Phrases: "passe l'allège à X cm", "lève l'allège",
              "set the sill at", "abaisse la fenêtre"
-    Similar: openings_set_head_height, walls_set_height
+    Similar: openings_set_head_height, openings_set_type,
+             openings_create_type_variant
 
     Args:
         llm_id: llm_id de la porte ou fenêtre à modifier.
@@ -566,18 +642,28 @@ def set_sill_height(
             niveau hôte).
 
     Returns:
-        {"ok": bool, "llm_id": str, "sill_height_m": float,
+        {"ok": bool, "llm_id": str,
+         "sill_height_m": float,        # valeur réellement committée
+         "head_height_m": float,        # head après recompute Revit
+         "requested_sill_height_m": float,
+         "drift": bool, "drift_note": str | None,
          "revit_modified": bool}
     """
     node = _require_live_opening(kg, llm_id)
     sill_value = float(sill_height_m)
-    kg.modify_node(llm_id, {"sill_height": sill_value})
 
     if doc is None:
+        # Hors-Revit : pas de recompute familial, le KG trust la valeur
+        # demandée. Drift toujours False.
+        kg.modify_node(llm_id, {"sill_height": sill_value})
         return {
             "ok": True,
             "llm_id": llm_id,
             "sill_height_m": sill_value,
+            "head_height_m": node.get("head_height", 0.0),
+            "requested_sill_height_m": sill_value,
+            "drift": False,
+            "drift_note": None,
             "revit_modified": False,
         }
 
@@ -593,7 +679,8 @@ def set_sill_height(
     from Autodesk.Revit.DB import BuiltInParameter, ElementId
 
     eid = ElementId(eid_raw)
-    revit_modified = False
+    actual_sill_m: Optional[float] = None
+    actual_head_m: Optional[float] = None
     with rp.transaction(doc, "openings.set_sill_height"):
         element = doc.GetElement(eid)
         param = element.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
@@ -608,13 +695,40 @@ def set_sill_height(
                 "Revit refused to set sill height on {} {} — check the "
                 "family constraints.".format(node.get("_type"), llm_id)
             )
-        revit_modified = True
+        # Re-read BOTH parameters post-Set : the family's opening_height
+        # (type-level) may have forced Revit to recompute head_height
+        # to preserve `head − sill = opening_height`. We mirror the
+        # actual committed values in the KG, not the requested ones —
+        # otherwise the KG drifts silently from Revit (cf. JOURNAL.md
+        # 2026-05-11 session 5).
+        reread = _read_sill_head_m(element)
+        actual_sill_m = reread["sill_height_m"]
+        actual_head_m = reread["head_height_m"]
+        kg_updates: Dict[str, Any] = {}
+        if actual_sill_m is not None:
+            kg_updates["sill_height"] = float(actual_sill_m)
+        if actual_head_m is not None:
+            kg_updates["head_height"] = float(actual_head_m)
+        if kg_updates:
+            kg.modify_node(llm_id, kg_updates)
 
+    note = _drift_note(
+        "sill_height", sill_value, actual_sill_m, actual_head_m,
+    )
     return {
         "ok": True,
         "llm_id": llm_id,
-        "sill_height_m": sill_value,
-        "revit_modified": revit_modified,
+        "sill_height_m": (
+            round(actual_sill_m, 3) if actual_sill_m is not None else sill_value
+        ),
+        "head_height_m": (
+            round(actual_head_m, 3)
+            if actual_head_m is not None else node.get("head_height", 0.0)
+        ),
+        "requested_sill_height_m": round(sill_value, 3),
+        "drift": note is not None,
+        "drift_note": note,
+        "revit_modified": True,
     }
 
 
@@ -628,10 +742,15 @@ def set_head_height(
     """Règle la hauteur de linteau (`INSTANCE_HEAD_HEIGHT_PARAM`) d'une
     porte ou d'une fenêtre.
 
+    **Couplage sill ↔ head.** Voir `openings_set_sill_height` — même
+    contrainte symétrique. Setter le head décale le sill via la hauteur
+    d'ouverture du type. Drift signalé dans la réponse quand Revit
+    n'a pas tenu la valeur demandée.
+
     Concepts: linteau, lintel, head, hauteur, modification, porte, fenêtre
     Phrases: "passe le linteau à X cm", "lève le linteau",
              "set the head at", "abaisse le haut de la porte"
-    Similar: openings_set_sill_height
+    Similar: openings_set_sill_height, openings_set_type
 
     Args:
         llm_id: llm_id de la porte ou fenêtre à modifier.
@@ -639,18 +758,26 @@ def set_head_height(
             au niveau hôte, mesurée au haut de l'ouverture).
 
     Returns:
-        {"ok": bool, "llm_id": str, "head_height_m": float,
+        {"ok": bool, "llm_id": str,
+         "head_height_m": float,        # valeur réellement committée
+         "sill_height_m": float,        # sill après recompute Revit
+         "requested_head_height_m": float,
+         "drift": bool, "drift_note": str | None,
          "revit_modified": bool}
     """
     node = _require_live_opening(kg, llm_id)
     head_value = float(head_height_m)
-    kg.modify_node(llm_id, {"head_height": head_value})
 
     if doc is None:
+        kg.modify_node(llm_id, {"head_height": head_value})
         return {
             "ok": True,
             "llm_id": llm_id,
             "head_height_m": head_value,
+            "sill_height_m": node.get("sill_height", 0.0),
+            "requested_head_height_m": head_value,
+            "drift": False,
+            "drift_note": None,
             "revit_modified": False,
         }
 
@@ -666,7 +793,8 @@ def set_head_height(
     from Autodesk.Revit.DB import BuiltInParameter, ElementId
 
     eid = ElementId(eid_raw)
-    revit_modified = False
+    actual_sill_m: Optional[float] = None
+    actual_head_m: Optional[float] = None
     with rp.transaction(doc, "openings.set_head_height"):
         element = doc.GetElement(eid)
         param = element.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
@@ -681,13 +809,34 @@ def set_head_height(
                 "Revit refused to set head height on {} {} — check the "
                 "family constraints.".format(node.get("_type"), llm_id)
             )
-        revit_modified = True
+        reread = _read_sill_head_m(element)
+        actual_sill_m = reread["sill_height_m"]
+        actual_head_m = reread["head_height_m"]
+        kg_updates: Dict[str, Any] = {}
+        if actual_sill_m is not None:
+            kg_updates["sill_height"] = float(actual_sill_m)
+        if actual_head_m is not None:
+            kg_updates["head_height"] = float(actual_head_m)
+        if kg_updates:
+            kg.modify_node(llm_id, kg_updates)
 
+    note = _drift_note(
+        "head_height", head_value, actual_sill_m, actual_head_m,
+    )
     return {
         "ok": True,
         "llm_id": llm_id,
-        "head_height_m": head_value,
-        "revit_modified": revit_modified,
+        "head_height_m": (
+            round(actual_head_m, 3) if actual_head_m is not None else head_value
+        ),
+        "sill_height_m": (
+            round(actual_sill_m, 3)
+            if actual_sill_m is not None else node.get("sill_height", 0.0)
+        ),
+        "requested_head_height_m": round(head_value, 3),
+        "drift": note is not None,
+        "drift_note": note,
+        "revit_modified": True,
     }
 
 

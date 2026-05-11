@@ -818,6 +818,162 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
     return summary
 
 
+# ----- Post-mutation read-back (KG mirrors Revit reality) ----------------
+#
+# Discipline established 2026-05-11 (session 5) : every Revit-side
+# mutation tool should call this helper *after* its `param.Set` /
+# `MoveElement` / `Create` / etc. so the KG reflects what Revit actually
+# committed rather than what the caller asked. Without this, the KG
+# silently diverges whenever a Revit constraint overrides the request
+# (family-rigid opening_height, Top Constraint on walls, snap-to-grid on
+# placement, etc.) — see `_drift_note` in `tools/openings.py` for the
+# user-facing alert pattern.
+
+# Per-node-type whitelist of *volatile* attrs that should be mirrored
+# from Revit after a mutation. Refs (level_ref / type_ref /
+# host_wall_ref / wall_type_ref) are deliberately excluded — they are
+# set at creation, never altered by geometric mutations, and re-writing
+# them would force a schema validation cycle for no reason.
+_REFRESH_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "Wall": ("p1", "p2", "length", "height"),
+    "Column": ("position", "height"),
+    "Door": ("position", "sill_height", "head_height"),
+    "Window": ("position", "sill_height", "head_height"),
+    "ModelLine": ("p1", "p2", "length"),
+    "DetailLine": ("p1", "p2", "length"),
+    "Level": ("name", "elevation"),
+    "WallType": ("name", "total_thickness"),
+    "ColumnType": ("family_name", "type_name", "kind"),
+    "FamilyType": ("family_name", "type_name", "dimensions"),
+}
+
+
+def refresh_node_from_revit(
+    kg: ProjectKG, doc: Any, llm_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Re-read a Revit-bound KG node and mirror the live attrs in the KG.
+
+    Resolves the node type, looks up its Revit element via the bound
+    `_revit_id`, dispatches to the appropriate `_*_to_attrs` converter,
+    then `modify_node`s the volatile attrs declared in `_REFRESH_FIELDS`
+    for that type. Skips refs (level_ref / type_ref / host_wall_ref…)
+    which mutations never alter.
+
+    Returns the dict of fresh attrs actually mirrored, or `None` when
+    the node has no Revit binding (CLI / pytest path) or the Revit
+    element is gone (deleted / invalid id).
+
+    Tools call this **inside their `rp.transaction`** after a Set /
+    Move / Create, so the KG and Revit commit / rollback together via
+    the outer `kg.transaction()` posed by the dispatcher.
+    """
+    if not kg.has_node(llm_id):
+        return None
+    raw = kg.get_revit_id(llm_id)
+    if raw is None:
+        return None
+
+    node = kg.get_node(llm_id)
+    node_type = node.get("_type")
+    fields = _REFRESH_FIELDS.get(node_type)
+    if not fields:
+        return None
+
+    from Autodesk.Revit.DB import ElementId
+
+    element = doc.GetElement(ElementId(raw))
+    if element is None:
+        return None
+
+    if node_type == "Wall":
+        fresh = _wall_to_attrs(
+            element,
+            level_ref=node.get("level_ref"),
+            wall_type_ref=node.get("type_ref"),
+        )
+    elif node_type == "Column":
+        fresh = _column_to_attrs(
+            element,
+            level_ref=node.get("level_ref"),
+            type_ref=node.get("type_ref"),
+        )
+    elif node_type in ("Door", "Window"):
+        fresh = _opening_to_attrs(
+            element,
+            type_ref=node.get("type_ref"),
+            host_wall_ref=node.get("host_wall_ref"),
+        )
+    elif node_type in ("ModelLine", "DetailLine"):
+        fresh = _curve_element_to_attrs(element)
+    elif node_type == "Level":
+        fresh = _level_to_attrs(element)
+    elif node_type == "WallType":
+        fresh = _wall_type_to_attrs(element)
+    elif node_type == "ColumnType":
+        fresh = _column_type_to_attrs(element)
+    elif node_type == "FamilyType":
+        fresh = _family_type_to_attrs(
+            element, category=node.get("category", ""),
+        )
+    else:
+        return None
+
+    updates = {k: fresh[k] for k in fields if k in fresh}
+    if updates:
+        kg.modify_node(llm_id, updates)
+    return updates
+
+
+# Drift detection helper. Compares a requested scalar / vector against
+# what Revit actually committed (re-read via `refresh_node_from_revit`).
+# Returns (drift: bool, note: Optional[str]) — note is None when within
+# tolerance, otherwise a one-line explanation pointing at the likely
+# Revit-side constraint that overrode the value.
+_DRIFT_EPSILON = 5e-4  # half a mm tolerates feet↔metres round-trip.
+
+
+def detect_drift(
+    requested: Any, committed: Any, field: str = "value",
+) -> Tuple[bool, Optional[str]]:
+    """Return `(has_drift, note)` comparing requested vs committed.
+
+    - Scalars (int / float) compared by absolute difference.
+    - Lists (e.g. `[x, y]`, `[x, y, z]`) compared elementwise.
+    - `None` on either side → no drift signal (caller didn't know to
+      compare, or the live value wasn't readable).
+    """
+    if requested is None or committed is None:
+        return False, None
+    if isinstance(requested, (list, tuple)):
+        if not isinstance(committed, (list, tuple)) or len(committed) != len(requested):
+            return True, (
+                "Revit committed shape {} mais on attendait {} pour {}".format(
+                    committed, requested, field,
+                )
+            )
+        diff = max(
+            abs(float(c) - float(r))
+            for r, c in zip(requested, committed)
+        )
+        if diff <= _DRIFT_EPSILON:
+            return False, None
+        return True, (
+            "Revit a commit {} au lieu de {} demandé pour {} "
+            "(écart max {:.3f} m)".format(committed, requested, field, diff)
+        )
+    try:
+        diff = abs(float(committed) - float(requested))
+    except (TypeError, ValueError):
+        return False, None
+    if diff <= _DRIFT_EPSILON:
+        return False, None
+    return True, (
+        "Revit a commit {:.3f} au lieu de {:.3f} demandé pour {}".format(
+            float(committed), float(requested), field,
+        )
+    )
+
+
 # ----- Generic Revit element → KG dispatcher ----------------------------
 
 

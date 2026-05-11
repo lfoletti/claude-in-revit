@@ -91,44 +91,15 @@ def _build_elementid_collection(raw_ids: List[int]) -> Any:
 
 def _refresh_kg_geometry(kg: ProjectKG, doc: Any, llm_ids: List[str]) -> None:
     """After an in-place Revit transform (translate/rotate), the KG
-    geometry stored on each node is stale. Re-extract from Revit and
-    `modify_node` in place. Refs (level/type) are assumed unchanged by
-    the transform."""
-    from Autodesk.Revit.DB import ElementId
+    geometry stored on each node is stale. Delegate to the central
+    `kg_sync.refresh_node_from_revit` (which covers every supported
+    node type — Walls, Columns, Doors, Windows, Lines — via the
+    `_REFRESH_FIELDS` whitelist). Refs (level/type/host) are
+    intentionally NOT touched by the helper, as transforms don't
+    change them."""
     from .. import kg_sync
     for lid in llm_ids:
-        raw = kg.get_revit_id(lid)
-        if raw is None:
-            continue
-        element = doc.GetElement(ElementId(raw))
-        if element is None:
-            continue
-        node = kg.get_node(lid)
-        t = node.get("_type")
-        if t == "Wall":
-            new = kg_sync._wall_to_attrs(
-                element,
-                level_ref=node["level_ref"],
-                wall_type_ref=node["type_ref"],
-            )
-            kg.modify_node(lid, {
-                "p1": new["p1"], "p2": new["p2"],
-                "length": new["length"], "height": new["height"],
-            })
-        elif t in ("ModelLine", "DetailLine"):
-            new = kg_sync._curve_element_to_attrs(element)
-            kg.modify_node(lid, {
-                "p1": new["p1"], "p2": new["p2"], "length": new["length"],
-            })
-        elif t == "Column":
-            new = kg_sync._column_to_attrs(
-                element,
-                level_ref=node["level_ref"],
-                type_ref=node["type_ref"],
-            )
-            kg.modify_node(lid, {
-                "position": new["position"], "height": new["height"],
-            })
+        kg_sync.refresh_node_from_revit(kg, doc, lid)
 
 
 def _apply_translation_to_kg_node(

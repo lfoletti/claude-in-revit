@@ -263,13 +263,21 @@ def create(
         )
         kg.set_revit_id(llm_id, revit_id)
         stamp_llm_id(instance, llm_id)
+        # Read-back discipline (2026-05-11 session 5) : NewFamilyInstance
+        # may snap the column to the nearest grid intersection or to a
+        # locked alignment. Mirror Revit reality so subsequent queries
+        # don't trust the requested position blindly.
+        from .. import kg_sync as _kg_sync
+        _kg_sync.refresh_node_from_revit(kg, doc, llm_id)
 
+    actual = kg.get_node(llm_id)
     return {
         "ok": True,
         "llm_id": llm_id,
         "revit_id": revit_id,
         "kind": kind,
-        "height_m": height,
+        "height_m": round(actual.get("height", height), 3),
+        "position": actual.get("position"),
         "height_default": height_default,
     }
 
@@ -466,6 +474,11 @@ def create_many(
             kg.set_revit_id(llm_id, revit_id)
             stamp_llm_id(instance, llm_id)
             llm_ids.append(llm_id)
+        # Read-back discipline : mirror live Revit position/height on
+        # every column post-creation.
+        from .. import kg_sync as _kg_sync
+        for nid in llm_ids:
+            _kg_sync.refresh_node_from_revit(kg, doc, nid)
 
     return bulk_summary(llm_ids)
 

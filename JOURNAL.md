@@ -14,6 +14,299 @@
 
 ---
 
+## 2026-05-11 (session 5) — Discipline read-back KG↔Revit systématique sur tout objet
+
+### Contexte & objectif
+
+La validation runtime des openings (session 4) a révélé une **drift
+KG↔Revit** sur `window_016` : après un appel multi-tour pour ajuster
+toutes les fenêtres (sill=0.80 m, head=2.20 m), le KG indiquait bien
+les valeurs demandées, mais Revit affichait `sill=1.45 m / head=2.20 m`
+sur cette instance spécifique. Diagnostic : la famille de
+`window_016` a `opening_height=0.75 m` (paramètre de TYPE), donc Revit
+impose `head − sill = 0.75`. Le LLM a successivement appelé
+`set_sill_height(0.80)` puis `set_head_height(2.20)` — la deuxième
+écriture (head) a sticked et Revit a recomputé `sill` à `2.20 − 0.75
+= 1.45`. **Côté KG, on avait écrit ce qu'on demandait, pas ce que
+Revit a réellement committé.**
+
+Le pattern bug est plus large que les openings : tout tool qui ferme
+sa transaction sans relire l'état Revit peut laisser le KG diverger.
+Demande utilisateur : « ce mécanisme de drift modèle/KG devrait être
+appliqué **systématiquement** pour éviter toute différence » +
+« systématiquement à **tout objet** je veux dire ». Cette session
+établit cette discipline comme invariant d'architecture.
+
+### Décisions
+
+1. **Discipline read-back universelle** : après chaque mutation Revit
+   (`param.Set`, `Wall.Create`, `MoveElement`, `NewFamilyInstance`,
+   etc.), le tool relit l'élément depuis Revit via un helper central
+   et mirror les attrs dans le KG. Le KG **ne fait jamais confiance
+   à la valeur demandée** — il mirror la valeur committée. Cas où
+   Revit recompute / refuse silencieusement :
+   - Familles avec dimensions de type rigides (sill ↔ head couplés
+     par `opening_height`).
+   - Walls avec Top Constraint qui figent la hauteur indépendamment
+     de `WALL_USER_HEIGHT_PARAM`.
+   - Placement snap-to-grid sur instances hostées.
+   - Locked alignments sur les MoveElement.
+
+2. **Helper central `kg_sync.refresh_node_from_revit(kg, doc, llm_id)`**
+   plutôt que pattern dupliqué dans chaque tool. Dispatch par node
+   type vers le bon `_*_to_attrs` (Wall / Column / Door / Window /
+   ModelLine / DetailLine / Level / WallType / ColumnType / FamilyType
+   — 10 types couverts dès aujourd'hui). Une seule source de vérité
+   pour la convention « attrs volatiles vs refs immuables ».
+
+3. **Whitelist `_REFRESH_FIELDS`** au lieu d'overwrite global. Pour
+   chaque node type, on déclare les attrs *volatiles* à mirror
+   (`p1, p2, length, height` pour Wall, `position, sill_height,
+   head_height` pour Door/Window, etc.). Les refs (`level_ref /
+   type_ref / host_wall_ref / wall_type_ref`) sont *exclues* — elles
+   sont fixées à la création et ne changent jamais sous une
+   mutation géométrique. Économise les validations de schéma et
+   évite d'écraser une référence si jamais une mutation Revit
+   touchait la `Host` (rare mais possible).
+
+4. **Helper de comparaison `detect_drift(requested, committed,
+   field)`** retournant `(drift: bool, note: Optional[str])`. Gère :
+   - Scalaires (différence absolue).
+   - Vecteurs `[x, y]` / `[x, y, z]` (élémentwise, max écart).
+   - `None` des deux côtés (silent — pas de signal sur ce qu'on ne
+     sait pas comparer).
+   - Shape mismatch entre requested et committed (flagué comme drift
+     suspect).
+   - Tolérance `5e-4 m` (½ mm) — absorbe le round-trip pieds↔mètres
+     sans flagger des faux drifts.
+
+5. **Symétrie sill ↔ head dans les setters d'openings.**
+   `openings_set_sill_height` ne se contente pas de relire `sill_param`
+   après `Set` — il relit **aussi** `head_param`, car la contrainte
+   familiale `head = sill + opening_height_of_type` peut décaler les
+   deux. Le KG mirror les deux valeurs ; la `drift_note` pointe vers
+   `openings_set_type` / `openings_create_type_variant` comme
+   contournement.
+
+6. **`transforms._refresh_kg_geometry` délégué au helper central**
+   pour DRY. L'ancienne version privée couvrait 3 types (Wall, Column,
+   Line) — elle aurait silencieusement perdu Door/Window après leur
+   ajout en session 4. Délégation à `kg_sync.refresh_node_from_revit`
+   couvre les 10 types d'un coup.
+
+7. **Réponse uniforme entre KG-only et Revit path.** Les tools
+   refactorés exposent toujours `requested_<field>`, `drift`,
+   `drift_note` — en KG-only `drift=False` et `requested=committed`
+   par construction. Le LLM voit le même shape, peut écrire un seul
+   code path de traitement, et la discipline reste lisible dans les
+   tests hors-Revit.
+
+8. **`drift` reporté dans le payload, pas dans le system prompt.**
+   Le LLM lit le tool_result et adapte sa réponse à l'utilisateur
+   (alerte explicite si `drift: true`). Pas de règle système à
+   maintenir — la sémantique vit dans la donnée retournée. Tom Note
+   intègre déjà le pointeur vers le contournement (`openings_set_type`
+   pour les openings, mention Top Constraint pour `walls_set_height`).
+
+### Phase 1 — Fix immédiat `openings_set_sill_height` / `_set_head_height`
+
+Refactor pour relire `INSTANCE_SILL_HEIGHT_PARAM` **et**
+`INSTANCE_HEAD_HEIGHT_PARAM` après chaque `param.Set` (peu importe
+lequel des deux a été demandé) — la contrainte familiale couple les
+deux. KG mirror les deux valeurs commitées. Helper privé
+`_read_sill_head_m(element)` factorise la lecture. Helper privé
+`_drift_note(field, requested, actual_sill, actual_head)` produit le
+texte explicatif pointant vers `openings_set_type` /
+`_create_type_variant`. Le tolérancement `_DRIFT_EPSILON_M = 5e-4`
+absorbe le bruit numérique.
+
+Format de la réponse étendu :
+- `sill_height_m` / `head_height_m` = valeurs committées (relues).
+- `requested_<field>_m` = ce que l'utilisateur a demandé.
+- `drift: bool` + `drift_note: str | None`.
+- `revit_modified: bool`.
+
+### Phase 2 — Audit + helpers centraux
+
+`lib/kg_sync.py` :
+- **`refresh_node_from_revit(kg, doc, llm_id) -> Optional[Dict]`** :
+  lit `_revit_id`, fait `doc.GetElement(ElementId(raw))`, dispatch
+  sur le `_*_to_attrs` du type, `modify_node` les fields whitelistés.
+  Returns `None` si pas bindé / element absent.
+- **`_REFRESH_FIELDS: Dict[str, Tuple[str, ...]]`** : whitelist
+  par type. 10 entrées (Wall, Column, Door, Window, ModelLine,
+  DetailLine, Level, WallType, ColumnType, FamilyType). Une seule
+  source à mettre à jour si on ajoute un type.
+- **`detect_drift(requested, committed, field='value') -> (bool,
+  Optional[str])`** : voir Décision 4.
+- **`_DRIFT_EPSILON = 5e-4`** constante module.
+
+Audit des tools : 9 chemins de mutation sans read-back identifiés
+(walls × 4, columns × 4, plus walls_move qui calcule sa nouvelle
+position mais ne relit pas).
+
+### Phase 3 — Refactor walls
+
+`lib/tools/walls.py` :
+
+- **`walls_create`** : appel `refresh_node_from_revit(kg, doc, llm_id)`
+  après `Wall.Create` + `set_revit_id` + `stamp_llm_id`. Réponse
+  étendue avec `p1_m / p2_m / length_m / height_m` (actuels).
+- **`walls_create_many`** : read-back per-wall après la boucle de
+  création (boucle séparée pour ne pas re-Get chaque élément avant
+  son commit). Idem pattern bulk activation des FamilySymbols.
+- **`walls_move`** : remplace `kg.modify_node({p1, p2})` par
+  `refresh_node_from_revit`. Compare au `new_p1 / new_p2` calculé →
+  emit `drift` + `drift_note`. KG-only path : réponse compatible
+  (drift=False, requested=committed).
+- **`walls_set_height`** : remplace `kg.modify_node({height})` par
+  `refresh_node_from_revit`. Compare la `height` committée à
+  `height_m` demandé → `drift_note` enrichi d'un pointeur Top
+  Constraint quand divergence (cas typique : un mur ancré à un
+  niveau supérieur ignore la hauteur libre).
+
+### Phase 4 — Refactor columns
+
+`lib/tools/columns.py` :
+
+- **`columns_create`** : read-back après `NewFamilyInstance` +
+  `FAMILY_TOP_LEVEL_OFFSET_PARAM.Set`. Réponse expose `position` et
+  `height_m` actuels — snap-to-grid sur les grilles Revit
+  potentiellement visible ici.
+- **`columns_create_many`** : read-back per-column en fin de boucle
+  (idem walls). `columns_create_grid` / `_grid_irregular` héritent
+  automatiquement via leur délégation à `columns_create_many`.
+
+### Phase 5 — Refactor transforms
+
+`lib/tools/transforms.py` :
+
+`_refresh_kg_geometry` réduit à 4 lignes — délègue à
+`kg_sync.refresh_node_from_revit` pour chaque `llm_id`. Couvre
+maintenant Door/Window automatiquement (gain par rapport à l'ancienne
+version qui aurait perdu ces types post-session 4). Tous les 7
+transforms `elements_*` héritent.
+
+### Phase 6 — Tests (+14)
+
+`tests/test_kg_sync.py` (+6) :
+- `refresh_node_from_revit` retourne None sur node sans `_revit_id`
+  binding (CLI path).
+- Retourne None sur llm_id inconnu (pas de KeyError).
+- `detect_drift` no-drift dans la tolérance (5e-4 m).
+- `detect_drift` scalaire reporte la différence.
+- `detect_drift` vecteur compare elementwise.
+- `detect_drift` tolère `None` silencieusement.
+- `detect_drift` vector length mismatch → drift suspect.
+
+`tests/test_tools.py` (+5 dont 3 drift sill/head session-spécifique +
+2 walls drift fields) :
+- `openings_set_sill_height` KG-only expose `requested_sill_height_m`,
+  `drift=False`, `drift_note=None`, `head_height_m` reporté.
+- Symétrique pour `openings_set_head_height`.
+- `_drift_note` helper test direct (avec / sans drift / avec None
+  actual).
+- `walls_set_height` réponse contient `requested_height_m`, `drift`,
+  `drift_note` même en KG-only.
+- `walls_move` réponse contient `requested_p1_m`, `requested_p2_m`,
+  `drift`, `drift_note` même en KG-only.
+
+### Validation
+
+- `pytest -q` : **228 tests verts en ~7s** (214 → +14). Aucune
+  régression. Le compteur a augmenté par étapes :
+  - 214 → 219 : fix immédiat openings_set_sill_height / _set_head_height
+    + tests de structure de réponse.
+  - 219 → 225 : helpers `refresh_node_from_revit` + `detect_drift`
+    + tests unitaires des helpers.
+  - 225 → 228 : refactor walls + tests structure de réponse drift
+    sur `walls_set_height` / `walls_move` en KG-only.
+- **Validation runtime à venir** sur le projet test : refaire le
+  scénario qui a déclenché le bug (toutes les fenêtres sill=0.80
+  head=2.20 avec types mixtes) — vérifier que la réponse signale
+  drift sur `window_016`, et que le KG mirror sill=1.45 (au lieu de
+  0.80) après les mutations.
+
+### Couverture de la discipline post-session 5
+
+Tools mutants qui appellent maintenant `refresh_node_from_revit` (ou
+équivalent) après leur mutation :
+
+| Tool | Helper appelé | Drift fields exposés |
+|------|---------------|----------------------|
+| `walls_create` | ✓ direct | (création — pas de drift par construction) |
+| `walls_create_many` | ✓ boucle | idem |
+| `walls_create_polyline` / `_from_lines` | ✓ via `_create_many` | idem |
+| `walls_move` | ✓ direct | `drift` + `drift_note` + `requested_p1_m` / `_p2_m` |
+| `walls_set_height` | ✓ direct | `drift` + `drift_note` (Top Constraint) + `requested_height_m` |
+| `walls_delete` | n/a (suppression) | — |
+| `columns_create` | ✓ direct | (création) |
+| `columns_create_many` / `_grid` / `_grid_irregular` | ✓ boucle | idem |
+| `openings_create_*` | déjà ✓ (session 4) | (création) |
+| `openings_set_sill_height` | ✓ direct (sill + head re-lus) | `drift` + `drift_note` |
+| `openings_set_head_height` | ✓ direct (sill + head re-lus) | `drift` + `drift_note` |
+| `openings_set_type` | déjà ✓ (session 4) | (sill/head re-lus post-swap) |
+| `openings_create_type_variant` | déjà ✓ (session 4) | (dimensions re-lues post-Set) |
+| `openings_delete` | n/a (suppression) | — |
+| `elements_translate` / `_rotate` | ✓ via `_refresh_kg_geometry` (→ helper central) | (transforms in-place) |
+| `elements_mirror` / `_copy` / `_array_*` | ✓ via `ingest_revit_element` (re-lit dès la copie) | (création de copies) |
+
+**14 tools mutants** sur 16 ont le read-back ; les 2 restants
+(`walls_delete`, `openings_delete`) n'en ont pas besoin (suppression
+unidirectionnelle).
+
+### État final & reste à faire
+
+**Acquis session 5** :
+- Helper central `refresh_node_from_revit` (10 types couverts) ✓
+- Helper `detect_drift` (scalaire / vecteur / None / shape mismatch) ✓
+- `openings_set_sill_height` / `_set_head_height` relisent sill ET
+  head avec drift_note pointant vers `openings_set_type` ✓
+- Refactor walls : `_create`, `_create_many`, `_move`,
+  `_set_height` avec read-back systématique ✓
+- Refactor columns : `_create`, `_create_many` (grid / irregular
+  héritent) avec read-back ✓
+- `transforms._refresh_kg_geometry` délégué au helper central →
+  couvre Door/Window automatiquement ✓
+- Réponses uniformes drift / drift_note / requested_* entre KG-only
+  et Revit path ✓
+- 14 nouveaux tests, baseline **228 verts** ✓
+
+**Dettes / TODO créés** :
+1. **`detect_drift` n'est appelé que sur les setters de valeur**
+   (`walls_set_height`, `walls_move`, `openings_set_*_height`). Sur
+   les créations (`*_create_*`), le read-back mirror sans flagger
+   de drift — on n'a pas de "requested" à comparer dans le cas
+   création. Si on voulait flagger un snap-to-grid à la création
+   (ex : « j'ai demandé p1=[0.524, 3.955] mais Revit a snappé à
+   [0.5, 4.0] »), il faudrait passer les valeurs demandées au
+   helper et étendre. Pas urgent — détecter au runtime si le cas
+   se présente.
+2. **Pas de pré-check de feasibility** côté openings : si
+   `family_height` est connu (via `FamilyType.dimensions`), on
+   pourrait anticiper le drift avant le Set et alerter le LLM en
+   amont (« sill=0.80 + family_height=0.75 = head=1.55, donc le
+   2.20 demandé ne tiendra pas »). Plus ergonomique, mais
+   demande de propager `dimensions.height_m` partout. Repoussé.
+3. **Helper read-back par catégorie d'attrs** : on relit TOUS les
+   fields whitelistés à chaque mutation, même si seul un changeait.
+   Coût acceptable (un Element fetch + un appel converter) mais
+   surveillable sur des bulk size > 100. Optimisation tardive si
+   le profil le réclame.
+
+**Suite immédiate (§9 DESIGN, Semaines 2-3 V0 restant)** :
+- `rooms.py` : create, recompute_boundaries, set_name, get_area +
+  convertisseur Room. La discipline read-back s'appliquera dès
+  l'écriture des tools (helper central déjà prêt à accueillir Room
+  dans `_REFRESH_FIELDS`).
+- `levels.py` (écriture) : create, modify_elevation, set_active.
+
+**Suite Sem.4-5 V0** :
+- `dwg_reader.py` + `dwg_classifier.py` (ezdxf) → UC1.
+- `tools/bulk.py` (`apply_to_filter`, `change_param_bulk`) → UC7.
+
+---
+
 ## 2026-05-11 (session 4) — Openings (portes/fenêtres) + préprocesseur déterministe + découplage sill/head
 
 ### Contexte & objectif

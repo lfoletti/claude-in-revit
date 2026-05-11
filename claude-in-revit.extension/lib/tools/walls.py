@@ -169,11 +169,20 @@ def create(
         llm_id = _record_in_kg(kg, level_ref, wall_type_ref, p1, p2, length, height)
         kg.set_revit_id(llm_id, revit_id)
         stamp_llm_id(wall, llm_id)
+        # Read-back discipline (2026-05-11 session 5) : Revit may snap
+        # endpoints to nearest gridline, refuse short curves, or
+        # otherwise adjust geometry. KG mirrors what was committed.
+        from .. import kg_sync as _kg_sync
+        _kg_sync.refresh_node_from_revit(kg, doc, llm_id)
 
+    actual = kg.get_node(llm_id)
     return {
         "ok": True,
         "llm_id": llm_id,
-        "length_m": round(length, 3),
+        "length_m": round(actual.get("length", length), 3),
+        "height_m": round(actual.get("height", height), 3),
+        "p1_m": actual.get("p1"),
+        "p2_m": actual.get("p2"),
         "revit_id": revit_id,
     }
 
@@ -292,6 +301,10 @@ def move(
             "llm_id": llm_id,
             "p1_m": new_p1,
             "p2_m": new_p2,
+            "requested_p1_m": new_p1,
+            "requested_p2_m": new_p2,
+            "drift": False,
+            "drift_note": None,
             "revit_moved": False,
         }
 
@@ -301,20 +314,36 @@ def move(
             "Wall {} has no Revit binding — run Refresh KG.".format(llm_id)
         )
 
-    from .. import revit_primitives as rp
+    from .. import kg_sync, revit_primitives as rp
     from Autodesk.Revit.DB import ElementId, ElementTransformUtils, XYZ
 
     translation = XYZ(rp.meters_to_internal(dx), rp.meters_to_internal(dy), 0.0)
     eid = ElementId(eid_raw)
     with rp.transaction(doc, "walls.move"):
         ElementTransformUtils.MoveElement(doc, eid, translation)
-        kg.modify_node(llm_id, {"p1": new_p1, "p2": new_p2})
+        # Mirror Revit reality (read-back discipline 2026-05-11 session 5)
+        # rather than trust the computed translation. Cheap insurance
+        # against future cases where Revit might snap the move (e.g.
+        # constrained by alignment, locked end, etc.).
+        kg_sync.refresh_node_from_revit(kg, doc, llm_id)
+
+    refreshed = kg.get_node(llm_id)
+    actual_p1 = refreshed["p1"]
+    actual_p2 = refreshed["p2"]
+    drift_p1, note_p1 = kg_sync.detect_drift(new_p1, actual_p1, field="p1")
+    drift_p2, note_p2 = kg_sync.detect_drift(new_p2, actual_p2, field="p2")
+    drift = drift_p1 or drift_p2
+    drift_note = note_p1 or note_p2
 
     return {
         "ok": True,
         "llm_id": llm_id,
-        "p1_m": new_p1,
-        "p2_m": new_p2,
+        "p1_m": actual_p1,
+        "p2_m": actual_p2,
+        "requested_p1_m": new_p1,
+        "requested_p2_m": new_p2,
+        "drift": drift,
+        "drift_note": drift_note,
         "revit_moved": True,
     }
 
@@ -348,6 +377,9 @@ def set_height(
             "ok": True,
             "llm_id": llm_id,
             "height_m": height_m,
+            "requested_height_m": height_m,
+            "drift": False,
+            "drift_note": None,
             "revit_modified": False,
         }
 
@@ -357,7 +389,7 @@ def set_height(
             "Wall {} has no Revit binding — run Refresh KG.".format(llm_id)
         )
 
-    from .. import revit_primitives as rp
+    from .. import kg_sync, revit_primitives as rp
     from Autodesk.Revit.DB import BuiltInParameter, ElementId
 
     eid = ElementId(eid_raw)
@@ -375,12 +407,29 @@ def set_height(
                 "Setting WALL_USER_HEIGHT_PARAM on {} returned False — the "
                 "parameter may be read-only (constrained by Top Constraint).".format(llm_id)
             )
-        kg.modify_node(llm_id, {"height": height_m})
+        # Read-back discipline : Top Constraint or other rules may have
+        # silently overridden our Set even though it returned True. The
+        # KG mirrors what Revit actually kept.
+        kg_sync.refresh_node_from_revit(kg, doc, llm_id)
+
+    actual_height = kg.get_node(llm_id).get("height", height_m)
+    drift, drift_note = kg_sync.detect_drift(
+        height_m, actual_height, field="height_m",
+    )
+    if drift and drift_note:
+        drift_note = (
+            drift_note
+            + " (probable Top Constraint ou contrainte de niveau supérieur "
+            "qui fixe la hauteur)"
+        )
 
     return {
         "ok": True,
         "llm_id": llm_id,
-        "height_m": height_m,
+        "height_m": round(actual_height, 3),
+        "requested_height_m": round(height_m, 3),
+        "drift": drift,
+        "drift_note": drift_note,
         "revit_modified": True,
     }
 
@@ -529,6 +578,11 @@ def create_many(
             kg.set_revit_id(llm_id, revit_id)
             stamp_llm_id(wall, llm_id)
             llm_ids.append(llm_id)
+        # Read-back discipline : mirror live Revit geometry on every
+        # wall, in case Revit snapped any endpoint.
+        from .. import kg_sync as _kg_sync
+        for nid in llm_ids:
+            _kg_sync.refresh_node_from_revit(kg, doc, nid)
 
     return bulk_summary(llm_ids)
 

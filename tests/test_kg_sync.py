@@ -606,6 +606,69 @@ def test_full_rescan_persists_clean_floats_in_kg(monkeypatch, tmp_path):
     assert reloaded.get_node("level_001")["elevation"] == 0.2
 
 
+# ----- refresh_node_from_revit + detect_drift ---------------------------
+
+
+def test_refresh_node_from_revit_returns_none_for_unbound_node():
+    """Pas de _revit_id sur le node → helper retourne None silencieusement
+    (CLI / pytest path, le KG est déjà la source de vérité)."""
+    kg = ProjectKG("p")
+    nid = kg.add_node("Level", {"name": "N00", "elevation": 0.0})
+    # No set_revit_id → unbound.
+    result = kg_sync.refresh_node_from_revit(kg, doc=object(), llm_id=nid)
+    assert result is None
+
+
+def test_refresh_node_from_revit_returns_none_for_unknown_llm_id():
+    """Helper tolère un llm_id absent (pas de KeyError) — pratique
+    pour les tools qui itèrent sur une liste."""
+    kg = ProjectKG("p")
+    result = kg_sync.refresh_node_from_revit(
+        kg, doc=object(), llm_id="ghost_001",
+    )
+    assert result is None
+
+
+def test_detect_drift_no_drift_within_epsilon():
+    """5e-4 m de tolérance pour absorber le round-trip pieds↔mètres."""
+    drift, note = kg_sync.detect_drift(2.7, 2.70003)
+    assert drift is False
+    assert note is None
+
+
+def test_detect_drift_scalar_reports_difference():
+    drift, note = kg_sync.detect_drift(2.7, 2.95, field="height_m")
+    assert drift is True
+    assert "2.700" in note or "2.7" in note
+    assert "2.950" in note or "2.95" in note
+    assert "height_m" in note
+
+
+def test_detect_drift_vector_compares_elementwise():
+    """`[x, y]` p1 / p2 comparés composante par composante, max écart."""
+    drift, note = kg_sync.detect_drift([0.0, 0.0], [0.0, 0.0001])
+    assert drift is False
+    drift, note = kg_sync.detect_drift([0.0, 0.0], [0.0, 0.05], field="p2")
+    assert drift is True
+    assert "p2" in note
+
+
+def test_detect_drift_handles_none_silently():
+    """Si on n'a pas pu relire le live (None) ou pas demandé (None), pas
+    de drift signalé — pas de bruit."""
+    drift, note = kg_sync.detect_drift(None, 2.0)
+    assert drift is False
+    drift, note = kg_sync.detect_drift(2.0, None)
+    assert drift is False
+
+
+def test_detect_drift_vector_length_mismatch_flags_drift():
+    """Si Revit retourne un shape différent, c'est suspect → drift."""
+    drift, note = kg_sync.detect_drift([0.0, 0.0], [0.0, 0.0, 0.0])
+    assert drift is True
+    assert "shape" in note
+
+
 def test_kg_synced_propagates_revit_failure_and_restores_kg(tmp_path, monkeypatch):
     """If the Revit Tx fails on commit (raised by the fake), KG snapshot restored."""
     @contextmanager

@@ -272,6 +272,42 @@ def test_walls_move_revit_path_requires_binding(kg_with_wall):
     assert kg.get_node(wall)["p1"] == [0.0, 0.0]
 
 
+def test_walls_set_height_response_includes_drift_fields(kg_with_wall):
+    """Discipline read-back : la réponse de walls_set_height expose
+    `requested_height_m` + `drift` + `drift_note` même en KG-only,
+    pour que le LLM ait toujours le même shape."""
+    kg, _, _, wall = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "walls_set_height",
+        {"llm_id": wall, "height_m": 3.0},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["height_m"] == 3.0
+    assert payload["requested_height_m"] == 3.0
+    assert payload["drift"] is False
+    assert payload["drift_note"] is None
+
+
+def test_walls_move_response_includes_drift_fields(kg_with_wall):
+    """Pareil pour walls_move : p1_m / p2_m sont les valeurs effectives,
+    requested_p1_m / requested_p2_m exposent la trajectoire demandée."""
+    kg, _, _, wall = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "walls_move",
+        {"llm_id": wall, "dx": 2.0, "dy": 0.0},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["p1_m"] == [2.0, 0.0]
+    assert payload["p2_m"] == [7.0, 0.0]
+    assert payload["requested_p1_m"] == [2.0, 0.0]
+    assert payload["requested_p2_m"] == [7.0, 0.0]
+    assert payload["drift"] is False
+
+
 def test_walls_set_height_kg_only_updates_attr(kg_with_wall):
     kg, _, _, wall = kg_with_wall
     result = llm_protocol.dispatch_tool_use(
@@ -1475,6 +1511,36 @@ def test_openings_set_sill_height_kg_only_updates_attr(kg_with_opening_setup):
     assert kg.get_node(nid)["sill_height"] == 1.2
 
 
+def test_openings_set_sill_height_kg_only_reports_no_drift(kg_with_opening_setup):
+    """En KG-only (pas de Revit pour recalculer), le drift est toujours
+    False et la réponse expose `requested_sill_height_m` + le
+    head_height courant (pour que l'utilisateur voie le couple
+    complet)."""
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {
+            "host_wall_ref": wall, "family_type_ref": window_type,
+            "position": [2.5, 0.0], "sill_height": 0.9,
+        },
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    set_result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height",
+        {"llm_id": nid, "sill_height_m": 1.2},
+        "t2", kg,
+    )
+    payload = json.loads(set_result["content"])
+    assert payload["drift"] is False
+    assert payload["drift_note"] is None
+    assert payload["requested_sill_height_m"] == 1.2
+    assert payload["sill_height_m"] == 1.2
+    # Head reporté tel qu'il était dans le KG (KG-only ne recalcule pas).
+    assert "head_height_m" in payload
+
+
 def test_openings_set_head_height_kg_only_updates_attr(kg_with_opening_setup):
     kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
     create = llm_protocol.dispatch_tool_use(
@@ -1497,6 +1563,82 @@ def test_openings_set_head_height_kg_only_updates_attr(kg_with_opening_setup):
     payload = json.loads(set_result["content"])
     assert payload["head_height_m"] == 2.10
     assert kg.get_node(nid)["head_height"] == 2.10
+
+
+def test_openings_set_head_height_kg_only_reports_no_drift(kg_with_opening_setup):
+    """Symétrique de sill : KG-only, drift=False, requested_head_height_m
+    exposé."""
+    kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall, "family_type_ref": door_type,
+            "position": [1.0, 0.0],
+        },
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    set_result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": nid, "head_height_m": 2.10},
+        "t2", kg,
+    )
+    payload = json.loads(set_result["content"])
+    assert payload["drift"] is False
+    assert payload["drift_note"] is None
+    assert payload["requested_head_height_m"] == 2.10
+    assert payload["head_height_m"] == 2.10
+    assert "sill_height_m" in payload
+
+
+def test_drift_note_built_when_committed_diverges():
+    """Test direct de l'helper `_drift_note` : si la valeur committée
+    diffère de la demandée au-delà du seuil, on a une note explicative
+    qui pointe vers openings_set_type / openings_create_type_variant."""
+    from lib.tools import openings
+
+    # Demandé sill=0.80, Revit a commit sill=1.45 → drift attendu.
+    note = openings._drift_note(  # noqa: SLF001
+        "sill_height",
+        requested_value=0.80,
+        actual_sill=1.45,
+        actual_head=2.20,
+    )
+    assert note is not None
+    assert "1.450" in note or "1.45" in note
+    assert "0.800" in note or "0.80" in note
+    # Le LLM doit y voir le contournement à proposer.
+    assert "openings_set_type" in note
+    assert "openings_create_type_variant" in note
+
+
+def test_drift_note_none_when_committed_matches():
+    """Pas de drift = pas de note. Tolérance demi-mm pour absorber le
+    round-trip pieds↔mètres."""
+    from lib.tools import openings
+
+    note = openings._drift_note(  # noqa: SLF001
+        "sill_height",
+        requested_value=0.80,
+        actual_sill=0.80003,  # < epsilon
+        actual_head=2.20,
+    )
+    assert note is None
+
+
+def test_drift_note_none_when_actual_unreadable():
+    """Si on n'a pas pu relire le paramètre depuis Revit (None), pas
+    de drift signalé — on ne sait juste pas."""
+    from lib.tools import openings
+
+    note = openings._drift_note(  # noqa: SLF001
+        "head_height",
+        requested_value=2.20,
+        actual_sill=0.80,
+        actual_head=None,
+    )
+    assert note is None
 
 
 def test_openings_delete_kg_only_soft_deletes(kg_with_opening_setup):
