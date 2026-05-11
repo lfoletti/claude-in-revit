@@ -419,6 +419,189 @@ def test_open_or_create_loads_existing_kg(fake_home):
     assert reloaded.find_by_type("Level")
 
 
+# ----- full_rescan : llm_id stability + log filtering + FP rounding ----
+#
+# `full_rescan` was extended on 2026-05-12 (cf. JOURNAL.md entry) to:
+# 1. Snapshot `{revit_id: llm_id}` BEFORE clearing topology, then reuse
+#    those ids during the rebuild → walls/columns/etc. survive a refresh
+#    without being renumbered (the UX bug that triggered this work).
+# 2. Suppress per-element `create` events; only a single `rescan` log
+#    event remains, with a summary including `preserved_llm_ids`.
+# 3. Round float artifacts at the SI conversion boundary (6 decimals).
+#
+# A minimal `lib.revit_primitives` stub lets us exercise the orchestration
+# without needing Autodesk.Revit.DB. We focus on Level (the simplest
+# converter) — walls/columns/lines require deeper Revit stubs and are
+# exercised at runtime in `refresh_kg.pushbutton`.
+
+
+class _FakeLevel:
+    """Stand-in for `Autodesk.Revit.DB.Level` — only the attrs the
+    converter reads (`Name`, `Elevation`, `Id.Value`)."""
+    def __init__(self, name, elevation, revit_id):
+        self.Name = name
+        self.Elevation = float(elevation)
+        self.Id = _FakeElementId(revit_id)
+
+
+def _install_rescan_stub(monkeypatch, *, levels=()):
+    """Inject a `lib.revit_primitives` stub for full_rescan tests.
+
+    Defaults: collectors return empty for everything except `levels`
+    (focus on the simplest converter). `internal_to_meters` is identity
+    so test elevations stay in the values we set. `transaction` is a
+    no-op ctx. No `ensure_shared_param_binding` / `set_llm_id_on_element`
+    on the stub → full_rescan's `getattr(...)` returns None → no
+    Revit-side mirror is attempted (we're testing KG-side invariants).
+    """
+    stub = types.ModuleType("lib.revit_primitives")
+    stub.levels = lambda doc: list(levels)
+    stub.wall_types = lambda doc: []
+    stub.walls = lambda doc: []
+    stub.model_lines = lambda doc: []
+    stub.detail_lines = lambda doc: []
+    stub.column_types = lambda doc: []
+    stub.columns = lambda doc: []
+    stub.internal_to_meters = lambda x: float(x)
+
+    @contextmanager
+    def noop_tx(doc, name):
+        yield
+
+    stub.transaction = noop_tx
+    monkeypatch.setitem(sys.modules, "lib.revit_primitives", stub)
+    return stub
+
+
+def test_full_rescan_reuses_llm_id_when_revit_id_matches(monkeypatch, tmp_path):
+    """A Level whose revit_id was already in the KG keeps its llm_id
+    across a rescan — the snapshot drives the reuse, no renumbering."""
+    persist = tmp_path / "kg.json"
+    kg = ProjectKG("p", persist_path=persist)
+    kg.advance_turn()
+
+    # Seed: two levels in the KG, bound to revit_ids 100 and 200.
+    a = kg.add_node("Level", {"name": "old_A", "elevation": 0.0})
+    b = kg.add_node("Level", {"name": "old_B", "elevation": 1.0})
+    kg.set_revit_id(a, 100)
+    kg.set_revit_id(b, 200)
+    assert a == "level_001"
+    assert b == "level_002"
+
+    # Revit-side: same two levels (matching revit_ids) plus a new third
+    # one (revit_id=300) that wasn't in the KG.
+    levels = [
+        _FakeLevel("A_new_name", 0.5, 100),  # match → keep llm_id `level_001`
+        _FakeLevel("B_new_name", 1.5, 200),  # match → keep llm_id `level_002`
+        _FakeLevel("brand_new", 2.0, 300),   # no match → fresh `level_003`
+    ]
+    _install_rescan_stub(monkeypatch, levels=levels)
+
+    summary = kg_sync.full_rescan(doc=object(), kg=kg)
+
+    # The two pre-existing llm_ids survive, pointing at the same revit_ids.
+    assert kg.find_by_revit_id(100) == "level_001"
+    assert kg.find_by_revit_id(200) == "level_002"
+    # The new level gets the next counter slot, no collision.
+    assert kg.find_by_revit_id(300) == "level_003"
+    # Summary reports the reuse count.
+    assert summary["levels"] == 3
+    assert summary["preserved_llm_ids"] == 2
+    # Names came through the converter (Level got *updated* on reuse —
+    # the llm_id stays, but the attrs reflect the current Revit state).
+    assert kg.get_node("level_001")["name"] == "A_new_name"
+
+
+def test_full_rescan_action_log_has_rescan_only_no_creates(monkeypatch, tmp_path):
+    """Per-element `create` events are suppressed during rescan — only a
+    single `rescan` event with a summary should appear in the action log."""
+    kg = ProjectKG("p", persist_path=tmp_path / "kg.json")
+    kg.advance_turn()
+    pre_log_len = len(kg.action_log)
+
+    levels = [
+        _FakeLevel("N00", 0.0, 100),
+        _FakeLevel("N01", 3.0, 101),
+        _FakeLevel("N02", 6.0, 102),
+    ]
+    _install_rescan_stub(monkeypatch, levels=levels)
+
+    kg_sync.full_rescan(doc=object(), kg=kg)
+
+    new_events = kg.action_log[pre_log_len:]
+    # Exactly one event added, of type `rescan`.
+    assert len(new_events) == 1
+    assert new_events[0]["action"] == "rescan"
+    # No `create` events sneaked in for the 3 levels.
+    assert not any(e["action"] == "create" for e in new_events)
+    # The rescan event carries the summary (levels count, etc.).
+    assert new_events[0]["details"]["summary"]["levels"] == 3
+
+
+def test_full_rescan_counter_advances_past_preserved_ids(monkeypatch, tmp_path):
+    """When the snapshot reuses `level_001` (counter was at 1), and a new
+    level is scanned, the next allocated id is `level_002`, not a
+    collision. Counter preservation is what makes this work."""
+    kg = ProjectKG("p", persist_path=tmp_path / "kg.json")
+    kg.advance_turn()
+    a = kg.add_node("Level", {"name": "A", "elevation": 0.0})
+    kg.set_revit_id(a, 100)
+    # Counter is at 1 — but soft-delete the only level so the snapshot
+    # still preserves its mapping (verifies deleted ids don't break
+    # counter logic either).
+    kg.soft_delete(a)
+    assert kg._counters["Level"] == 1  # noqa: SLF001
+
+    levels = [
+        _FakeLevel("A_back", 0.0, 100),   # match → reuse level_001
+        _FakeLevel("fresh", 3.0, 999),    # no match → next counter slot
+    ]
+    _install_rescan_stub(monkeypatch, levels=levels)
+    kg_sync.full_rescan(doc=object(), kg=kg)
+
+    # level_001 is the reused one.
+    assert kg.find_by_revit_id(100) == "level_001"
+    # The fresh one is level_002 — counter advanced exactly by one.
+    assert kg.find_by_revit_id(999) == "level_002"
+
+
+# ----- FP rounding in converters ----------------------------------------
+
+
+def test_r_strips_feet_to_meters_artifacts():
+    """`_r` rounds at the SI conversion boundary so the KG JSON shows
+    `0.2` instead of `0.20000000000000004` (post-2026-05-12 fix)."""
+    # Classic artifacts observed in the validation runtime.
+    assert kg_sync._r(0.20000000000000004) == 0.2  # noqa: SLF001
+    assert kg_sync._r(4.999999999999992) == 5.0    # noqa: SLF001
+    assert kg_sync._r(0.024999999999999998) == 0.025  # noqa: SLF001
+    # Sub-micrometre precision preserved (6 decimals = 0.000001 m = 1 µm).
+    assert kg_sync._r(1.234567891234) == 1.234568  # noqa: SLF001
+    # Integers + clean values pass through unchanged.
+    assert kg_sync._r(2.7) == 2.7  # noqa: SLF001
+    assert kg_sync._r(0.0) == 0.0  # noqa: SLF001
+
+
+def test_full_rescan_persists_clean_floats_in_kg(monkeypatch, tmp_path):
+    """End-to-end: a Level with an `Elevation` that comes back from
+    Revit as a float artifact lands in the KG as a clean rounded value."""
+    persist = tmp_path / "kg.json"
+    kg = ProjectKG("p", persist_path=persist)
+    kg.advance_turn()
+
+    levels = [
+        _FakeLevel("dirty", 0.20000000000000004, 100),
+    ]
+    _install_rescan_stub(monkeypatch, levels=levels)
+
+    kg_sync.full_rescan(doc=object(), kg=kg)
+    elevation = kg.get_node("level_001")["elevation"]
+    assert elevation == 0.2
+    # Re-load from disk to confirm round-trip persistence is also clean.
+    reloaded = ProjectKG.load(persist)
+    assert reloaded.get_node("level_001")["elevation"] == 0.2
+
+
 def test_kg_synced_propagates_revit_failure_and_restores_kg(tmp_path, monkeypatch):
     """If the Revit Tx fails on commit (raised by the fake), KG snapshot restored."""
     @contextmanager

@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 
-from ._helpers import bulk_summary
+from ._helpers import bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 
@@ -168,6 +168,7 @@ def create(
         revit_id = int(wall.Id.Value)
         llm_id = _record_in_kg(kg, level_ref, wall_type_ref, p1, p2, length, height)
         kg.set_revit_id(llm_id, revit_id)
+        stamp_llm_id(wall, llm_id)
 
     return {
         "ok": True,
@@ -526,6 +527,7 @@ def create_many(
                 spec["p1"], spec["p2"], length, spec["height"],
             )
             kg.set_revit_id(llm_id, revit_id)
+            stamp_llm_id(wall, llm_id)
             llm_ids.append(llm_id)
 
     return bulk_summary(llm_ids)

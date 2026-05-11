@@ -35,9 +35,12 @@ from Autodesk.Revit.DB import (  # noqa: F401  (Element re-exported for callers)
     CurveElement,
     DetailCurve,
     Element,
+    ExternalDefinitionCreationOptions,
     FilteredElementCollector,
+    GroupTypeId,
     Level,
     ModelCurve,
+    SpecTypeId,
     Transaction,
     UnitTypeId,
     UnitUtils,
@@ -193,3 +196,196 @@ def column_types(doc):
     arch = collect_types_by_category(doc, BuiltInCategory.OST_Columns)
     struct = collect_types_by_category(doc, BuiltInCategory.OST_StructuralColumns)
     return arch + struct
+
+
+# ----- Shared parameter: claude-in-revit:llm_id --------------------------
+#
+# Surface UX visible dans le panneau Propriétés de Revit pour que
+# l'utilisateur lise le `llm_id` d'un élément qu'il clique dans le modèle.
+# **Le KG reste la source de vérité** du mapping `llm_id ↔ revit_id` :
+# le param est écrit DEPUIS le KG (`set_llm_id_on_element`) après chaque
+# `bind()` ou création, jamais lu PAR le KG en flow normal. La lecture
+# (`get_llm_id_from_element`) sert uniquement de fallback de récupération
+# si le KG est absent ou corrompu.
+#
+# Binding Instance sur **toutes les catégories acceptant un paramètre lié**
+# (Settings.Categories.AllowsBoundParameters): anticipe les types futurs
+# (Doors, Windows, Rooms, Floors, Roofs, Beams, etc.) sans avoir à
+# re-binder à chaque ajout. GUID stable dans le code → un `.rvt` ouvert
+# sur une autre machine voit le même param sans collision.
+
+_SHARED_PARAM_GROUP_NAME = "claude-in-revit"
+_SHARED_PARAM_NAME = "llm_id"
+# Stable across machines so the parameter survives copy-pasting the file
+# between collaborators. Regenerated once, frozen here.
+_SHARED_PARAM_GUID = "cca44e1c-7a8d-4b3e-9f50-7c1d8ab23e0a"
+
+# Minimal valid Revit shared-parameter file header. Revit's text format,
+# UTF-16 LE with BOM. Definitions are appended by Revit when we call
+# `Definitions.Create(opts)` so we only need the bare skeleton here.
+_SHARED_PARAMS_FILE_HEADER = (
+    "# This is a Revit shared parameter file.\r\n"
+    "# Do not edit manually.\r\n"
+    "*META\tVERSION\tMINVERSION\r\n"
+    "META\t2\t1\r\n"
+    "*GROUP\tID\tNAME\r\n"
+    "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\t"
+    "DESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\r\n"
+)
+
+
+def _ensure_shared_params_file(path):
+    """Create an empty-but-valid shared params file at `path` if missing."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Revit's shared-param parser expects UTF-16 LE with BOM.
+    data = "﻿" + _SHARED_PARAMS_FILE_HEADER
+    with open(str(path), "wb") as f:
+        f.write(data.encode("utf-16-le"))
+
+
+def _get_or_create_definition(doc):
+    """Return the `ExternalDefinition` for `claude-in-revit:llm_id`.
+
+    Creates the group + definition in the shared parameter file if absent.
+    Idempotent — calling multiple times returns the existing definition
+    after the first call. The file path comes from `config.shared_params_file()`.
+    Side effect: sets `app.SharedParametersFilename` for the session.
+    """
+    from . import config
+    import System  # PythonNet — provided by pyRevit runtime
+
+    app = doc.Application
+    path = config.shared_params_file()
+    _ensure_shared_params_file(path)
+    app.SharedParametersFilename = str(path)
+    shared_file = app.OpenSharedParameterFile()
+    if shared_file is None:
+        raise RuntimeError(
+            "Could not open shared parameter file: {}".format(path)
+        )
+
+    group = None
+    for g in shared_file.Groups:
+        if g.Name == _SHARED_PARAM_GROUP_NAME:
+            group = g
+            break
+    if group is None:
+        group = shared_file.Groups.Create(_SHARED_PARAM_GROUP_NAME)
+
+    definition = None
+    for d in group.Definitions:
+        if d.Name == _SHARED_PARAM_NAME:
+            definition = d
+            break
+    if definition is None:
+        opts = ExternalDefinitionCreationOptions(
+            _SHARED_PARAM_NAME, SpecTypeId.String.Text
+        )
+        opts.GUID = System.Guid(_SHARED_PARAM_GUID)
+        definition = group.Definitions.Create(opts)
+    return definition
+
+
+def _all_bindable_categories(doc):
+    """Build a `CategorySet` of every category accepting bound parameters.
+
+    "Anticipates future types" per the design — Doors, Windows, Rooms,
+    Floors, Roofs, Beams, etc. all get the binding upfront so adding a
+    new converter to `kg_sync` later doesn't require re-binding the
+    parameter. Categories that raise on `.AllowsBoundParameters` are
+    skipped silently (some hidden / sub-categories misbehave).
+    """
+    app = doc.Application
+    cat_set = app.Create.NewCategorySet()
+    for cat in doc.Settings.Categories:
+        try:
+            if cat.AllowsBoundParameters:
+                cat_set.Insert(cat)
+        except Exception:  # noqa: BLE001 — defensive: some categories raise.
+            continue
+    return cat_set
+
+
+def ensure_shared_param_binding(doc):
+    """One-shot setup of `claude-in-revit:llm_id` as an Instance parameter.
+
+    Creates the shared parameter file if missing, defines the parameter
+    if absent, and binds it as an Instance parameter on all categories
+    accepting bound parameters. Idempotent — if the binding already
+    exists, returns `False` without re-opening a Revit transaction.
+
+    Opens its own Revit transaction (named "claude-in-revit: bind llm_id
+    shared param") so the caller must NOT be inside another Revit
+    transaction when invoking this. Currently called from
+    `kg_sync.full_rescan`, which runs outside any Revit transaction.
+
+    Returns `True` if a new binding was inserted, `False` if it was
+    already in place.
+    """
+    definition = _get_or_create_definition(doc)
+    bindings_map = doc.ParameterBindings
+    if bindings_map.Contains(definition):
+        return False
+
+    cat_set = _all_bindable_categories(doc)
+    app = doc.Application
+    binding = app.Create.NewInstanceBinding(cat_set)
+    # Revit 2024+ deprecated `BuiltInParameterGroup` (enum) in favour of
+    # `GroupTypeId` (ForgeTypeId). 2025 removed the old name entirely from
+    # the public API, hence we use `GroupTypeId.IdentityData` here — same
+    # semantic group ("Identification" in the FR Properties panel),
+    # surfaced via the modern ForgeTypeId machinery.
+    with transaction(doc, "claude-in-revit: bind llm_id shared param"):
+        bindings_map.Insert(
+            definition, binding, GroupTypeId.IdentityData,
+        )
+    return True
+
+
+def set_llm_id_on_element(element, llm_id):
+    """Mirror the KG-side llm_id onto the element's shared parameter.
+
+    Must be called inside a Revit transaction. Returns `True` on success,
+    `False` if the parameter isn't bound on this element's category
+    (rare given `ensure_shared_param_binding` binds everything bindable)
+    or if the write was refused. Failures are silent: the KG holds the
+    authoritative mapping, so a missing UX mirror is not fatal.
+    """
+    if element is None or not llm_id:
+        return False
+    try:
+        param = element.LookupParameter(_SHARED_PARAM_NAME)
+    except Exception:  # noqa: BLE001
+        return False
+    if param is None or param.IsReadOnly:
+        return False
+    try:
+        return bool(param.Set(str(llm_id)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_llm_id_from_element(element):
+    """Read the llm_id mirror on an element. Fallback only — not for normal flow.
+
+    The KG is the source of truth for the llm_id ↔ revit_id mapping.
+    This getter exists only for recovery scenarios (KG file missing or
+    corrupted) where we want to re-bootstrap the mapping from the Revit
+    document alone. Returns `None` if the parameter isn't set or
+    accessible.
+    """
+    if element is None:
+        return None
+    try:
+        param = element.LookupParameter(_SHARED_PARAM_NAME)
+    except Exception:  # noqa: BLE001
+        return None
+    if param is None or not param.HasValue:
+        return None
+    try:
+        value = param.AsString()
+    except Exception:  # noqa: BLE001
+        return None
+    return value or None

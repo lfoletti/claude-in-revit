@@ -98,3 +98,32 @@ def bulk_summary(
     out["llm_ids"] = ids
     out["note"] = "Non-contiguous batch — explicit list of {} llm_ids.".format(n)
     return out
+
+
+def stamp_llm_id(element: Any, llm_id: str) -> None:
+    """Mirror the KG-side llm_id onto the Revit element's shared parameter.
+
+    The KG remains the source of truth — this stamp is purely a UX
+    surface (visible in Revit's Properties panel) and a recovery
+    fallback. Silent on failure: if `revit_primitives` isn't on the
+    pythonpath (hors-Revit tests) or the param isn't bound on the
+    element's category, we no-op so callers don't have to guard.
+
+    Must be invoked inside an open Revit transaction (the parameter
+    write requires one). Typically called right after the KG-side
+    `kg.set_revit_id(llm_id, revit_id)` inside a `rp.transaction(...)`
+    block in the creation tool.
+    """
+    if element is None or not llm_id:
+        return
+    try:
+        from .. import revit_primitives as rp
+    except Exception:  # noqa: BLE001 — pythonpath/import issues hors-Revit.
+        return
+    fn = getattr(rp, "set_llm_id_on_element", None)
+    if fn is None:
+        return
+    try:
+        fn(element, llm_id)
+    except Exception:  # noqa: BLE001 — UX surface, never fatal.
+        pass

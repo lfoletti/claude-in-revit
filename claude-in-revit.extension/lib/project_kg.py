@@ -144,7 +144,24 @@ class ProjectKG:
         node_type: str,
         attrs: Dict[str, Any],
         llm_id: Optional[str] = None,
+        _emit_log: bool = True,
     ) -> str:
+        """Add a typed node to the graph.
+
+        Args:
+            node_type: One of `NODE_TYPES`.
+            attrs: Required + optional attrs for that type.
+            llm_id: Explicit id to assign. If `None`, allocate via the typed
+                counter. Used by `kg_sync.full_rescan` to *reuse* an existing
+                id from a `revit_id → llm_id` snapshot, so that ids stay
+                stable across rescans (UX: post-rescan, `wall_001` keeps
+                pointing to the same physical wall).
+            _emit_log: When `False`, the create action is not appended to the
+                action log. Used by `kg_sync.full_rescan` to suppress N
+                `create` entries during the rebuild — a single `rescan`
+                event is logged at the end instead. Internal flag, leave at
+                default for tool code.
+        """
         if node_type not in NODE_TYPES:
             raise ValueError("Unknown node type: {}".format(node_type))
         spec = NODE_TYPES[node_type]
@@ -172,7 +189,8 @@ class ProjectKG:
         full_attrs[DELETED_AT] = None
 
         self._g.add_node(llm_id, **full_attrs)
-        self._log("create", llm_id, node_type=node_type, attrs=dict(attrs))
+        if _emit_log:
+            self._log("create", llm_id, node_type=node_type, attrs=dict(attrs))
         return llm_id
 
     def modify_node(self, llm_id: str, updates: Dict[str, Any]) -> None:
@@ -251,10 +269,27 @@ class ProjectKG:
                 return nid
         return None
 
+    def snapshot_revit_id_map(self) -> Dict[int, str]:
+        """Return `{revit_id: llm_id}` for every node currently bound.
+
+        Used by `kg_sync.full_rescan` to preserve llm_ids across the
+        topology clear: ids are re-assigned by matching on `_revit_id`,
+        so an element whose Revit ElementId survived the rescan keeps
+        the same `wall_007` (etc.) instead of being renumbered. Includes
+        soft-deleted nodes so an undo→rescan round-trip recovers the
+        original id.
+        """
+        out: Dict[int, str] = {}
+        for nid, attrs in self._g.nodes(data=True):
+            rid = attrs.get(REVIT_ID)
+            if rid is not None:
+                out[int(rid)] = nid
+        return out
+
     # ----- Topology reset (used by kg_sync.full_rescan) -----------------
 
-    def _clear_topology(self) -> None:
-        """Drop all nodes, edges, and llm_id counters.
+    def _clear_topology(self, preserve_counters: bool = False) -> None:
+        """Drop all nodes, edges, and (optionally) llm_id counters.
 
         Keeps `turn`, `action_log`, `project_id`, and `persist_path` intact —
         the hybrid `full_rescan` semantics (decided 2026-05-11): node graph is
@@ -262,11 +297,20 @@ class ProjectKG:
         history) stays continuous so `diff_since()` keeps working across a
         mid-session refresh.
 
+        Args:
+            preserve_counters: When `True`, the `_counters` dict is left
+                intact. Used by `kg_sync.full_rescan` so newly-allocated
+                llm_ids continue past the highest pre-rescan id (no
+                renumbering, no collision with preserved ids reused from
+                the `revit_id → llm_id` snapshot). Default `False`
+                preserves the original semantics (counters reset to 0).
+
         Callers should append a single `rescan` entry to the action log so
         the timeline reflects the boundary.
         """
         self._g = nx.MultiDiGraph()
-        self._counters = {}
+        if not preserve_counters:
+            self._counters = {}
 
     # ----- Queries ------------------------------------------------------
 

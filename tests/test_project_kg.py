@@ -243,3 +243,80 @@ def test_clear_topology_resets_graph_but_preserves_turn_and_history():
     assert kg.turn == pre_turn
     # Pre-existing log entries are still there (the new add_node appended one).
     assert kg.action_log[: len(pre_log)] == pre_log
+
+
+def test_clear_topology_preserve_counters_keeps_them():
+    """With `preserve_counters=True`, the next allocated id continues
+    past the highest pre-clear id (no renumbering)."""
+    kg = ProjectKG("p")
+    # Allocate 3 walls so counters['Wall'] = 3.
+    kg.add_node("Level", {"name": "L1", "elevation": 0.0})
+    kg.add_node("WallType", {"name": "T1", "total_thickness": 0.2})
+    for _ in range(3):
+        kg.add_node("Wall", {
+            "type_ref": "walltype_001", "level_ref": "level_001",
+            "p1": [0, 0], "p2": [1, 0], "length": 1.0, "height": 2.7,
+        })
+    assert kg._counters["Wall"] == 3  # noqa: SLF001
+
+    kg._clear_topology(preserve_counters=True)  # noqa: SLF001
+    # Counter intact.
+    assert kg._counters["Wall"] == 3  # noqa: SLF001
+    # Re-add the prerequisites then a wall — next id is wall_004, not wall_001.
+    kg.add_node("Level", {"name": "L1", "elevation": 0.0})
+    kg.add_node("WallType", {"name": "T1", "total_thickness": 0.2})
+    new_wall = kg.add_node("Wall", {
+        "type_ref": "walltype_001", "level_ref": "level_001",
+        "p1": [0, 0], "p2": [1, 0], "length": 1.0, "height": 2.7,
+    })
+    assert new_wall == "wall_004"
+
+
+def test_add_node_emit_log_false_suppresses_create_entry():
+    """`_emit_log=False` skips the `create` action_log entry. Used by
+    `kg_sync.full_rescan` so the log doesn't fill up with N creates at
+    every rescan — only a single `rescan` event remains meaningful."""
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    pre_log_len = len(kg.action_log)
+
+    # Silent: node added, but no log entry appended.
+    nid = kg.add_node(
+        "Level", {"name": "Silent", "elevation": 0.0}, _emit_log=False,
+    )
+    assert kg.has_node(nid)
+    assert len(kg.action_log) == pre_log_len  # no `create` event.
+
+    # Default: log appended.
+    kg.add_node("Level", {"name": "Loud", "elevation": 1.0})
+    assert len(kg.action_log) == pre_log_len + 1
+    assert kg.action_log[-1]["action"] == "create"
+
+
+def test_snapshot_revit_id_map_returns_mapping_including_deleted():
+    """The snapshot must include soft-deleted nodes so an undo→rescan
+    round-trip recovers the original llm_id when the element comes back."""
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    a = kg.add_node("Level", {"name": "A", "elevation": 0.0})
+    b = kg.add_node("Level", {"name": "B", "elevation": 1.0})
+    kg.set_revit_id(a, 100)
+    kg.set_revit_id(b, 200)
+    # Soft-delete b — still bound, still findable.
+    kg.soft_delete(b)
+
+    mapping = kg.snapshot_revit_id_map()
+    assert mapping == {100: a, 200: b}
+
+
+def test_snapshot_skips_nodes_without_revit_binding():
+    """Unbound nodes (created via CLI without `set_revit_id`) don't appear
+    in the snapshot — preserving their id at rescan would be meaningless
+    since they have no Revit element to match against."""
+    kg = ProjectKG("p")
+    kg.add_node("Level", {"name": "Unbound", "elevation": 0.0})
+    a = kg.add_node("Level", {"name": "Bound", "elevation": 1.0})
+    kg.set_revit_id(a, 555)
+
+    mapping = kg.snapshot_revit_id_map()
+    assert mapping == {555: a}

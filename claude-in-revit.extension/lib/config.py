@@ -37,6 +37,7 @@ ENV_VAR_NAME = "ANTHROPIC_API_KEY"
 PROJECTS_SUBDIR = "projects"
 KG_FILE_SUFFIX = ".kg.json"
 HISTORY_FILE_SUFFIX = ".history.json"
+SHARED_PARAMS_FILENAME = "shared_params.txt"
 
 
 class ConfigError(RuntimeError):
@@ -78,6 +79,18 @@ def history_path_for(project_id: str) -> Path:
     come later when we want human readability).
     """
     return projects_dir() / "{}{}".format(project_id, HISTORY_FILE_SUFFIX)
+
+
+def shared_params_file() -> Path:
+    """Return the path to the Revit shared parameter file managed by us.
+
+    Single file per machine, used by `revit_primitives.ensure_shared_param_binding`
+    to define the `claude-in-revit:llm_id` shared parameter. The file is
+    auto-created on first call (Revit format, UTF-16 LE header). Located
+    in the same config dir as the API key so a per-user backup captures
+    both at once.
+    """
+    return config_dir() / SHARED_PARAMS_FILENAME
 
 
 def get_api_key() -> str:

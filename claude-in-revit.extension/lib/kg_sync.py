@@ -36,6 +36,7 @@ called, so tests can monkeypatch the import.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import math
@@ -269,11 +270,24 @@ def active_selection_llm_ids(
 # so the KG schema only ever speaks SI units.
 
 
+# Float artifacts from the feet↔metres roundtrip (`0.20000000000000004`,
+# `4.999999999999992`) make the JSON noisy without adding precision the
+# user cares about. Round at the SI conversion boundary so the KG stores
+# clean numbers — 6 decimals = sub-micrometre precision, well past
+# anything BIM needs.
+_FP_PRECISION = 6
+
+
+def _r(value: float) -> float:
+    """Round a float at the KG storage boundary (6 decimals)."""
+    return round(float(value), _FP_PRECISION)
+
+
 def _level_to_attrs(level: Any) -> Dict[str, Any]:
     from . import revit_primitives as rp
     return {
         "name": level.Name,
-        "elevation": rp.internal_to_meters(level.Elevation),
+        "elevation": _r(rp.internal_to_meters(level.Elevation)),
     }
 
 
@@ -281,7 +295,7 @@ def _wall_type_to_attrs(wall_type: Any) -> Dict[str, Any]:
     from . import revit_primitives as rp
     return {
         "name": wall_type.Name,
-        "total_thickness": rp.internal_to_meters(wall_type.Width),
+        "total_thickness": _r(rp.internal_to_meters(wall_type.Width)),
     }
 
 
@@ -313,11 +327,11 @@ def _column_to_attrs(
     loc = column.Location
     pt = loc.Point  # XYZ in feet
     position = [
-        rp.internal_to_meters(pt.X),
-        rp.internal_to_meters(pt.Y),
+        _r(rp.internal_to_meters(pt.X)),
+        _r(rp.internal_to_meters(pt.Y)),
     ]
     height_param = column.get_Parameter(BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM)
-    height_m = rp.internal_to_meters(height_param.AsDouble()) if height_param else 0.0
+    height_m = _r(rp.internal_to_meters(height_param.AsDouble())) if height_param else 0.0
     return {
         "level_ref": level_ref,
         "type_ref": type_ref,
@@ -344,16 +358,16 @@ def _curve_element_to_attrs(curve_element: Any) -> Dict[str, Any]:
     a = curve.GetEndPoint(0)
     b = curve.GetEndPoint(1)
     p1 = [
-        rp.internal_to_meters(a.X),
-        rp.internal_to_meters(a.Y),
-        rp.internal_to_meters(a.Z),
+        _r(rp.internal_to_meters(a.X)),
+        _r(rp.internal_to_meters(a.Y)),
+        _r(rp.internal_to_meters(a.Z)),
     ]
     p2 = [
-        rp.internal_to_meters(b.X),
-        rp.internal_to_meters(b.Y),
-        rp.internal_to_meters(b.Z),
+        _r(rp.internal_to_meters(b.X)),
+        _r(rp.internal_to_meters(b.Y)),
+        _r(rp.internal_to_meters(b.Z)),
     ]
-    length = math.sqrt(sum((p2[i] - p1[i]) ** 2 for i in range(3)))
+    length = _r(math.sqrt(sum((p2[i] - p1[i]) ** 2 for i in range(3))))
     return {"p1": p1, "p2": p2, "length": length}
 
 
@@ -375,12 +389,12 @@ def _wall_to_attrs(
     curve = loc.Curve
     a = curve.GetEndPoint(0)
     b = curve.GetEndPoint(1)
-    p1 = [rp.internal_to_meters(a.X), rp.internal_to_meters(a.Y)]
-    p2 = [rp.internal_to_meters(b.X), rp.internal_to_meters(b.Y)]
-    length = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
+    p1 = [_r(rp.internal_to_meters(a.X)), _r(rp.internal_to_meters(a.Y))]
+    p2 = [_r(rp.internal_to_meters(b.X)), _r(rp.internal_to_meters(b.Y))]
+    length = _r(math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2))
 
     height_param = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM)
-    height_m = rp.internal_to_meters(height_param.AsDouble()) if height_param else 0.0
+    height_m = _r(rp.internal_to_meters(height_param.AsDouble())) if height_param else 0.0
 
     return {
         "type_ref": wall_type_ref,
@@ -398,9 +412,23 @@ def _wall_to_attrs(
 def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
     """Drop the KG topology and rebuild it from the live Revit document.
 
-    Hybrid reset: nodes/edges/counters are wiped; `turn` and `action_log`
-    are preserved (decision 2026-05-11). A single `rescan` entry is appended
-    to the action log so the timeline reflects the boundary.
+    Hybrid reset: nodes/edges are wiped; `turn`, `action_log`, and
+    `_counters` are preserved (decision 2026-05-11). A single `rescan`
+    entry is appended to the action log so the timeline reflects the
+    boundary — individual `create` events for each rebuilt element are
+    *suppressed* (otherwise the log would grow by N elements at every
+    rescan, see 2026-05-12 fix).
+
+    **Stable llm_ids across rescans.** Before clearing topology, we snapshot
+    `{revit_id: llm_id}` from the existing KG. During the rebuild, each
+    Revit element looks itself up by its `ElementId.Value`: if the
+    snapshot knows it, we reuse the same llm_id (so `wall_007` keeps
+    pointing to the same physical wall after a Refresh KG). If unknown
+    (new since last scan), the typed counter allocates a fresh id —
+    counters are preserved so new ids never collide with reused ones.
+    The KG remains the single source of truth for the mapping; the
+    Revit-side shared parameter is purely a UX mirror / recovery
+    fallback (cf. 2026-05-12).
 
     **Defensive per-element conversion.** Each `Element` is converted
     inside an isolated try/except: if one wall type has a quirky `.Width`
@@ -428,14 +456,67 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         "columns": 0,
     }
 
-    with kg.transaction():
-        kg._clear_topology()  # noqa: SLF001 — intentional cross-module API.
+    # Snapshot `revit_id → llm_id` BEFORE clearing — drives id stability.
+    preserved = kg.snapshot_revit_id_map()
+
+    def _preserved_id(element_or_id: Any) -> Optional[str]:
+        try:
+            return preserved.get(_extract_revit_id(element_or_id))
+        except Exception:  # noqa: BLE001 — corrupted element shouldn't abort.
+            return None
+
+    # Ensure the `claude-in-revit:llm_id` shared parameter is bound on every
+    # bindable category. Soft-fail: the KG is the authoritative source for
+    # the mapping, so a missing UX mirror just degrades the Properties-panel
+    # display — never the data layer. Pre-call sits OUTSIDE `kg.transaction`
+    # because `ensure_shared_param_binding` opens its own Revit transaction
+    # and Revit refuses nested transactions of the same kind. Resolved via
+    # `getattr` so hors-Revit tests with a stubbed `revit_primitives` (no
+    # `ensure_shared_param_binding`) keep working without explicit opt-in.
+    param_bound = False
+    ensure_fn = getattr(rp, "ensure_shared_param_binding", None)
+    if ensure_fn is not None:
+        try:
+            ensure_fn(doc)
+            param_bound = True
+        except Exception:  # noqa: BLE001
+            param_bound = False
+    stamp_fn = getattr(rp, "set_llm_id_on_element", None) if param_bound else None
+
+    def _stamp(element: Any, llm_id: str) -> None:
+        """Mirror the llm_id onto the element's shared parameter. No-op
+        when the binding isn't available (stub mode or first-time setup
+        failed). Silent failures are intentional — UX surface, not data."""
+        if stamp_fn is None:
+            return
+        try:
+            stamp_fn(element, llm_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # The rebuild itself stays in a single Revit transaction when there's
+    # anything to stamp (so `param.Set` calls are batched into one commit),
+    # otherwise drops to a null context to preserve the pure-KG path
+    # exercised by tests.
+    rebuild_tx = (
+        rp.transaction(doc, "claude-in-revit: rescan stamp llm_id")
+        if stamp_fn is not None else contextlib.nullcontext()
+    )
+
+    with kg.transaction(), rebuild_tx:
+        kg._clear_topology(preserve_counters=True)  # noqa: SLF001
 
         # 1. Levels — no inbound refs.
         for lvl in rp.levels(doc):
             try:
-                nid = kg.add_node("Level", _level_to_attrs(lvl))
+                nid = kg.add_node(
+                    "Level",
+                    _level_to_attrs(lvl),
+                    llm_id=_preserved_id(lvl),
+                    _emit_log=False,
+                )
                 bind(kg, nid, lvl)
+                _stamp(lvl, nid)
             except Exception:  # noqa: BLE001 — converter or Revit attr access.
                 skipped["levels"] += 1
 
@@ -443,8 +524,14 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         # have a `.Width` that's 0 or raises; the try/except absorbs both.
         for wt in rp.wall_types(doc):
             try:
-                nid = kg.add_node("WallType", _wall_type_to_attrs(wt))
+                nid = kg.add_node(
+                    "WallType",
+                    _wall_type_to_attrs(wt),
+                    llm_id=_preserved_id(wt),
+                    _emit_log=False,
+                )
                 bind(kg, nid, wt)
+                _stamp(wt, nid)
             except Exception:  # noqa: BLE001
                 skipped["wall_types"] += 1
 
@@ -461,8 +548,11 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
                 attrs = _wall_to_attrs(
                     w, level_ref=level_ref, wall_type_ref=wall_type_ref,
                 )
-                nid = kg.add_node("Wall", attrs)
+                nid = kg.add_node(
+                    "Wall", attrs, llm_id=_preserved_id(w), _emit_log=False,
+                )
                 bind(kg, nid, w)
+                _stamp(w, nid)
                 kg.add_edge(nid, level_ref, "at_level")
                 kg.add_edge(nid, wall_type_ref, "is_type")
             except Exception:  # noqa: BLE001
@@ -472,16 +562,28 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         # Arcs / splines fall in the skipped bucket (Line geometry only V0).
         for ml in rp.model_lines(doc):
             try:
-                nid = kg.add_node("ModelLine", _curve_element_to_attrs(ml))
+                nid = kg.add_node(
+                    "ModelLine",
+                    _curve_element_to_attrs(ml),
+                    llm_id=_preserved_id(ml),
+                    _emit_log=False,
+                )
                 bind(kg, nid, ml)
+                _stamp(ml, nid)
             except Exception:  # noqa: BLE001
                 skipped["model_lines"] += 1
 
         # 5. DetailLines — view-bound; we drop the view link in V0.
         for dl in rp.detail_lines(doc):
             try:
-                nid = kg.add_node("DetailLine", _curve_element_to_attrs(dl))
+                nid = kg.add_node(
+                    "DetailLine",
+                    _curve_element_to_attrs(dl),
+                    llm_id=_preserved_id(dl),
+                    _emit_log=False,
+                )
                 bind(kg, nid, dl)
+                _stamp(dl, nid)
             except Exception:  # noqa: BLE001
                 skipped["detail_lines"] += 1
 
@@ -489,8 +591,14 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         # before column instances so columns can resolve their type_ref.
         for ct in rp.column_types(doc):
             try:
-                nid = kg.add_node("ColumnType", _column_type_to_attrs(ct))
+                nid = kg.add_node(
+                    "ColumnType",
+                    _column_type_to_attrs(ct),
+                    llm_id=_preserved_id(ct),
+                    _emit_log=False,
+                )
                 bind(kg, nid, ct)
+                _stamp(ct, nid)
             except Exception:  # noqa: BLE001
                 skipped["column_types"] += 1
 
@@ -505,13 +613,21 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
                 attrs = _column_to_attrs(
                     col, level_ref=level_ref, type_ref=type_ref,
                 )
-                nid = kg.add_node("Column", attrs)
+                nid = kg.add_node(
+                    "Column", attrs, llm_id=_preserved_id(col), _emit_log=False,
+                )
                 bind(kg, nid, col)
+                _stamp(col, nid)
                 kg.add_edge(nid, level_ref, "at_level")
                 kg.add_edge(nid, type_ref, "is_type")
             except Exception:  # noqa: BLE001
                 skipped["columns"] += 1
 
+        reused = sum(
+            1 for _, attrs in kg._g.nodes(data=True)  # noqa: SLF001
+            if attrs.get("_revit_id") is not None
+            and preserved.get(int(attrs["_revit_id"])) is not None
+        )
         summary = {
             "levels": kg.count_by_type("Level"),
             "wall_types": kg.count_by_type("WallType"),
@@ -521,6 +637,7 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             "column_types": kg.count_by_type("ColumnType"),
             "columns": kg.count_by_type("Column"),
             "skipped": dict(skipped),
+            "preserved_llm_ids": reused,
         }
         kg._log("rescan", target="", summary=dict(summary))  # noqa: SLF001
 
@@ -528,6 +645,29 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
 
 
 # ----- Generic Revit element → KG dispatcher ----------------------------
+
+
+def _stamp_param_silent(element: Any, llm_id: str) -> None:
+    """Mirror the llm_id onto the element's `claude-in-revit:llm_id` shared
+    parameter, swallowing any failure.
+
+    Used by `ingest_revit_element` so callers (transforms after copy) get
+    the Properties-panel display without needing to know whether the
+    parameter is bound. Silent because the KG is the source of truth — a
+    missing UX mirror degrades visibility but never the data layer.
+    Resolved via `getattr` so a stubbed `revit_primitives` (hors-Revit
+    tests) doesn't need to define the function explicitly.
+
+    Caller's responsibility to be inside an open Revit transaction.
+    """
+    from . import revit_primitives as rp
+    fn = getattr(rp, "set_llm_id_on_element", None)
+    if fn is None:
+        return
+    try:
+        fn(element, llm_id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
@@ -546,6 +686,12 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
     tool) collects the failure and aborts the batch atomically.
 
     Returns the new node's llm_id.
+
+    Also mirrors the resulting llm_id onto the element's
+    `claude-in-revit:llm_id` shared parameter so the user sees it in
+    Revit's Properties panel. Silent failure if the parameter isn't
+    bound (e.g. user did transforms before any Refresh KG); the KG
+    remains the authoritative mapping.
     """
     from Autodesk.Revit.DB import (
         DetailCurve,
@@ -569,6 +715,7 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
         )
         nid = kg.add_node("Wall", attrs)
         bind(kg, nid, element)
+        _stamp_param_silent(element, nid)
         kg.add_edge(nid, level_ref, "at_level")
         kg.add_edge(nid, wall_type_ref, "is_type")
         return nid
@@ -595,6 +742,7 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
                 )
                 nid = kg.add_node("Column", attrs)
                 bind(kg, nid, element)
+                _stamp_param_silent(element, nid)
                 kg.add_edge(nid, level_ref, "at_level")
                 kg.add_edge(nid, type_ref, "is_type")
                 return nid
@@ -602,11 +750,13 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
     if isinstance(element, ModelCurve):
         nid = kg.add_node("ModelLine", _curve_element_to_attrs(element))
         bind(kg, nid, element)
+        _stamp_param_silent(element, nid)
         return nid
 
     if isinstance(element, DetailCurve):
         nid = kg.add_node("DetailLine", _curve_element_to_attrs(element))
         bind(kg, nid, element)
+        _stamp_param_silent(element, nid)
         return nid
 
     raise ValueError(

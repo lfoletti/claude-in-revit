@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ._helpers import bulk_summary
+from ._helpers import bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 
@@ -262,6 +262,7 @@ def create(
             kg, level_ref, column_type_ref, position, height, kind,
         )
         kg.set_revit_id(llm_id, revit_id)
+        stamp_llm_id(instance, llm_id)
 
     return {
         "ok": True,
@@ -463,6 +464,7 @@ def create_many(
                 spec["kind"],
             )
             kg.set_revit_id(llm_id, revit_id)
+            stamp_llm_id(instance, llm_id)
             llm_ids.append(llm_id)
 
     return bulk_summary(llm_ids)
