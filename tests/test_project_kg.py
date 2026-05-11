@@ -320,3 +320,74 @@ def test_snapshot_skips_nodes_without_revit_binding():
 
     mapping = kg.snapshot_revit_id_map()
     assert mapping == {555: a}
+
+
+def test_family_type_requires_category_attr():
+    """`category` is required on FamilyType so the openings catalogs can
+    filter without re-resolving the Revit category each time."""
+    kg = ProjectKG("p")
+    # Valid : with category.
+    nid = kg.add_node("FamilyType", {
+        "family_name": "Porte simple",
+        "type_name": "0915 x 2134 mm",
+        "category": "Doors",
+    })
+    assert kg.get_node(nid)["category"] == "Doors"
+
+    # Missing category → ValueError mentions the missing attr.
+    with pytest.raises(ValueError, match="category"):
+        kg.add_node("FamilyType", {
+            "family_name": "Bare",
+            "type_name": "T1",
+        })
+
+
+def test_remove_edge_drops_typed_edge_idempotently():
+    """`remove_edge` returns True on first call, False on subsequent
+    calls (idempotent). Used by `openings_set_type` to re-route the
+    `is_type` edge atomically."""
+    kg = ProjectKG("p")
+    a = kg.add_node("Level", {"name": "A", "elevation": 0.0})
+    b = kg.add_node("WallType", {"name": "T", "total_thickness": 0.2})
+    wall = kg.add_node("Wall", {
+        "type_ref": b, "level_ref": a,
+        "p1": [0, 0], "p2": [1, 0], "length": 1.0, "height": 2.7,
+    })
+    kg.add_edge(wall, b, "is_type")
+    assert kg._g.has_edge(wall, b, key="is_type")  # noqa: SLF001
+
+    assert kg.remove_edge(wall, b, "is_type") is True
+    assert not kg._g.has_edge(wall, b, key="is_type")  # noqa: SLF001
+    # Idempotent — second call returns False without raising.
+    assert kg.remove_edge(wall, b, "is_type") is False
+
+
+def test_door_window_schema_accepts_required_attrs():
+    """Schema sanity check : Door/Window need the 5 required attrs."""
+    kg = ProjectKG("p")
+    door = kg.add_node("Door", {
+        "type_ref": "family_type_001",
+        "host_wall_ref": "wall_001",
+        "position": [1.0, 0.0],
+        "sill_height": 0.0,
+        "head_height": 2.1,
+    })
+    assert kg.get_node(door)["_type"] == "Door"
+
+    win = kg.add_node("Window", {
+        "type_ref": "family_type_002",
+        "host_wall_ref": "wall_001",
+        "position": [3.0, 0.0],
+        "sill_height": 0.9,
+        "head_height": 2.4,
+    })
+    assert kg.get_node(win)["_type"] == "Window"
+
+    # Door without `position` is refused.
+    with pytest.raises(ValueError, match="position"):
+        kg.add_node("Door", {
+            "type_ref": "family_type_001",
+            "host_wall_ref": "wall_001",
+            "sill_height": 0.0,
+            "head_height": 2.1,
+        })

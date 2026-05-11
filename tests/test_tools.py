@@ -68,6 +68,18 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "columns_create_many",
         "columns_create_grid",
         "columns_create_grid_irregular",
+        "openings_create_door",
+        "openings_create_window",
+        "openings_create_many",
+        "openings_set_sill_height",
+        "openings_set_head_height",
+        "openings_set_type",
+        "openings_create_type_variant",
+        "openings_delete",
+        "catalog_list_door_types",
+        "catalog_list_window_types",
+        "catalog_list_doors",
+        "catalog_list_windows",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -1258,3 +1270,525 @@ def test_columns_create_top_level_errors_when_height_omitted(kg_with_column_type
     assert "No level above" in result["content"]
     # KG untouched.
     assert kg.count_by_type("Column") == 0
+
+
+# ----- openings : create_door / create_window / set_*_height / delete ---
+
+
+@pytest.fixture
+def kg_with_opening_setup(kg_with_wall):
+    """`kg_with_wall` enrichi de deux FamilyType (un door, un window)
+    et d'un second mur — assez de matière pour exercer create_door,
+    create_window, create_many, et les mutations."""
+    kg, level, wt, wall = kg_with_wall
+    door_type = kg.add_node("FamilyType", {
+        "family_name": "Porte simple",
+        "type_name": "0915 x 2134 mm",
+        "category": "Doors",
+    })
+    window_type = kg.add_node("FamilyType", {
+        "family_name": "Fenêtre fixe",
+        "type_name": "1200 x 1500 mm",
+        "category": "Windows",
+    })
+    wall2 = kg.add_node("Wall", {
+        "type_ref": wt,
+        "level_ref": level,
+        "p1": [0.0, 5.0],
+        "p2": [5.0, 5.0],
+        "length": 5.0,
+        "height": 2.7,
+    })
+    kg.add_edge(wall2, level, "at_level")
+    kg.add_edge(wall2, wt, "is_type")
+    return kg, level, wt, wall, wall2, door_type, window_type
+
+
+def test_openings_create_door_kg_only_records_node_and_edges(kg_with_opening_setup):
+    kg, level, _, wall, _, door_type, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall,
+            "family_type_ref": door_type,
+            "position": [2.5, 0.0],
+            "sill_height": 0.0,
+        },
+        "t1",
+        kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    nid = payload["llm_id"]
+    assert payload["revit_id"] is None
+    node = kg.get_node(nid)
+    assert node["_type"] == "Door"
+    assert node["host_wall_ref"] == wall
+    assert node["type_ref"] == door_type
+    assert node["position"] == [2.5, 0.0]
+    # Edges : wall hosts door, door is_type door_type, door at_level level.
+    edge_types = {k for _, _, k in kg._g.edges(nid, keys=True)}  # noqa: SLF001
+    edge_types_in = {k for _, _, k in kg._g.in_edges(nid, keys=True)}  # noqa: SLF001
+    assert "is_type" in edge_types
+    assert "at_level" in edge_types
+    assert "hosts" in edge_types_in
+
+
+def test_openings_create_window_kg_only_uses_window_defaults(kg_with_opening_setup):
+    """Sans `sill_height` fourni, le défaut KG-only pour une fenêtre est
+    0.9 m (architectes standard d'allège française/suisse)."""
+    kg, _, _, _, wall2, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {
+            "host_wall_ref": wall2,
+            "family_type_ref": window_type,
+            "position": [2.5, 5.0],
+        },
+        "t1",
+        kg,
+    )
+    payload = json.loads(result["content"])
+    nid = payload["llm_id"]
+    node = kg.get_node(nid)
+    assert node["_type"] == "Window"
+    assert node["sill_height"] == 0.9
+    assert payload["sill_height_m"] == 0.9
+
+
+def test_openings_create_door_rejects_window_type(kg_with_opening_setup):
+    """`openings_create_door` doit refuser un family_type_ref de catégorie
+    "Windows" — c'est ce qui empêche le LLM de poser une fenêtre via le
+    tool 'porte' par confusion."""
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall,
+            "family_type_ref": window_type,
+            "position": [2.5, 0.0],
+        },
+        "t1",
+        kg,
+    )
+    assert result["is_error"] is True
+    assert "category=Windows" in result["content"]
+    assert "expected Doors" in result["content"]
+    assert kg.count_by_type("Door") == 0
+
+
+def test_openings_create_door_rejects_unknown_host_wall(kg_with_opening_setup):
+    kg, _, _, _, _, door_type, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": "wall_999",
+            "family_type_ref": door_type,
+            "position": [0.0, 0.0],
+        },
+        "t1",
+        kg,
+    )
+    assert result["is_error"] is True
+    assert "wall_999" in result["content"]
+
+
+def test_openings_create_door_rejects_non_wall_host(kg_with_opening_setup):
+    """Si on passe un level llm_id comme host_wall_ref, refus net."""
+    kg, level, _, _, _, door_type, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": level,
+            "family_type_ref": door_type,
+            "position": [0.0, 0.0],
+        },
+        "t1",
+        kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Wall" in result["content"]
+
+
+def test_openings_create_many_kg_only_mixed_door_window(kg_with_opening_setup):
+    kg, _, _, wall, wall2, door_type, window_type = kg_with_opening_setup
+    items = [
+        {"kind": "door", "host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        {"kind": "window", "host_wall_ref": wall2, "family_type_ref": window_type, "position": [1.0, 5.0]},
+        {"kind": "window", "host_wall_ref": wall2, "family_type_ref": window_type, "position": [3.0, 5.0]},
+    ]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_many", {"items": items}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 3
+    # 1 door + 2 windows.
+    assert kg.count_by_type("Door") == 1
+    assert kg.count_by_type("Window") == 2
+
+
+def test_openings_create_many_validates_upfront_no_partial_mutation(
+    kg_with_opening_setup,
+):
+    """Si l'item #2 est invalide (mauvaise catégorie), AUCUN item ne doit
+    être créé — atomicité par la validation upfront."""
+    kg, _, _, wall, _, door_type, window_type = kg_with_opening_setup
+    items = [
+        {"kind": "door", "host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        # kind=door mais family_type est une window → erreur.
+        {"kind": "door", "host_wall_ref": wall, "family_type_ref": window_type, "position": [2.0, 0.0]},
+    ]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_many", {"items": items}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    # Le 1er item n'est pas non plus créé (rollback KG sur exception via dispatcher).
+    assert kg.count_by_type("Door") == 0
+
+
+def test_openings_set_sill_height_kg_only_updates_attr(kg_with_opening_setup):
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {
+            "host_wall_ref": wall,
+            "family_type_ref": window_type,
+            "position": [2.5, 0.0],
+            "sill_height": 0.9,
+        },
+        "t1",
+        kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    set_result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height",
+        {"llm_id": nid, "sill_height_m": 1.2},
+        "t2",
+        kg,
+    )
+    payload = json.loads(set_result["content"])
+    assert payload["ok"] is True
+    assert payload["sill_height_m"] == 1.2
+    assert payload["revit_modified"] is False
+    assert kg.get_node(nid)["sill_height"] == 1.2
+
+
+def test_openings_set_head_height_kg_only_updates_attr(kg_with_opening_setup):
+    kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall, "family_type_ref": door_type,
+            "position": [2.5, 0.0],
+        },
+        "t1",
+        kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    set_result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": nid, "head_height_m": 2.10},
+        "t2",
+        kg,
+    )
+    payload = json.loads(set_result["content"])
+    assert payload["head_height_m"] == 2.10
+    assert kg.get_node(nid)["head_height"] == 2.10
+
+
+def test_openings_delete_kg_only_soft_deletes(kg_with_opening_setup):
+    kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall, "family_type_ref": door_type,
+            "position": [1.0, 0.0],
+        },
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+    assert kg.count_by_type("Door") == 1
+
+    delete = llm_protocol.dispatch_tool_use(
+        "openings_delete", {"llm_id": nid}, "t2", kg,
+    )
+    payload = json.loads(delete["content"])
+    assert payload["ok"] is True
+    assert payload["revit_deleted"] is False
+    # Filtered out of default queries.
+    assert kg.count_by_type("Door") == 0
+    # Still present with include_deleted=True.
+    assert nid in kg.find_by_type("Door", include_deleted=True)
+
+
+def test_openings_delete_refuses_already_deleted(kg_with_opening_setup):
+    kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {
+            "host_wall_ref": wall, "family_type_ref": door_type,
+            "position": [1.0, 0.0],
+        },
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+    kg.soft_delete(nid)
+
+    second = llm_protocol.dispatch_tool_use(
+        "openings_delete", {"llm_id": nid}, "t2", kg,
+    )
+    assert second["is_error"] is True
+    assert "already soft-deleted" in second["content"]
+
+
+def test_openings_set_sill_height_refuses_non_opening(kg_with_opening_setup):
+    """Passer un llm_id de Wall doit échouer net (pas un Door/Window)."""
+    kg, _, _, wall, _, _, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height",
+        {"llm_id": wall, "sill_height_m": 1.0},
+        "t1",
+        kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Door or Window" in result["content"]
+
+
+# ----- catalogues openings ---------------------------------------------
+
+
+def test_catalog_list_door_types_filters_by_category(kg_with_opening_setup):
+    kg, _, _, _, _, door_type, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "catalog_list_door_types", {}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    ids = [d["llm_id"] for d in payload["door_types"]]
+    assert door_type in ids
+    # Pas de window_type qui aurait fuité.
+    family_names = [d["family_name"] for d in payload["door_types"]]
+    assert "Fenêtre fixe" not in family_names
+
+
+def test_catalog_list_window_types_filters_by_category(kg_with_opening_setup):
+    kg, _, _, _, _, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "catalog_list_window_types", {}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    ids = [w["llm_id"] for w in payload["window_types"]]
+    assert window_type in ids
+    family_names = [w["family_name"] for w in payload["window_types"]]
+    assert "Porte simple" not in family_names
+
+
+def test_openings_set_type_kg_only_swaps_type_ref(kg_with_opening_setup):
+    """KG-only swap d'un Door vers un autre type Doors : modify_node +
+    edge `is_type` rerouted."""
+    kg, _, _, wall, _, door_type, _ = kg_with_opening_setup
+    # Second door type to swap to.
+    door_type_b = kg.add_node("FamilyType", {
+        "family_name": "Porte simple",
+        "type_name": "0815 x 2050 mm",
+        "category": "Doors",
+        "dimensions": {"height_m": 2.05, "width_m": 0.815},
+    })
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {"host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+    assert kg.get_node(nid)["type_ref"] == door_type
+
+    swap = llm_protocol.dispatch_tool_use(
+        "openings_set_type",
+        {"llm_id": nid, "new_family_type_ref": door_type_b},
+        "t2", kg,
+    )
+    payload = json.loads(swap["content"])
+    assert payload["ok"] is True
+    assert payload["old_type_ref"] == door_type
+    assert payload["new_type_ref"] == door_type_b
+    # Attr updated.
+    assert kg.get_node(nid)["type_ref"] == door_type_b
+    # Old edge gone, new edge present.
+    assert not kg._g.has_edge(nid, door_type, key="is_type")  # noqa: SLF001
+    assert kg._g.has_edge(nid, door_type_b, key="is_type")  # noqa: SLF001
+
+
+def test_openings_set_type_refuses_cross_category(kg_with_opening_setup):
+    """Une porte ne peut pas adopter un type fenêtre."""
+    kg, _, _, wall, _, door_type, window_type = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {"host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    swap = llm_protocol.dispatch_tool_use(
+        "openings_set_type",
+        {"llm_id": nid, "new_family_type_ref": window_type},
+        "t2", kg,
+    )
+    assert swap["is_error"] is True
+    assert "category=Windows" in swap["content"]
+    assert "expected Doors" in swap["content"]
+    # Type unchanged.
+    assert kg.get_node(nid)["type_ref"] == door_type
+
+
+def test_openings_set_type_refuses_non_family_type(kg_with_opening_setup):
+    """Refus net si new_family_type_ref n'est pas un FamilyType."""
+    kg, level, _, wall, _, door_type, _ = kg_with_opening_setup
+    create = llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {"host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        "t1", kg,
+    )
+    nid = json.loads(create["content"])["llm_id"]
+
+    swap = llm_protocol.dispatch_tool_use(
+        "openings_set_type",
+        {"llm_id": nid, "new_family_type_ref": level},
+        "t2", kg,
+    )
+    assert swap["is_error"] is True
+    assert "not a FamilyType" in swap["content"]
+
+
+def test_openings_create_type_variant_kg_only_adds_node(kg_with_opening_setup):
+    """KG-only path : ajoute un FamilyType avec dimensions, mirror du
+    family_name source, type_name = new_name."""
+    kg, _, _, _, _, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_type_variant",
+        {
+            "source_type_ref": window_type,
+            "new_name": "Fenêtre 1200 x 1200 mm",
+            "opening_height_m": 1.20,
+            "opening_width_m": 1.20,
+        },
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    new_nid = payload["llm_id"]
+    assert payload["revit_id"] is None
+    assert payload["family_name"] == "Fenêtre fixe"
+    assert payload["type_name"] == "Fenêtre 1200 x 1200 mm"
+    assert payload["category"] == "Windows"
+    assert payload["dimensions"]["height_m"] == 1.20
+    assert payload["dimensions"]["width_m"] == 1.20
+
+    # KG node mirrors the payload.
+    node = kg.get_node(new_nid)
+    assert node["_type"] == "FamilyType"
+    assert node["category"] == "Windows"
+    assert node["dimensions"] == {"height_m": 1.20, "width_m": 1.20}
+
+
+def test_openings_create_type_variant_height_only_omits_width(
+    kg_with_opening_setup,
+):
+    """Sans opening_width_m, la dimensions garde uniquement height_m."""
+    kg, _, _, _, _, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_type_variant",
+        {
+            "source_type_ref": window_type,
+            "new_name": "Fenêtre haute",
+            "opening_height_m": 2.40,
+        },
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["dimensions"] == {"height_m": 2.40}
+    assert "width_m" not in payload["dimensions"]
+
+
+def test_openings_create_type_variant_refuses_non_family_source(
+    kg_with_opening_setup,
+):
+    kg, level, _, _, _, _, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_type_variant",
+        {
+            "source_type_ref": level,
+            "new_name": "fail",
+            "opening_height_m": 1.5,
+        },
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "not a FamilyType" in result["content"]
+
+
+def test_openings_create_type_variant_refuses_empty_name(
+    kg_with_opening_setup,
+):
+    kg, _, _, _, _, _, window_type = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_create_type_variant",
+        {
+            "source_type_ref": window_type,
+            "new_name": "  ",
+            "opening_height_m": 1.5,
+        },
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "non-empty" in result["content"]
+
+
+def test_catalog_list_door_types_surfaces_dimensions(kg_with_opening_setup):
+    """Si un FamilyType a un attribut dimensions, le catalog le remonte."""
+    kg, _, _, _, _, _, _ = kg_with_opening_setup
+    kg.add_node("FamilyType", {
+        "family_name": "Porte coupe-feu",
+        "type_name": "EI60 0900 x 2100",
+        "category": "Doors",
+        "dimensions": {"height_m": 2.10, "width_m": 0.90},
+    })
+    result = llm_protocol.dispatch_tool_use(
+        "catalog_list_door_types", {}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    types_with_dims = [d for d in payload["door_types"] if "dimensions" in d]
+    assert any(
+        d["dimensions"] == {"height_m": 2.10, "width_m": 0.90}
+        for d in types_with_dims
+    )
+
+
+def test_catalog_list_doors_and_windows_return_geometry(kg_with_opening_setup):
+    kg, _, _, wall, wall2, door_type, window_type = kg_with_opening_setup
+    # Crée 1 porte + 2 fenêtres.
+    llm_protocol.dispatch_tool_use(
+        "openings_create_door",
+        {"host_wall_ref": wall, "family_type_ref": door_type, "position": [1.0, 0.0]},
+        "t1", kg,
+    )
+    llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall2, "family_type_ref": window_type, "position": [1.0, 5.0]},
+        "t2", kg,
+    )
+    llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall2, "family_type_ref": window_type, "position": [3.0, 5.0]},
+        "t3", kg,
+    )
+
+    doors_result = llm_protocol.dispatch_tool_use(
+        "catalog_list_doors", {}, "t4", kg,
+    )
+    windows_result = llm_protocol.dispatch_tool_use(
+        "catalog_list_windows", {}, "t5", kg,
+    )
+    assert len(json.loads(doors_result["content"])["doors"]) == 1
+    assert len(json.loads(windows_result["content"])["windows"]) == 2

@@ -198,6 +198,155 @@ def column_types(doc):
     return arch + struct
 
 
+def doors(doc):
+    """All hosted door instances (OST_Doors). Excludes door FamilySymbols."""
+    return collect_by_category(doc, BuiltInCategory.OST_Doors)
+
+
+def door_types(doc):
+    """All door FamilySymbols (OST_Doors type elements)."""
+    return collect_types_by_category(doc, BuiltInCategory.OST_Doors)
+
+
+def windows(doc):
+    """All hosted window instances (OST_Windows). Excludes window FamilySymbols."""
+    return collect_by_category(doc, BuiltInCategory.OST_Windows)
+
+
+def window_types(doc):
+    """All window FamilySymbols (OST_Windows type elements)."""
+    return collect_types_by_category(doc, BuiltInCategory.OST_Windows)
+
+
+# ----- Opening dimensions (Height / Width on FamilySymbol) ---------------
+#
+# Door / Window families expose their opening dimensions through one of
+# several parameters depending on vendor / vintage / language. We cascade
+# through the standard BuiltInParameters first (most reliable when they
+# apply), then fall back to `LookupParameter` with usual French/English
+# names. All public helpers below are no-op-safe: failed reads return
+# `None`, failed writes return `False`. Callers (the `openings_*` tools)
+# treat absence as a feature-not-supported on this family, not a fatal
+# error.
+
+# Try-list order matters : Window/Door-specific BIPs ahead of the
+# generic FAMILY_HEIGHT_PARAM, so we land on the more semantic one when
+# both are present.
+_HEIGHT_BIPS = (
+    "WINDOW_HEIGHT",
+    "DOOR_HEIGHT",
+    "FAMILY_HEIGHT_PARAM",
+    "GENERIC_HEIGHT",
+)
+_WIDTH_BIPS = (
+    "WINDOW_WIDTH",
+    "DOOR_WIDTH",
+    "FAMILY_WIDTH_PARAM",
+    "GENERIC_WIDTH",
+)
+_HEIGHT_NAMES = ("Height", "Hauteur", "Hauteur d'ouverture")
+_WIDTH_NAMES = ("Width", "Largeur", "Largeur d'ouverture")
+
+
+def _try_bip_param(symbol, bip_name):
+    """Return the symbol's Parameter for `bip_name`, or None if missing.
+
+    `bip_name` is a string ("WINDOW_HEIGHT") rather than the enum value so
+    a missing BIP entry on this Revit version doesn't raise at import —
+    we resolve dynamically and fall through on AttributeError.
+    """
+    from Autodesk.Revit.DB import BuiltInParameter
+    bip = getattr(BuiltInParameter, bip_name, None)
+    if bip is None:
+        return None
+    try:
+        return symbol.get_Parameter(bip)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_dim_m(symbol, bip_names, lookup_names):
+    """Cascade through BIPs then LookupParameter names to read a length
+    in metres from `symbol`. Returns None if nothing resolved or the
+    parameter doesn't carry a numeric value."""
+    for name in bip_names:
+        p = _try_bip_param(symbol, name)
+        if p is None:
+            continue
+        try:
+            return internal_to_meters(p.AsDouble())
+        except Exception:  # noqa: BLE001
+            continue
+    for label in lookup_names:
+        try:
+            p = symbol.LookupParameter(label)
+        except Exception:  # noqa: BLE001
+            continue
+        if p is None:
+            continue
+        try:
+            return internal_to_meters(p.AsDouble())
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _set_dim_m(symbol, value_m, bip_names, lookup_names):
+    """Cascade-write a length (metres) onto `symbol`. Returns True on a
+    confirmed set, False if no parameter accepted the write (read-only
+    or absent). Silent on every exception path — these are type-side
+    parameters that vary wildly across families."""
+    feet = meters_to_internal(value_m)
+    for name in bip_names:
+        p = _try_bip_param(symbol, name)
+        if p is None or p.IsReadOnly:
+            continue
+        try:
+            if bool(p.Set(feet)):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    for label in lookup_names:
+        try:
+            p = symbol.LookupParameter(label)
+        except Exception:  # noqa: BLE001
+            continue
+        if p is None or p.IsReadOnly:
+            continue
+        try:
+            if bool(p.Set(feet)):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def opening_read_height_m(symbol):
+    """Read the opening's height (m) from a FamilySymbol (type element).
+    Returns None if no compatible parameter is found."""
+    return _read_dim_m(symbol, _HEIGHT_BIPS, _HEIGHT_NAMES)
+
+
+def opening_read_width_m(symbol):
+    """Read the opening's width (m) from a FamilySymbol. Returns None
+    when no parameter exposes it on this family."""
+    return _read_dim_m(symbol, _WIDTH_BIPS, _WIDTH_NAMES)
+
+
+def opening_set_height(symbol, height_m):
+    """Set the opening height (m) on a FamilySymbol. Returns True iff a
+    compatible writable parameter was found and accepted the value.
+    Must be inside an open Revit transaction."""
+    return _set_dim_m(symbol, height_m, _HEIGHT_BIPS, _HEIGHT_NAMES)
+
+
+def opening_set_width(symbol, width_m):
+    """Set the opening width (m) on a FamilySymbol. Returns True iff a
+    compatible writable parameter was found and accepted the value.
+    Must be inside an open Revit transaction."""
+    return _set_dim_m(symbol, width_m, _WIDTH_BIPS, _WIDTH_NAMES)
+
+
 # ----- Shared parameter: claude-in-revit:llm_id --------------------------
 #
 # Surface UX visible dans le panneau Propriétés de Revit pour que

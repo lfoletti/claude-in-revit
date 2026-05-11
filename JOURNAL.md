@@ -14,6 +14,328 @@
 
 ---
 
+## 2026-05-11 (session 4) — Openings (portes/fenêtres) + préprocesseur déterministe + découplage sill/head
+
+### Contexte & objectif
+
+Démarrage de Semaines 2-3 V0 (§9 DESIGN) sur le morceau `openings.py`,
+qui débloque la majorité des prompts naturels architecturaux (« ajoute
+une porte », « passe l'allège des fenêtres à 1 m », etc.). Trois pans
+abordés en une session :
+
+1. **`openings.py` bout-en-bout** : schéma KG, collectors, convertisseurs,
+   full_rescan étendu, ~6 tools, catalogues, `ingest_revit_element` à
+   jour pour que les 7 transforms couvrent automatiquement Door/Window.
+2. **Bug détecté en runtime** : « passe toutes les fenêtres à 1 m
+   d'allège » a traité 2/3 fenêtres seulement. Le LLM s'est fié à sa
+   mémoire conversationnelle au lieu d'appeler `catalog_list_windows`.
+   Une règle dans le system prompt est *advisory* — le modèle peut
+   l'ignorer sous pression. Fix : pré-processeur déterministe
+   `lib/preprocess.py` qui détecte les quantificateurs universels
+   dans le prompt utilisateur AVANT l'appel API et injecte le résultat
+   du `catalog_list_*` correspondant.
+3. **Découplage sill / head** : modifier `INSTANCE_SILL_HEIGHT_PARAM`
+   décale automatiquement `INSTANCE_HEAD_HEIGHT_PARAM` parce que la
+   plupart des familles Revit ont la hauteur d'ouverture en *paramètre
+   de type*. Solution BIM-orthodoxe : `openings_set_type` (switch
+   FamilySymbol) + `openings_create_type_variant` (duplique le type
+   avec une autre hauteur d'ouverture).
+
+### Décisions
+
+1. **FamilyType générique avec attribut `category` discriminator**
+   plutôt que `DoorType` / `WindowType` séparés. Évite la prolifération
+   de node types pour les hosted families (futures : Furniture,
+   Equipment, etc.). Le catalogue filtre par `category` ; la symétrie
+   avec `ColumnType` (qui garde son node type à cause du discriminator
+   `kind: architectural | structural`) est gardée à l'esprit — un node
+   type spécifique se justifie quand un attribut spécifique l'impose.
+
+2. **Position openings = `[x, y]` plan du niveau** (mètres). z dérivé
+   du host (élévation du niveau hôte + sill_height). Aligné avec
+   `Column.position` et `Wall.p1/p2`. La 3ᵉ coordonnée serait bruit
+   redondant (l'edge `at_level` la porte déjà).
+
+3. **Edge `hosts` orienté Wall → opening** (le mur héberge la porte) ;
+   `is_type` opening → FamilyType ; `at_level` dérivé du host wall via
+   `host_attrs.level_ref`, pas de `door.LevelId` (sur certaines
+   familles hosted la propriété Level peut différer du host — on
+   considère le host comme autorité pour l'étage).
+
+4. **Quantificateurs universels → autoscan déterministe côté
+   pushbutton, pas instruction system prompt.** L'incident runtime a
+   confirmé que le LLM peut ignorer une règle texte. Le pré-processeur
+   scanne le prompt avec une regex (`toutes/tous/chaque/l'ensemble
+   des/all/every/each` + noun de collection FR+EN, tolérance
+   accent-less), dispatche les `catalog_list_*` localement, et
+   préfixe le résultat dans un bloc `<auto_scan_kg>` du message
+   utilisateur. Le LLM voit l'énumération exhaustive avant même de
+   choisir un tool — plus de marge pour oublier. Coût tokens payé
+   uniquement quand un quantificateur apparaît effectivement.
+
+5. **Soft lock résiduel sur les quantificateurs non couverts.** Si
+   l'utilisateur dit « pour chacun des éléments du R+1 » (collection
+   pas dans la mappe regex), le pré-processeur ne déclenche pas → la
+   règle texte du system prompt reste comme filet de sécurité. Le
+   modèle est instruit que **quand il voit `<auto_scan_kg>`, il NE
+   doit PAS rappeler `catalog_list_*`** pour les collections déjà
+   listées (économie tokens) ; sinon, il appelle lui-même.
+
+6. **Découplage sill ↔ head via assignment de type, pas via override
+   instance.** Choix BIM-orthodoxe (option A) : l'utilisateur passe à
+   un FamilyType qui a déjà la bonne `dimensions.height_m`. Quand le
+   catalogue ne contient pas de variant adapté (option B),
+   `openings_create_type_variant` duplique un FamilySymbol et règle
+   sa hauteur d'ouverture côté type — pas de touch instance, ce qui
+   évite le piège « le param Height est read-only / type-level sur la
+   plupart des familles standard ».
+
+7. **Cascade BuiltInParameter → LookupParameter pour les dimensions
+   d'ouverture.** Les noms varient selon la famille / vendor / langue :
+   `WINDOW_HEIGHT` / `DOOR_HEIGHT` / `FAMILY_HEIGHT_PARAM` /
+   `GENERIC_HEIGHT` essayés d'abord, puis `LookupParameter("Height" |
+   "Hauteur" | "Hauteur d'ouverture")` en fallback (et idem largeur).
+   Toutes les opérations sont silent-fail : `None` au read, `False` au
+   set. Le tool `openings_create_type_variant` remonte un message
+   actionnable seulement si **toute** la cascade échoue.
+
+8. **`FamilyType.dimensions` populé opportunistement au rescan.**
+   Quand la cascade `opening_read_height_m` retourne une valeur, on
+   stamp `dimensions: {height_m, width_m}` sur le node — sinon on
+   omet l'attribut. Le LLM peut alors filtrer dans
+   `catalog_list_door_types` / `_window_types` sur les dimensions
+   exposées sans avoir à interroger l'API Revit.
+
+9. **`ProjectKG.remove_edge(src, dst, edge_type)` méthode publique**
+   pour permettre `openings_set_type` de re-router l'edge `is_type`
+   atomiquement. Évite le pattern `_g.remove_edge` underscore-private
+   dans le code applicatif. Idempotente (retourne True/False).
+
+### Phase 1 — Schéma KG : `FamilyType.category` required
+
+`lib/project_kg.py` : `FamilyType` étendu avec `category` en required
+("Doors" | "Windows" | …). Door / Window déjà déclarés (héritage du
+slice initial). Pas de nouveau node type — la discrimination est
+attributaire.
+
+### Phase 2 — Collectors + convertisseurs + full_rescan étendu
+
+`lib/revit_primitives.py` :
+- `doors(doc)` / `windows(doc)` (instances).
+- `door_types(doc)` / `window_types(doc)` (FamilySymbols).
+
+`lib/kg_sync.py` :
+- `_family_type_to_attrs(symbol, *, category)` — populé dimensions
+  opportunistement (cf. Décision 8).
+- `_opening_to_attrs(opening, *, type_ref, host_wall_ref)` — position
+  2D métres, sill/head via BuiltInParameters, arrondi 6 décimales.
+- 4 passes ajoutées à `full_rescan` : DoorTypes, WindowTypes, Doors,
+  Windows. Le summary élargi expose des counts séparés pour
+  `door_types` / `window_types` (filtrés sur l'attribut `category` du
+  node FamilyType).
+- `ingest_revit_element` : nouvelle branche `FamilyInstance` qui
+  détecte `Category.Id ∈ {OST_Doors, OST_Windows}` et dispatche vers
+  `_opening_to_attrs`. Les 7 transforms héritent automatiquement.
+- `_RESCANNABLE_CATEGORY_IDS` enrichi de OST_Doors / OST_Windows → la
+  sélection active suggère un Refresh KG si l'utilisateur clique un
+  opening non bindé.
+
+### Phase 3 — Tools `openings.py` (nouveau, ~720 lignes)
+
+Six tools livrés :
+
+| Tool | Action |
+|------|--------|
+| `openings_create_door(host_wall_ref, family_type_ref, position, sill_height?)` | Solo, refuse type non-Doors |
+| `openings_create_window(host_wall_ref, family_type_ref, position, sill_height?)` | Solo, refuse type non-Windows, défaut sill=0.9m KG-only |
+| `openings_create_many(items)` | Bulk doors+windows mixé, validation upfront, batch activation FamilySymbols |
+| `openings_set_sill_height(llm_id, sill_height_m)` | `INSTANCE_SILL_HEIGHT_PARAM`, KG + Revit |
+| `openings_set_head_height(llm_id, head_height_m)` | `INSTANCE_HEAD_HEIGHT_PARAM`, KG + Revit |
+| `openings_delete(llm_id)` | KG soft-delete + Revit `Document.Delete` |
+
+Helper privé `_require_live_opening` (pattern de `_require_live_wall`)
+factorise les pré-checks. `stamp_llm_id` appelé après chaque
+`set_revit_id`. Pattern doc-aware standard : `doc=None` → mutation KG
+seule, `doc != None` → branche Revit avec `rp.transaction(...)`.
+
+### Phase 4 — Catalogues openings + dimensions
+
+`lib/tools/catalog.py` étendu :
+- `catalog_list_door_types()` / `_window_types()` — filtrent FamilyType
+  par `category`, surface `dimensions` quand présent (key absente si
+  la cascade Revit n'a rien trouvé pour ce type).
+- `catalog_list_doors()` / `_windows()` — listent les openings vivants
+  avec position, sill, head, host_wall_ref.
+- Helper privé `_list_family_types_by_category` factorisé.
+
+### Phase 5 — DYNAMIC state block enrichi
+
+`prompt.pushbutton/script.py:_dynamic_state_block` ajoute
+`Portes / Fenêtres / Types de porte / Types de fenêtre` au summary
+qui apparaît à chaque turn. Les counts FamilyType sont ventilés par
+`category` (boucle sur les nodes au lieu d'un simple `count_by_type`)
+pour que le LLM voie la composition réelle de son inventaire.
+
+### Phase 6 — Pré-processeur déterministe (`lib/preprocess.py` nouveau)
+
+Surface :
+- `detect_exhaustive_collections(prompt) -> [(tool_name, key), …]` :
+  regex compilées au load, pattern `(quantificateur)\s*(noun)` avec
+  10 entrées (4 type-catalogs prioritaires + 6 instance-catalogs).
+  L'ordre dans `_COLLECTION_MAP` privilégie le noun phrase le plus
+  spécifique (« types de mur » avant « murs »). De-dup et ordre stable
+  par position dans le prompt.
+- `autoscan_payload(prompt, kg) -> str` : dispatche les catalogs
+  détectés via `llm_protocol.dispatch_tool_use`, formate les résultats
+  dans un bloc `<auto_scan_kg>…</auto_scan_kg>` avec un trailing note
+  explicite (« exhaustive et à jour ; itère dessus ; ne RAPPELLE
+  PAS `catalog_list_*` »). Retourne `""` quand rien ne matche → zéro
+  coût sur les prompts ordinaires.
+
+Tolérances regex :
+- Sans accent : `fenetres`, `etages` matchent (alternation `[ée]` /
+  `[êe]` dans les classes).
+- Casse : `re.IGNORECASE`.
+- Pluriels : `s?` sur tous les nouns + `toutes?` / `tous`.
+- Anglais : `all (the) | every | each` parallèle au français.
+
+### Phase 7 — Wiring autoscan dans `prompt.pushbutton`
+
+Le pushbutton appelle `preprocess.autoscan_payload(user_prompt, kg)`
+*avant* `build_user_content`. Si le payload est non vide, il est
+préfixé au texte utilisateur — Anthropic le voit comme partie du
+message utilisateur. Le pré-processeur est donc transparent côté
+LLM-API ; on ne touche pas à l'historique persisté (un autoscan
+n'ajoute pas de turn assistant fantôme).
+
+System prompt mis à jour : la règle « quantificateurs universels »
+explique le bloc `<auto_scan_kg>` comme énumération faisant autorité
+*injectée par le pushbutton* — le LLM doit itérer dessus directement
+et **ne pas** rappeler `catalog_list_*`. Le fallback (régex non
+matchée → autoscan absent → LLM se débrouille avec un `catalog_list_*`
+manuel) reste documenté.
+
+### Phase 8 — Découplage sill / head : helpers + 2 tools
+
+`lib/revit_primitives.py` : 4 helpers cascade pour les dimensions
+opening :
+- `opening_read_height_m(symbol)` / `opening_read_width_m(symbol)` —
+  cascade BIP (`WINDOW_HEIGHT` / `DOOR_HEIGHT` / `FAMILY_HEIGHT_PARAM`
+  / `GENERIC_HEIGHT`) puis `LookupParameter` (`Height` / `Hauteur` /
+  `Hauteur d'ouverture`, idem largeur). Retournent None si rien.
+- `opening_set_height(symbol, value_m)` / `opening_set_width(symbol,
+  value_m)` — même cascade en écriture, retournent True/False.
+  `IsReadOnly` filtré, silent-fail sur exception. Utilisent
+  `getattr(BuiltInParameter, name, None)` pour tolérer une BIP
+  absente d'une version Revit donnée — pas d'`ImportError` à
+  l'import.
+
+`lib/tools/openings.py` étendu de 2 tools :
+
+- **`openings_set_type(llm_id, new_family_type_ref)`** : switch d'un
+  FamilySymbol à un autre sur une porte/fenêtre existante.
+  - Validation : nouveau type **même catégorie** (Door ↔ Doors,
+    Window ↔ Windows) — refuse cross-category avec message
+    actionnable.
+  - Revit : `instance.Symbol = new_symbol`, activate si besoin.
+  - KG : `remove_edge` ancien `is_type` + `modify_node(type_ref +
+    sill_height + head_height)` + `add_edge` nouveau. Re-lit sill /
+    head post-swap (le nouveau type peut avoir une hauteur d'ouverture
+    différente).
+
+- **`openings_create_type_variant(source_type_ref, new_name,
+  opening_height_m, opening_width_m?)`** : duplique un FamilySymbol
+  via `symbol.Duplicate(new_name)`, règle la hauteur d'ouverture (et
+  largeur si fournie) via les helpers cascade. Refus actionnable si
+  toute la cascade échoue (message qui liste les BIPs et les
+  LookupParameter tentés). Active le nouveau symbol, bind ElementId,
+  stamp llm_id. Ajoute le node FamilyType au KG avec `dimensions`
+  re-lues post-Set (mirror de ce que Revit a réellement commit).
+
+Cas d'usage typique enchaîné : « j'ai besoin d'une fenêtre 90cm de
+sill et 220cm de head » →
+1. `catalog_list_window_types` → cherche un type avec
+   `dimensions.height_m == 1.30`.
+2. Si absent : `openings_create_type_variant(source_type_ref, "Fenêtre
+   1300mm", opening_height_m=1.30)`.
+3. `openings_set_type(window_001, new_type_llm_id)`.
+4. `openings_set_sill_height(window_001, 0.9)` → head tombe à 2.20
+   automatiquement (sill + opening_height).
+
+### Phase 9 — `ProjectKG.remove_edge` publique
+
+Méthode ajoutée à `project_kg.py` : `remove_edge(src, dst, edge_type)
+-> bool`. Idempotente — retourne True si l'edge existait, False sinon.
+Utilisée par `openings_set_type` pour re-router `is_type` atomiquement
+sans accès `_g.remove_edge` underscore-private.
+
+### Validation
+
+- `pytest -q` : **214 tests verts en ~7s** (187 → +27 cette session).
+  - 17 nouveaux dans `test_preprocess.py` (détection FR/EN +
+    autoscan).
+  - 8 dans `test_tools.py` pour les openings de base + 8 supplémentaires
+    pour `set_type` / `create_type_variant` + dimensions au catalog.
+  - 3 dans `test_project_kg.py` : `FamilyType.category` required,
+    `Door/Window` schema, `remove_edge` idempotente.
+- **Validation runtime partielle** : openings tools exercés (incident
+  des 2/3 fenêtres), pré-processeur et set_type/variant non encore
+  validés en Revit (à faire prochaine ouverture).
+
+### État final & reste à faire
+
+**Acquis session 4** :
+- Openings complet : 6 tools création/modification + 4 catalogues +
+  rescan + ingest_revit_element + DYNAMIC state ✓
+- Pré-processeur déterministe `<auto_scan_kg>` : détection FR+EN +
+  injection dans le prompt utilisateur ✓
+- Découplage sill/head via `openings_set_type` + `_create_type_variant`
+  + helpers cascade Height/Width ✓
+- FamilyType.dimensions populé au rescan, surface dans les catalogs ✓
+- `ProjectKG.remove_edge` méthode publique ✓
+- 214 tests verts (187 → +27), aucune régression ✓
+
+**À valider en runtime** :
+- Création d'une porte / fenêtre + ajustement sill/head.
+- `openings_create_many` avec 10 fenêtres dans un même mur.
+- Pré-processeur : prompt « passe toutes les fenêtres à 1 m
+  d'allège » → bloc `<auto_scan_kg>` injecté, LLM traite les 3 sans
+  oublier.
+- `openings_set_type` : swap d'un type vers un autre, sill/head
+  re-lus correctement.
+- `openings_create_type_variant` : duplication d'un type avec hauteur
+  d'ouverture custom, dispo immédiate pour `openings_create_window`.
+
+**Dettes / TODO créés** :
+1. **Pré-processeur — collection inconnue** : si l'utilisateur dit
+   « pour l'ensemble des escaliers », rien ne se déclenche (collection
+   non encore modélisée). Pas de bug, mais le LLM doit tomber sur le
+   safety-net texte. À étendre `_COLLECTION_MAP` quand `rooms` /
+   `stairs` / `floors` arriveront.
+2. **`openings_create_type_variant` — paramètres custom** : seules
+   `Height` / `Width` sont exposées (cascade dimensions). Pour des
+   familles avec d'autres dimensions paramétrables (épaisseur de
+   cadre, hauteur d'imposte, …), l'utilisateur devra ouvrir Revit. À
+   évoluer si un cas réel le réclame.
+3. **Sill / head dépend de la famille** : `openings_set_sill_height`
+   tombe en erreur si la famille a `INSTANCE_SILL_HEIGHT_PARAM`
+   read-only (rare mais possible sur certaines familles custom).
+   Le message d'erreur pointe la cause — le LLM peut suggérer un
+   `set_type` à la place.
+
+**Suite immédiate (§9 DESIGN, Semaines 2-3 V0 restant)** :
+- `rooms.py` : create, recompute_boundaries, set_name, get_area +
+  convertisseur Room + ingest_revit_element branche Room. Préparation
+  UC8 compliance (Room.use_subcategory pour le scope hiérarchique).
+- `levels.py` (écriture) : create, modify_elevation, set_active.
+  Lecture déjà couverte au rescan.
+
+**Suite Sem.4-5 V0** :
+- `dwg_reader.py` + `dwg_classifier.py` (ezdxf) → UC1 (DWG → modèle).
+- `tools/bulk.py` (`apply_to_filter`, `change_param_bulk`) → UC7.
+
+---
+
 ## 2026-05-11 (session 3) — Stabilisation des `llm_id` au rescan + shared param UX
 
 ### Contexte & objectif

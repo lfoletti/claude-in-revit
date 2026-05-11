@@ -152,6 +152,8 @@ _RESCANNABLE_CATEGORY_IDS: set = {
     -2000051,  # OST_Lines — ModelCurve (3D) + DetailCurve (view-bound 2D).
     -2000100,  # OST_Columns — architectural column instances + types.
     -2001330,  # OST_StructuralColumns — structural column instances + types.
+    -2000023,  # OST_Doors — hosted door instances + FamilySymbols.
+    -2000014,  # OST_Windows — hosted window instances + FamilySymbols.
     # OST_Levels (-2000240) intentionally NOT included: Levels are picked
     # up via `OfClass(Level)` (their Category is unreliable on 2024+, see
     # revit_primitives.levels() rationale), and selecting a Level via the
@@ -161,6 +163,8 @@ _RESCANNABLE_CATEGORY_IDS: set = {
 
 _OST_COLUMNS_CATEGORY_INT = -2000100
 _OST_STRUCTURAL_COLUMNS_CATEGORY_INT = -2001330
+_OST_DOORS_CATEGORY_INT = -2000023
+_OST_WINDOWS_CATEGORY_INT = -2000014
 
 
 def _column_kind(element: Any) -> str:
@@ -371,6 +375,78 @@ def _curve_element_to_attrs(curve_element: Any) -> Dict[str, Any]:
     return {"p1": p1, "p2": p2, "length": length}
 
 
+def _family_type_to_attrs(symbol: Any, *, category: str) -> Dict[str, Any]:
+    """Extract `family_name`, `type_name`, `category` (+ `dimensions`)
+    from a FamilySymbol.
+
+    `category` is a stable discriminator string ("Doors" | "Windows" | …)
+    set by the caller from the BuiltInCategory used to collect the symbol.
+    Catalog tools (`catalog_list_door_types`, `_window_types`) filter on
+    this attr without re-resolving the Revit category at query time.
+
+    `dimensions` is populated opportunistically — the cascade in
+    `revit_primitives.opening_read_*` returns None on families whose
+    parameter naming we don't recognise. When both height and width
+    resolve, we emit `{"height_m": h, "width_m": w}` ; missing one is
+    skipped (key absent rather than `None`). The LLM filters /
+    selects types by these dimensions via `catalog_list_door_types` /
+    `_window_types`.
+    """
+    from . import revit_primitives as rp
+    attrs: Dict[str, Any] = {
+        "family_name": symbol.Family.Name,
+        "type_name": symbol.Name,
+        "category": category,
+    }
+    dims: Dict[str, float] = {}
+    h = rp.opening_read_height_m(symbol)
+    if h is not None:
+        dims["height_m"] = _r(h)
+    w = rp.opening_read_width_m(symbol)
+    if w is not None:
+        dims["width_m"] = _r(w)
+    if dims:
+        attrs["dimensions"] = dims
+    return attrs
+
+
+def _opening_to_attrs(
+    opening: Any,
+    *,
+    type_ref: str,
+    host_wall_ref: str,
+) -> Dict[str, Any]:
+    """Extract shared attrs for a hosted Door/Window instance.
+
+    `position` is `[x, y]` in metres on the level plane (z is implied by
+    the host level's elevation + the sill height). `sill_height` and
+    `head_height` come from the standard BuiltInParameters — if a
+    family doesn't expose them (rare on stock Revit families) we fall
+    back to 0.0 and the agent can re-read after creation.
+    """
+    from . import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter
+
+    loc = opening.Location
+    pt = loc.Point  # XYZ in feet — for hosted FamilyInstance this is the
+                    # world-space insertion point on the host wall.
+    position = [
+        _r(rp.internal_to_meters(pt.X)),
+        _r(rp.internal_to_meters(pt.Y)),
+    ]
+    sill_param = opening.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+    head_param = opening.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+    sill_height = _r(rp.internal_to_meters(sill_param.AsDouble())) if sill_param else 0.0
+    head_height = _r(rp.internal_to_meters(head_param.AsDouble())) if head_param else 0.0
+    return {
+        "type_ref": type_ref,
+        "host_wall_ref": host_wall_ref,
+        "position": position,
+        "sill_height": sill_height,
+        "head_height": head_height,
+    }
+
+
 def _wall_to_attrs(
     wall: Any,
     *,
@@ -454,6 +530,10 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         "detail_lines": 0,
         "column_types": 0,
         "columns": 0,
+        "door_types": 0,
+        "window_types": 0,
+        "doors": 0,
+        "windows": 0,
     }
 
     # Snapshot `revit_id → llm_id` BEFORE clearing — drives id stability.
@@ -623,11 +703,101 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             except Exception:  # noqa: BLE001
                 skipped["columns"] += 1
 
+        # 8. DoorTypes / WindowTypes — FamilySymbols filtered by category.
+        # Scanned before instances so doors/windows can resolve `type_ref`.
+        for dt in rp.door_types(doc):
+            try:
+                nid = kg.add_node(
+                    "FamilyType",
+                    _family_type_to_attrs(dt, category="Doors"),
+                    llm_id=_preserved_id(dt),
+                    _emit_log=False,
+                )
+                bind(kg, nid, dt)
+                _stamp(dt, nid)
+            except Exception:  # noqa: BLE001
+                skipped["door_types"] += 1
+
+        for wt in rp.window_types(doc):
+            try:
+                nid = kg.add_node(
+                    "FamilyType",
+                    _family_type_to_attrs(wt, category="Windows"),
+                    llm_id=_preserved_id(wt),
+                    _emit_log=False,
+                )
+                bind(kg, nid, wt)
+                _stamp(wt, nid)
+            except Exception:  # noqa: BLE001
+                skipped["window_types"] += 1
+
+        # 9. Doors — hosted on Walls. Need Wall + DoorType refs already
+        # bound. Unmapped host (door on a wall we couldn't scan, or whose
+        # type failed conversion) → skip silently.
+        for d in rp.doors(doc):
+            try:
+                host_wall_ref = llm_id_of(kg, d.Host)
+                type_ref = llm_id_of(kg, d.Symbol)
+                if host_wall_ref is None or type_ref is None:
+                    skipped["doors"] += 1
+                    continue
+                # `at_level` is the host wall's level — derive from KG
+                # rather than re-reading from Revit, so a Door whose
+                # `.LevelId` is invalid still gets a clean edge.
+                host_attrs = kg.get_node(host_wall_ref)
+                level_ref = host_attrs.get("level_ref")
+                attrs = _opening_to_attrs(
+                    d, type_ref=type_ref, host_wall_ref=host_wall_ref,
+                )
+                nid = kg.add_node(
+                    "Door", attrs, llm_id=_preserved_id(d), _emit_log=False,
+                )
+                bind(kg, nid, d)
+                _stamp(d, nid)
+                kg.add_edge(host_wall_ref, nid, "hosts")
+                kg.add_edge(nid, type_ref, "is_type")
+                if level_ref is not None:
+                    kg.add_edge(nid, level_ref, "at_level")
+            except Exception:  # noqa: BLE001
+                skipped["doors"] += 1
+
+        # 10. Windows — same pattern as Doors.
+        for w in rp.windows(doc):
+            try:
+                host_wall_ref = llm_id_of(kg, w.Host)
+                type_ref = llm_id_of(kg, w.Symbol)
+                if host_wall_ref is None or type_ref is None:
+                    skipped["windows"] += 1
+                    continue
+                host_attrs = kg.get_node(host_wall_ref)
+                level_ref = host_attrs.get("level_ref")
+                attrs = _opening_to_attrs(
+                    w, type_ref=type_ref, host_wall_ref=host_wall_ref,
+                )
+                nid = kg.add_node(
+                    "Window", attrs, llm_id=_preserved_id(w), _emit_log=False,
+                )
+                bind(kg, nid, w)
+                _stamp(w, nid)
+                kg.add_edge(host_wall_ref, nid, "hosts")
+                kg.add_edge(nid, type_ref, "is_type")
+                if level_ref is not None:
+                    kg.add_edge(nid, level_ref, "at_level")
+            except Exception:  # noqa: BLE001
+                skipped["windows"] += 1
+
         reused = sum(
             1 for _, attrs in kg._g.nodes(data=True)  # noqa: SLF001
             if attrs.get("_revit_id") is not None
             and preserved.get(int(attrs["_revit_id"])) is not None
         )
+        # Door / Window FamilyTypes share the `FamilyType` node type with
+        # other future hosted families; we count by `category` attr so the
+        # summary reflects what was actually scanned in each pass.
+        family_types_by_cat = {"Doors": 0, "Windows": 0, "other": 0}
+        for nid in kg.find_by_type("FamilyType"):
+            cat = kg.get_node(nid).get("category", "other")
+            family_types_by_cat[cat] = family_types_by_cat.get(cat, 0) + 1
         summary = {
             "levels": kg.count_by_type("Level"),
             "wall_types": kg.count_by_type("WallType"),
@@ -636,6 +806,10 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             "detail_lines": kg.count_by_type("DetailLine"),
             "column_types": kg.count_by_type("ColumnType"),
             "columns": kg.count_by_type("Column"),
+            "door_types": family_types_by_cat.get("Doors", 0),
+            "window_types": family_types_by_cat.get("Windows", 0),
+            "doors": kg.count_by_type("Door"),
+            "windows": kg.count_by_type("Window"),
             "skipped": dict(skipped),
             "preserved_llm_ids": reused,
         }
@@ -747,6 +921,39 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
                 kg.add_edge(nid, type_ref, "is_type")
                 return nid
 
+            if cat_int in (
+                _OST_DOORS_CATEGORY_INT,
+                _OST_WINDOWS_CATEGORY_INT,
+            ):
+                node_type = (
+                    "Door" if cat_int == _OST_DOORS_CATEGORY_INT else "Window"
+                )
+                host_wall_ref = llm_id_of(kg, element.Host)
+                type_ref = llm_id_of(kg, element.Symbol)
+                if host_wall_ref is None or type_ref is None:
+                    raise ValueError(
+                        "Cannot ingest {} {}: host wall or type missing "
+                        "from KG. Run Refresh KG first.".format(
+                            node_type, _extract_revit_id(element.Id),
+                        )
+                    )
+                # Derive level from host wall — Door.LevelId may differ
+                # from the wall's level on certain hosted families;
+                # we treat the host wall as authoritative for `at_level`.
+                host_attrs = kg.get_node(host_wall_ref)
+                level_ref = host_attrs.get("level_ref")
+                attrs = _opening_to_attrs(
+                    element, type_ref=type_ref, host_wall_ref=host_wall_ref,
+                )
+                nid = kg.add_node(node_type, attrs)
+                bind(kg, nid, element)
+                _stamp_param_silent(element, nid)
+                kg.add_edge(host_wall_ref, nid, "hosts")
+                kg.add_edge(nid, type_ref, "is_type")
+                if level_ref is not None:
+                    kg.add_edge(nid, level_ref, "at_level")
+                return nid
+
     if isinstance(element, ModelCurve):
         nid = kg.add_node("ModelLine", _curve_element_to_attrs(element))
         bind(kg, nid, element)
@@ -761,8 +968,10 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
 
     raise ValueError(
         "Don't know how to ingest element of class {}. Supported in V0: "
-        "Wall, Column (arch/struct FamilyInstance), ModelCurve, "
-        "DetailCurve.".format(type(element).__name__)
+        "Wall, Column (arch/struct FamilyInstance), Door / Window "
+        "(hosted FamilyInstance), ModelCurve, DetailCurve.".format(
+            type(element).__name__
+        )
     )
 
 

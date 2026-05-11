@@ -295,6 +295,19 @@ _STATIC_SYSTEM_PROMPT = (
     "  `catalog_list_<type>` ou `query_get_node` **avant** la modif "
     "  — les compteurs llm_id peuvent avoir des trous (suppressions, "
     "  sessions antérieures), donc ids non contigus.\n"
+    "- **Quantificateurs universels (« tous », « toutes », « chaque », "
+    "  « l'ensemble des », « la totalité des », « all/every/each ») : "
+    "  le pushbutton détecte ces tournures et injecte automatiquement "
+    "  un bloc `<auto_scan_kg>` en tête du message utilisateur avec "
+    "  le résultat à jour du `catalog_list_<type>` correspondant.** "
+    "  Quand tu vois un bloc `<auto_scan_kg>`, c'est l'énumération "
+    "  exhaustive faisant autorité — itère sur ces llm_ids directement, "
+    "  ne RAPPELLE PAS `catalog_list_*` pour les collections déjà "
+    "  listées dedans, et ne te fie JAMAIS à ta mémoire conversationnelle "
+    "  pour cette collection-là. Si l'expression universelle vise une "
+    "  collection qui n'est PAS dans l'autoscan (cas non couvert par "
+    "  le préprocesseur), appelle `catalog_list_<type>` toi-même avant "
+    "  d'agir.\n"
     "- **Sur erreur de tool**, ne ré-essaye pas la même commande à "
     "  l'identique. Lis le message d'erreur, ajuste les arguments "
     "  ou bien remonte le blocage à l'utilisateur en clair plutôt "
@@ -310,6 +323,18 @@ def _dynamic_state_block(kg, selection_ids, unbound_by_category, refresh_actiona
     static instructions above stay in the cached prefix turn after
     turn, while this state is re-encoded fresh.
     """
+    # FamilyType nodes are shared across hosted families (Door, Window,
+    # eventually Furniture, …) — discriminated by `category`. Count
+    # them per-category so the state block reflects the actual room
+    # the LLM has to maneuver in.
+    door_types = 0
+    window_types = 0
+    for nid in kg.find_by_type("FamilyType"):
+        cat = kg.get_node(nid).get("category")
+        if cat == "Doors":
+            door_types += 1
+        elif cat == "Windows":
+            window_types += 1
     return (
         "## État courant du projet\n\n"
         "Project ID : {project_id}\n"
@@ -317,7 +342,9 @@ def _dynamic_state_block(kg, selection_ids, unbound_by_category, refresh_actiona
         "Niveaux : {levels} | Types de mur : {wall_types} | "
         "Murs : {walls} | Lignes modèle : {model_lines} | "
         "Lignes détail : {detail_lines} | Types de poteau : "
-        "{column_types} | Poteaux : {columns}\n"
+        "{column_types} | Poteaux : {columns} | Types de porte : "
+        "{door_types} | Portes : {doors} | Types de fenêtre : "
+        "{window_types} | Fenêtres : {windows}\n"
         "{selection_line}"
     ).format(
         project_id=kg.project_id,
@@ -329,6 +356,10 @@ def _dynamic_state_block(kg, selection_ids, unbound_by_category, refresh_actiona
         detail_lines=kg.count_by_type("DetailLine"),
         column_types=kg.count_by_type("ColumnType"),
         columns=kg.count_by_type("Column"),
+        door_types=door_types,
+        doors=kg.count_by_type("Door"),
+        window_types=window_types,
+        windows=kg.count_by_type("Window"),
         selection_line=_format_selection_line(
             selection_ids, unbound_by_category, refresh_actionable,
         ),
@@ -375,7 +406,7 @@ def _fmt_usage(u, stop_reason):
 
 
 def _main():
-    from lib import config, kg_sync
+    from lib import config, kg_sync, preprocess
     from lib.llm_api import (
         LLMClient,
         build_user_content,
@@ -471,6 +502,19 @@ def _main():
         # conversation. The KG is untouched (project state survives).
         history = []
         save_history(history, history_path)
+
+    # Deterministic safety net: if the user prompt contains an
+    # exhaustive quantifier (« toutes les fenêtres », « tous les murs »,
+    # « chaque porte », « all the windows », …), pre-scan the relevant
+    # KG catalog(s) and inject the result as an `<auto_scan_kg>` block
+    # at the top of the user message. This converts the advisory
+    # system-prompt rule into a runtime guarantee — the LLM literally
+    # sees the live collection state in its context and can't fall
+    # back on a stale conversation memory. Token cost paid only when
+    # an exhaustive expression actually appears.
+    autoscan_preamble = preprocess.autoscan_payload(user_prompt, kg)
+    if autoscan_preamble:
+        user_prompt = autoscan_preamble + user_prompt
 
     # build_user_content wraps prompt + optional attachment into the shape
     # Anthropic expects in `messages=[{"role": "user", "content": …}]`: a

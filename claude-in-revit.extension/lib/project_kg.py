@@ -28,6 +28,10 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
         "required": {"type_ref", "level_ref", "p1", "p2", "length", "height"},
         "optional": set(),
     },
+    # Hosted opening on a wall. `position` is `[x, y]` in metres in the
+    # level plane (z = level_elevation + sill_height, derived). `sill_height`
+    # and `head_height` come from the BuiltInParameter
+    # `INSTANCE_SILL_HEIGHT_PARAM` / `INSTANCE_HEAD_HEIGHT_PARAM`.
     "Door": {
         "required": {"type_ref", "host_wall_ref", "position", "sill_height", "head_height"},
         "optional": set(),
@@ -58,8 +62,16 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
         "required": {"family_name", "type_name", "kind"},
         "optional": set(),
     },
+    # Generic FamilySymbol used by Door/Window instances (and any future
+    # hosted family type we add — furniture, equipment, etc.). The
+    # `category` discriminator is required so `catalog_list_door_types`
+    # / `catalog_list_window_types` can filter without us having to
+    # proliferate node types per category. Mirrors the choice for
+    # `ColumnType` (which keeps its own type because of the
+    # `kind: architectural | structural` discriminator that doesn't
+    # generalise to other hosted families).
     "FamilyType": {
-        "required": {"family_name", "type_name"},
+        "required": {"family_name", "type_name", "category"},
         "optional": {"dimensions"},
     },
     # 3D model lines (`Autodesk.Revit.DB.ModelCurve`). Useful as
@@ -239,6 +251,16 @@ class ProjectKG:
                 "Edge endpoints must exist: {} -> {}".format(src, dst)
             )
         self._g.add_edge(src, dst, key=edge_type, _type=edge_type, **attrs)
+
+    def remove_edge(self, src: str, dst: str, edge_type: str) -> bool:
+        """Drop the typed edge `src --(edge_type)-> dst`, returning whether
+        it existed. Used by tools that re-route a single edge (e.g.
+        `openings_set_type` swaps `is_type` from old to new FamilyType).
+        Idempotent — no error if the edge is already absent."""
+        if not self._g.has_edge(src, dst, key=edge_type):
+            return False
+        self._g.remove_edge(src, dst, key=edge_type)
+        return True
 
     # ----- Revit binding -----------------------------------------------
 

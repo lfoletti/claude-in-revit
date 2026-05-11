@@ -92,6 +92,126 @@ def list_walls(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     return {"walls": out}
 
 
+def _list_family_types_by_category(
+    kg: ProjectKG, category: str,
+) -> List[Dict[str, Any]]:
+    """Filter FamilyType nodes by their `category` attr. Shared by
+    `catalog_list_door_types` / `_window_types`. Includes `dimensions`
+    when the type's family exposes recognised height/width parameters
+    (`{height_m, width_m}` — either key may be absent for partial
+    coverage)."""
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("FamilyType"):
+        attrs = kg.get_node(nid)
+        if attrs.get("category") != category:
+            continue
+        entry: Dict[str, Any] = {
+            "llm_id": nid,
+            "family_name": attrs.get("family_name"),
+            "type_name": attrs.get("type_name"),
+        }
+        dims = attrs.get("dimensions")
+        if dims:
+            entry["dimensions"] = dims
+        out.append(entry)
+    return out
+
+
+@tool(name="catalog_list_door_types", tier=1)
+def list_door_types(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste tous les types de porte (`FamilyType` de catégorie "Doors").
+
+    Concepts: type de porte, door type, famille, catalogue, inventaire
+    Phrases: "quels types de porte", "list door types", "catalogue portes"
+    Similar: catalog_list_window_types, openings_create_door
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"door_types": [{llm_id, family_name, type_name}, ...]}
+    """
+    return {"door_types": _list_family_types_by_category(kg, "Doors")}
+
+
+@tool(name="catalog_list_window_types", tier=1)
+def list_window_types(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste tous les types de fenêtre (`FamilyType` de catégorie "Windows").
+
+    Concepts: type de fenêtre, window type, famille, catalogue, inventaire
+    Phrases: "quels types de fenêtre", "list window types",
+             "catalogue fenêtres"
+    Similar: catalog_list_door_types, openings_create_window
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"window_types": [{llm_id, family_name, type_name}, ...]}
+    """
+    return {"window_types": _list_family_types_by_category(kg, "Windows")}
+
+
+@tool(name="catalog_list_doors", tier=1)
+def list_doors(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste toutes les portes vivantes du projet avec leur géométrie complète.
+
+    Concepts: porte, door, ouverture, inventaire, hosted
+    Phrases: "liste les portes", "quelles portes", "all doors",
+             "toutes les portes"
+    Similar: catalog_list_windows, catalog_list_walls, openings_create_door
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"doors": [{llm_id, host_wall_ref, type_ref, position,
+                    sill_height, head_height}, ...]}
+    """
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("Door"):
+        attrs = kg.get_node(nid)
+        out.append({
+            "llm_id": nid,
+            "host_wall_ref": attrs.get("host_wall_ref"),
+            "type_ref": attrs.get("type_ref"),
+            "position": attrs.get("position"),
+            "sill_height": attrs.get("sill_height"),
+            "head_height": attrs.get("head_height"),
+        })
+    return {"doors": out}
+
+
+@tool(name="catalog_list_windows", tier=1)
+def list_windows(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste toutes les fenêtres vivantes du projet avec leur géométrie complète.
+
+    Concepts: fenêtre, window, ouverture, inventaire, hosted, allège
+    Phrases: "liste les fenêtres", "quelles fenêtres", "all windows",
+             "toutes les fenêtres"
+    Similar: catalog_list_doors, catalog_list_walls, openings_create_window
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"windows": [{llm_id, host_wall_ref, type_ref, position,
+                      sill_height, head_height}, ...]}
+    """
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("Window"):
+        attrs = kg.get_node(nid)
+        out.append({
+            "llm_id": nid,
+            "host_wall_ref": attrs.get("host_wall_ref"),
+            "type_ref": attrs.get("type_ref"),
+            "position": attrs.get("position"),
+            "sill_height": attrs.get("sill_height"),
+            "head_height": attrs.get("head_height"),
+        })
+    return {"windows": out}
+
+
 @tool(name="catalog_list_lines", tier=1)
 def list_lines(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     """Liste toutes les lignes du projet (modèle 3D + détail view-bound).
