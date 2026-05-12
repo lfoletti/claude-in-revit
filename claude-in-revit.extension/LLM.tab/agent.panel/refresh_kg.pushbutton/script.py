@@ -34,8 +34,22 @@ if _EXT_ROOT not in sys.path:
 from Autodesk.Revit.UI import TaskDialog
 
 
-def _show(title, body):
+def _show_error(title, body):
+    """TaskDialog rapide pour les erreurs critiques au démarrage — pas
+    de dépendance autre que Autodesk.Revit.UI, donc survit même si
+    `lib.*` est cassé."""
     TaskDialog.Show("claude-in-revit — {}".format(title), body)
+
+
+def _show(title, body):
+    """Dialog sélectionnable + copiable au clipboard pour les outputs
+    normaux. Fallback TaskDialog si ui_dialogs n'est pas importable
+    (cas rare : .NET non chargé, etc.)."""
+    try:
+        from lib.ui_dialogs import show_selectable_text
+        show_selectable_text("claude-in-revit — {}".format(title), body)
+    except Exception:  # noqa: BLE001
+        _show_error(title, body)
 
 
 def _main():
@@ -99,29 +113,29 @@ def _main():
     skipped = summary.get("skipped", {})
     skipped_line = ""
     if any(skipped.values()):
-        skipped_line = (
-            "\nSkipped: levels={}, wall_types={}, walls={}, "
-            "model_lines={}, detail_lines={}, "
-            "column_types={}, columns={}"
-        ).format(
-            skipped.get("levels", 0),
-            skipped.get("wall_types", 0),
-            skipped.get("walls", 0),
-            skipped.get("model_lines", 0),
-            skipped.get("detail_lines", 0),
-            skipped.get("column_types", 0),
-            skipped.get("columns", 0),
-        )
+        # Lignes "skipped" listées seulement pour les types qui ont
+        # effectivement skippé — évite un mur de zéros sur les projets
+        # propres.
+        skipped_parts = [
+            "{}={}".format(k, v) for k, v in sorted(skipped.items()) if v
+        ]
+        skipped_line = "\nSkipped: " + ", ".join(skipped_parts)
     _show(
         "Refresh KG",
         "KG resynced for project_id={}.\n\n"
-        "Levels: {}\n"
-        "Wall types: {}\n"
-        "Walls: {}\n"
-        "Model lines: {}\n"
-        "Detail lines: {}\n"
-        "Column types: {}\n"
-        "Columns: {}{}\n\n"
+        "Levels:        {}\n"
+        "Wall types:    {}\n"
+        "Walls:         {}\n"
+        "Model lines:   {}\n"
+        "Detail lines:  {}\n"
+        "Column types:  {}\n"
+        "Columns:       {}\n"
+        "Door types:    {}\n"
+        "Doors:         {}\n"
+        "Window types:  {}\n"
+        "Windows:       {}\n"
+        "Rooms:         {}{}\n\n"
+        "Preserved llm_ids across rescan: {}\n\n"
         "Persisted to:\n{}".format(
             kg.project_id,
             summary["levels"],
@@ -131,7 +145,13 @@ def _main():
             summary["detail_lines"],
             summary["column_types"],
             summary["columns"],
+            summary.get("door_types", 0),
+            summary.get("doors", 0),
+            summary.get("window_types", 0),
+            summary.get("windows", 0),
+            summary.get("rooms", 0),
             skipped_line,
+            summary.get("preserved_llm_ids", 0),
             kg.persist_path,
         ),
     )
@@ -142,7 +162,9 @@ try:
 except BaseException as exc:  # noqa: BLE001 — surface everything to the UI.
     # `BaseException` (not `Exception`) because PythonNet sometimes wraps
     # .NET exceptions in a way that bypasses the Python Exception hierarchy.
-    _show(
+    # Path d'erreur : `_show_error` (TaskDialog brut) au lieu de `_show`
+    # (qui passe par ui_dialogs et pourrait re-péter sur le même import).
+    _show_error(
         "Refresh KG failed",
         "{}: {}\n\n{}".format(type(exc).__name__, exc, traceback.format_exc()),
     )

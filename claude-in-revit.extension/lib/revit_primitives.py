@@ -101,6 +101,43 @@ def internal_to_sqm(area_sf):
 # ----- Collectors --------------------------------------------------------
 
 
+def get_element_or_raise(doc, eid_or_raw, llm_id, kind="element"):
+    """Resolve `eid_or_raw` → live `Element`. Raise `ValueError` if stale.
+
+    `doc.GetElement(ElementId)` retourne `None` silencieusement quand
+    l'ElementId pointe vers un élément supprimé hors-pipeline (user qui
+    delete via l'UI Revit pendant qu'on a un KG cache, ou suppression
+    précédente non synchronisée). Sans ce garde-fou, le crash se traduit
+    en `AttributeError: NoneType` (sur le premier `get_Parameter`),
+    diagnostic LLM imprécis. Ici on remonte un message actionnable
+    qui dit explicitement « run Refresh KG ».
+
+    Args:
+        doc: Revit Document.
+        eid_or_raw: `ElementId` ou `int` brut (Revit-side value).
+        llm_id: llm_id KG de l'élément (pour le message d'erreur).
+        kind: type d'élément pour le message ("window", "wall", …).
+
+    Returns:
+        Le `Element` résolu (non-None garanti).
+    """
+    from Autodesk.Revit.DB import ElementId as _ElementId
+    if isinstance(eid_or_raw, int):
+        eid = _ElementId(eid_or_raw)
+        raw_value = eid_or_raw
+    else:
+        eid = eid_or_raw
+        raw_value = eid.Value
+    element = doc.GetElement(eid)
+    if element is None:
+        raise ValueError(
+            "Revit binding stale for {} {} (ElementId {}): element "
+            "not found in document. Run Refresh KG to purge orphan "
+            "KG nodes, then retry.".format(kind, llm_id, raw_value)
+        )
+    return element
+
+
 def collect_by_category(doc, builtin_category):
     """All non-type elements in a `BuiltInCategory`.
 

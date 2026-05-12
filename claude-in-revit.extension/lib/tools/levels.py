@@ -60,6 +60,47 @@ def _name_collision(kg: ProjectKG, name: str, exclude_id: Optional[str] = None) 
     return False
 
 
+def _find_floor_plan_view_family_type(doc: Any) -> Any:
+    """Renvoie le premier `ViewFamilyType` de famille FloorPlan, ou None.
+
+    Pas de cache : itération O(N) sur les ViewFamilyType (≤ 10 dans un
+    projet typique), négligeable. Appelé une fois par création de Level.
+
+    Côté caller : si None, on ne génère pas de plan d'étage et on
+    remonte un warning au LLM (`floor_plan_created: False, reason:
+    "no FloorPlan ViewFamilyType in this project"`). Cas pathologique
+    — un template Revit standard a toujours au moins un FloorPlan VFT.
+    """
+    from Autodesk.Revit.DB import FilteredElementCollector, ViewFamily, ViewFamilyType
+    for vft in FilteredElementCollector(doc).OfClass(ViewFamilyType):
+        if vft.ViewFamily == ViewFamily.FloorPlan:
+            return vft
+    return None
+
+
+def _create_floor_plan_for_level(doc: Any, level: Any) -> Optional[int]:
+    """Crée un FloorPlan ViewPlan pour `level`. Caller *déjà* dans une
+    `rp.transaction` ouverte.
+
+    Renvoie le `revit_id` du nouveau plan, ou None si aucun
+    ViewFamilyType FloorPlan disponible dans le doc (cas extrême).
+
+    Le ViewPlan n'est PAS bindé au KG en V0 — les vues n'ont pas de
+    schéma node KG (deferred V1 via `catalog_list_views`). C'est un
+    side-effect UX pur, comme `set_llm_id_on_element` sur les autres
+    objets.
+    """
+    from Autodesk.Revit.DB import ViewPlan
+    vft = _find_floor_plan_view_family_type(doc)
+    if vft is None:
+        return None
+    view = ViewPlan.Create(doc, vft.Id, level.Id)
+    # Le nom auto-généré par Revit reflète déjà le Level (cf. template
+    # Revit standard). On laisse Revit nommer pour rester cohérent
+    # avec l'UX du ruban.
+    return int(view.Id.Value)
+
+
 # ----- Tools -------------------------------------------------------------
 
 
@@ -69,26 +110,41 @@ def create(
     doc: Any,
     name: str,
     elevation_m: float,
+    create_floor_plan: bool = True,
 ) -> Dict[str, Any]:
-    """Crée un nouveau niveau à l'altitude donnée.
+    """Crée un nouveau niveau à l'altitude donnée, et **par défaut un
+    plan d'étage (FloorPlan)** associé.
 
-    Le niveau n'a pas de vue associée à sa création — Revit ne fabrique
-    pas automatiquement de plan d'étage. L'utilisateur peut le faire
-    depuis l'onglet Vue / Plan d'étage dans Revit si nécessaire.
+    Pourquoi le flag : `Level.Create(doc, elev)` côté API Revit crée
+    seulement le Level, *pas* la vue Plan d'étage (contrairement à l'UI
+    ruban). Sans `create_floor_plan=True`, le nouveau niveau apparaît
+    en élévation et en arborescence Vue, mais pas dans la liste des
+    Plans d'étage. C'était le bug runtime UX du 2026-05-12. Le défaut
+    True restitue le comportement attendu de l'UI Revit.
 
-    Concepts: niveau, level, étage, étages, plan, élévation, création
+    Concepts: niveau, level, étage, étages, plan d'étage, élévation,
+              création, FloorPlan, vue
     Phrases: "ajoute un niveau", "crée un étage", "create a level",
              "nouveau niveau à X m"
-    Similar: levels_set_elevation, levels_set_name, catalog_list_levels
+    Similar: levels_create_floor_plan, levels_set_elevation,
+             levels_set_name, catalog_list_levels
 
     Args:
         name: nom du niveau (ex: "N01", "Étage 1", "Toiture"). Unique
             dans le projet — Revit refuse les doublons.
         elevation_m: altitude en mètres (origine = niveau 0 du projet).
+        create_floor_plan: si True (défaut), crée aussi un `ViewPlan`
+            FloorPlan associé. Si False, seul le Level est créé (cas
+            rare : niveaux structurels ou bornes sans vue plan).
 
     Returns:
         {"ok": bool, "llm_id": str, "revit_id": int | None,
-         "name": str, "elevation_m": float}
+         "name": str, "elevation_m": float,
+         "floor_plan_created": bool, "floor_plan_revit_id": int | None,
+         "floor_plan_note": str | None}
+        `floor_plan_note` est posé si la création du plan a été
+        sautée (template Revit sans ViewFamilyType FloorPlan, cas
+        exotique) — le LLM peut alerter l'utilisateur.
     """
     if not isinstance(name, str) or not name.strip():
         raise ValueError("name must be a non-empty string")
@@ -107,6 +163,9 @@ def create(
             "revit_id": None,
             "name": new_name,
             "elevation_m": round(elev, 3),
+            "floor_plan_created": False,
+            "floor_plan_revit_id": None,
+            "floor_plan_note": None,
         }
 
     from .. import kg_sync, revit_primitives as rp
@@ -116,6 +175,8 @@ def create(
 
     revit_id: Optional[int] = None
     llm_id_out: Optional[str] = None
+    floor_plan_revit_id: Optional[int] = None
+    floor_plan_note: Optional[str] = None
 
     with rp.transaction(doc, "levels.create"):
         # Static factory: `Level.Create(doc, elevation_ft)` returns the
@@ -123,17 +184,24 @@ def create(
         # rename afterward via the writable `Name` property.
         level = Level.Create(doc, elev_ft)
         revit_id = int(level.Id.Value)
-        # Revit auto-names ("Level 3", "Niveau 3" depending on locale) —
-        # rename to the requested string. Direct property assignment is
-        # the documented path; collisions raise InvalidOperationException
-        # which propagates out (already pre-checked via _name_collision
-        # so this should not fire under normal flow).
         level.Name = new_name
 
         llm_id_out = _record_in_kg(kg, name=new_name, elevation=elev)
         kg.set_revit_id(llm_id_out, revit_id)
         stamp_llm_id(level, llm_id_out)
         kg_sync.refresh_node_from_revit(kg, doc, llm_id_out)
+
+        # Création du FloorPlan dans la même Tx Revit (rollback symétrique
+        # si la suite échoue). Side-effect UX, pas bindé au KG (vues =
+        # V1, cf. dette catalog_list_views).
+        if create_floor_plan:
+            floor_plan_revit_id = _create_floor_plan_for_level(doc, level)
+            if floor_plan_revit_id is None:
+                floor_plan_note = (
+                    "Aucun ViewFamilyType FloorPlan trouvé dans le template "
+                    "Revit — le plan d'étage n'a pas été créé. Tu peux le "
+                    "générer manuellement via Vue → Plan d'étage."
+                )
 
     refreshed = kg.get_node(llm_id_out)
     return {
@@ -142,6 +210,77 @@ def create(
         "revit_id": revit_id,
         "name": refreshed.get("name", new_name),
         "elevation_m": round(float(refreshed.get("elevation", elev)), 3),
+        "floor_plan_created": floor_plan_revit_id is not None,
+        "floor_plan_revit_id": floor_plan_revit_id,
+        "floor_plan_note": floor_plan_note,
+    }
+
+
+@tool(name="levels_create_floor_plan", tier=1)
+def create_floor_plan(
+    kg: ProjectKG,
+    doc: Any,
+    llm_id: str,
+) -> Dict[str, Any]:
+    """Crée un plan d'étage (FloorPlan ViewPlan) pour un niveau existant.
+
+    Utile pour réparer un niveau créé sans plan (ex : niveau venant d'un
+    `levels_create` avec `create_floor_plan=False`, ou niveau pré-existant
+    importé qui n'a pas son plan). Idempotent côté API Revit : appeler
+    deux fois génère deux vues (Revit n'a pas de "FindOrCreate"
+    natif). Caller responsable d'éviter les doublons s'il itère.
+
+    Concepts: niveau, plan d'étage, vue, FloorPlan, ViewPlan, création
+    Phrases: "ajoute un plan d'étage pour ce niveau", "crée la vue
+             plan", "fais apparaître le plan d'étage", "create floor
+             plan view"
+    Similar: levels_create, catalog_list_levels
+
+    Args:
+        llm_id: llm_id d'un Level vivant.
+
+    Returns:
+        {"ok": bool, "llm_id": str, "floor_plan_revit_id": int | None,
+         "note": str | None}
+    """
+    _require_live_level(kg, llm_id)
+
+    if doc is None:
+        # Pas de Revit en main — opération no-op KG (les vues ne sont
+        # pas modélisées dans le KG en V0). Retour cohérent avec doc-aware.
+        return {
+            "ok": True,
+            "llm_id": llm_id,
+            "floor_plan_revit_id": None,
+            "note": "doc is None — no Revit view created (KG-only path).",
+        }
+
+    eid_raw = kg.get_revit_id(llm_id)
+    if eid_raw is None:
+        raise ValueError(
+            "Level {} has no Revit binding — run Refresh KG.".format(llm_id)
+        )
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    eid = ElementId(eid_raw)
+    floor_plan_revit_id: Optional[int] = None
+    note: Optional[str] = None
+    with rp.transaction(doc, "levels.create_floor_plan"):
+        level = doc.GetElement(eid)
+        floor_plan_revit_id = _create_floor_plan_for_level(doc, level)
+        if floor_plan_revit_id is None:
+            note = (
+                "Aucun ViewFamilyType FloorPlan trouvé dans le template "
+                "Revit. Le plan n'a pas été créé."
+            )
+
+    return {
+        "ok": True,
+        "llm_id": llm_id,
+        "floor_plan_revit_id": floor_plan_revit_id,
+        "note": note,
     }
 
 

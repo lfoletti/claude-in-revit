@@ -161,6 +161,7 @@ def _create_opening_revit_path(
     """
     host_eid_raw = kg.get_revit_id(host_wall_ref)
     type_eid_raw = kg.get_revit_id(family_type_ref)
+    level_eid_raw = kg.get_revit_id(level_ref)
     if host_eid_raw is None:
         raise ValueError(
             "Host wall {} has no Revit binding — run Refresh KG.".format(host_wall_ref)
@@ -168,6 +169,10 @@ def _create_opening_revit_path(
     if type_eid_raw is None:
         raise ValueError(
             "FamilyType {} has no Revit binding — run Refresh KG.".format(family_type_ref)
+        )
+    if level_eid_raw is None:
+        raise ValueError(
+            "Level {} has no Revit binding — run Refresh KG.".format(level_ref)
         )
     level_node = kg.get_node(level_ref)
     level_elev_m = float(level_node.get("elevation", 0.0))
@@ -178,6 +183,7 @@ def _create_opening_revit_path(
 
     host_eid = ElementId(host_eid_raw)
     type_eid = ElementId(type_eid_raw)
+    level_eid = ElementId(level_eid_raw)
 
     revit_id: Optional[int] = None
     sill_height_out = 0.0
@@ -187,6 +193,7 @@ def _create_opening_revit_path(
     with rp.transaction(doc, tx_name):
         host = doc.GetElement(host_eid)
         symbol = doc.GetElement(type_eid)
+        level_elem = doc.GetElement(level_eid)
         # FamilySymbols must be active before placement (§Phase 2 of
         # REVIT_API_NOTES). Batch-style activate to avoid one regen per
         # bulk creation later — here the cost is negligible solo too.
@@ -194,15 +201,29 @@ def _create_opening_revit_path(
             symbol.Activate()
             doc.Regenerate()
 
-        # World XYZ — z = host level elevation; Revit handles the rest
-        # (projects to host wall's location curve + applies sill height).
+        # XYZ pour openings hostées avec overload 5-args
+        # `NewFamilyInstance(XYZ, FamilySymbol, host, Level, StructuralType)` :
+        # - x, y en mètres dans le plan du level
+        # - **z = level_elev_m** en *coordonnées monde*. Revit calcule
+        #   sill = XYZ.Z − Level.Elevation, puis on impose la sill voulue
+        #   via `INSTANCE_SILL_HEIGHT_PARAM.Set` plus bas.
+        # Le piège du 2026-05-12 (testé en runtime sur SS01=-3m) :
+        # - si on passait z=0 avec Level=SS01, sill calculée = 0−(−3)=3m,
+        #   au-dessus du top du mur → erreur Revit « ne coupent rien »
+        #   et fenêtre invisible (suspendue hors mur).
+        # - sur Niveau 1 (elev=0), z=0 et z=level_elev=0 coïncident, donc
+        #   le bug ne se manifestait pas sur ce level — d'où la confusion.
         x_ft = rp.meters_to_internal(position[0])
         y_ft = rp.meters_to_internal(position[1])
         z_ft = rp.meters_to_internal(level_elev_m)
         point = XYZ(x_ft, y_ft, z_ft)
 
+        # 5-args overload pour binder explicitement le Reference Level
+        # de la fenêtre au level du host_wall. Sans Level explicite,
+        # Revit choisit le 1er Level du projet (Niveau 1 typiquement)
+        # comme reference, ce qui décale la fenêtre d'un étage.
         instance = doc.Create.NewFamilyInstance(
-            point, symbol, host, StructuralType.NonStructural,
+            point, symbol, host, level_elem, StructuralType.NonStructural,
         )
         revit_id = int(instance.Id.Value)
 
@@ -506,24 +527,39 @@ def create_many(
         for spec in specs:
             host_eid_raw = kg.get_revit_id(spec["host_wall_ref"])
             type_eid_raw = kg.get_revit_id(spec["family_type_ref"])
+            level_eid_raw = kg.get_revit_id(spec["level_ref"])
             if host_eid_raw is None:
                 raise ValueError(
                     "Host wall {} has no Revit binding".format(spec["host_wall_ref"])
                 )
+            if level_eid_raw is None:
+                raise ValueError(
+                    "Level {} has no Revit binding".format(spec["level_ref"])
+                )
             host_eid = ElementId(host_eid_raw)
             type_eid = ElementId(type_eid_raw)
+            level_eid = ElementId(level_eid_raw)
             host = doc.GetElement(host_eid)
             symbol = doc.GetElement(type_eid)
+            level_elem = doc.GetElement(level_eid)
 
             level_node = kg.get_node(spec["level_ref"])
             level_elev_m = float(level_node.get("elevation", 0.0))
+
+            # XYZ.Z = level_elev_m (monde). Voir note `_create_opening_revit_path` :
+            # avec l'overload 5-args, le Z monde + Level explicite
+            # produisent la position correcte ; z=0 est faux sur les
+            # levels d'élévation non-nulle (testé sur SS01=-3m, 2026-05-12).
             point = XYZ(
                 rp.meters_to_internal(spec["position"][0]),
                 rp.meters_to_internal(spec["position"][1]),
                 rp.meters_to_internal(level_elev_m),
             )
+            # 5-args overload pour binder explicitement le Reference Level
+            # de la fenêtre au level du host_wall. Sans Level explicite,
+            # Revit choisit le 1er Level du projet (Niveau 1 typique).
             instance = doc.Create.NewFamilyInstance(
-                point, symbol, host, StructuralType.NonStructural,
+                point, symbol, host, level_elem, StructuralType.NonStructural,
             )
             revit_id = int(instance.Id.Value)
 
@@ -732,10 +768,13 @@ def _swap_to_type_internal(
     from .. import revit_primitives as rp
     from Autodesk.Revit.DB import BuiltInParameter, ElementId
 
-    inst_eid = ElementId(kg.get_revit_id(llm_id))
-    new_type_eid = ElementId(kg.get_revit_id(new_family_type_ref))
-    instance = doc.GetElement(inst_eid)
-    new_symbol = doc.GetElement(new_type_eid)
+    instance = rp.get_element_or_raise(
+        doc, kg.get_revit_id(llm_id), llm_id, kind=node.get("_type", "opening"),
+    )
+    new_symbol = rp.get_element_or_raise(
+        doc, kg.get_revit_id(new_family_type_ref), new_family_type_ref,
+        kind="FamilyType",
+    )
     if not new_symbol.IsActive:
         new_symbol.Activate()
         doc.Regenerate()
@@ -995,16 +1034,14 @@ def set_sill_height(
     decouple_info: Dict[str, Any] = {
         "decoupled": False, "new_type_ref": None, "auto_variant_created": False,
     }
-    if preserve_head:
-        decouple_info = _maybe_decouple(kg, doc, llm_id, new_sill_m=sill_value)
-        # Re-load node attrs after potential swap (sill/head may have
-        # shifted post-swap toward the family's new opening_height ;
-        # the explicit Set below realigns sill exactly).
-        node = kg.get_node(llm_id)
 
     if doc is None:
-        # Hors-Revit : pas de recompute familial, le KG trust la valeur
-        # demandée. Drift toujours False.
+        # KG-only : `_maybe_decouple` ici aussi (le helper a un path
+        # KG-only via `_create_type_variant_internal` doc=None). Pas
+        # besoin de Tx Revit côté KG.
+        if preserve_head:
+            decouple_info = _maybe_decouple(kg, doc, llm_id, new_sill_m=sill_value)
+            node = kg.get_node(llm_id)
         kg.modify_node(llm_id, {"sill_height": sill_value})
         return {
             "ok": True,
@@ -1033,7 +1070,26 @@ def set_sill_height(
     actual_sill_m: Optional[float] = None
     actual_head_m: Optional[float] = None
     with rp.transaction(doc, "openings.set_sill_height"):
-        element = doc.GetElement(eid)
+        # IMPORTANT : `_maybe_decouple` doit être DANS la Tx Revit
+        # parce qu'il duplique le FamilySymbol et swap l'instance. Hors-Tx,
+        # les mutations Revit retournent silencieusement None → cascade
+        # `AttributeError: NoneType`. Bug runtime 2026-05-12 (post auto-
+        # découple session c) — caught par les tests unitaires KG-only
+        # qui ne nécessitent pas de Tx.
+        if preserve_head:
+            decouple_info = _maybe_decouple(kg, doc, llm_id, new_sill_m=sill_value)
+            # Re-load node attrs après swap potentiel (sill/head ont pu
+            # bouger pendant le swap ; le Set explicite ci-dessous réaligne
+            # sill exactement à la valeur demandée).
+            node = kg.get_node(llm_id)
+            # Re-bind eid si le swap a affecté l'instance (en théorie pas,
+            # `instance.Symbol = ...` préserve l'ElementId, mais on est défensif).
+            eid_raw_after = kg.get_revit_id(llm_id)
+            if eid_raw_after is not None and eid_raw_after != eid_raw:
+                eid = ElementId(eid_raw_after)
+        element = rp.get_element_or_raise(
+            doc, eid, llm_id, kind=node.get("_type", "opening"),
+        )
         param = element.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
         if param is None or param.IsReadOnly:
             raise ValueError(
@@ -1138,11 +1194,12 @@ def set_head_height(
     decouple_info: Dict[str, Any] = {
         "decoupled": False, "new_type_ref": None, "auto_variant_created": False,
     }
-    if preserve_sill:
-        decouple_info = _maybe_decouple(kg, doc, llm_id, new_head_m=head_value)
-        node = kg.get_node(llm_id)
 
     if doc is None:
+        # KG-only : `_maybe_decouple` ici (path KG du helper).
+        if preserve_sill:
+            decouple_info = _maybe_decouple(kg, doc, llm_id, new_head_m=head_value)
+            node = kg.get_node(llm_id)
         kg.modify_node(llm_id, {"head_height": head_value})
         return {
             "ok": True,
@@ -1171,7 +1228,16 @@ def set_head_height(
     actual_sill_m: Optional[float] = None
     actual_head_m: Optional[float] = None
     with rp.transaction(doc, "openings.set_head_height"):
-        element = doc.GetElement(eid)
+        # `_maybe_decouple` DANS la Tx Revit — cf. note dans set_sill_height.
+        if preserve_sill:
+            decouple_info = _maybe_decouple(kg, doc, llm_id, new_head_m=head_value)
+            node = kg.get_node(llm_id)
+            eid_raw_after = kg.get_revit_id(llm_id)
+            if eid_raw_after is not None and eid_raw_after != eid_raw:
+                eid = ElementId(eid_raw_after)
+        element = rp.get_element_or_raise(
+            doc, eid, llm_id, kind=node.get("_type", "opening"),
+        )
         param = element.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
         if param is None or param.IsReadOnly:
             raise ValueError(
@@ -1644,15 +1710,16 @@ def set_sill_height_many(
 
     decoupled_count = 0
     auto_variants_created = 0
-    if preserve_head:
-        for spec in specs:
-            info = _maybe_decouple(kg, doc, spec["llm_id"], new_sill_m=spec["sill_height_m"])
-            if info["decoupled"]:
-                decoupled_count += 1
-                if info["auto_variant_created"]:
-                    auto_variants_created += 1
 
     if doc is None:
+        # KG-only : _maybe_decouple en path KG (pas de Tx Revit nécessaire).
+        if preserve_head:
+            for spec in specs:
+                info = _maybe_decouple(kg, doc, spec["llm_id"], new_sill_m=spec["sill_height_m"])
+                if info["decoupled"]:
+                    decoupled_count += 1
+                    if info["auto_variant_created"]:
+                        auto_variants_created += 1
         for spec in specs:
             kg.modify_node(spec["llm_id"], {"sill_height": spec["sill_height_m"]})
         out = bulk_setter_summary([], count=len(specs), revit_modified=False)
@@ -1673,9 +1740,19 @@ def set_sill_height_many(
 
     drifts: List[Dict[str, Any]] = []
     with rp.transaction(doc, "openings.set_sill_height_many"):
+        # `_maybe_decouple` par item DANS la Tx Revit (cf. note solo).
+        if preserve_head:
+            for spec in specs:
+                info = _maybe_decouple(kg, doc, spec["llm_id"], new_sill_m=spec["sill_height_m"])
+                if info["decoupled"]:
+                    decoupled_count += 1
+                    if info["auto_variant_created"]:
+                        auto_variants_created += 1
         for spec in specs:
-            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
-            element = doc.GetElement(eid)
+            element = rp.get_element_or_raise(
+                doc, kg.get_revit_id(spec["llm_id"]), spec["llm_id"],
+                kind="opening",
+            )
             param = element.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
             if param is None or param.IsReadOnly:
                 raise ValueError(
@@ -1750,15 +1827,15 @@ def set_head_height_many(
 
     decoupled_count = 0
     auto_variants_created = 0
-    if preserve_sill:
-        for spec in specs:
-            info = _maybe_decouple(kg, doc, spec["llm_id"], new_head_m=spec["head_height_m"])
-            if info["decoupled"]:
-                decoupled_count += 1
-                if info["auto_variant_created"]:
-                    auto_variants_created += 1
 
     if doc is None:
+        if preserve_sill:
+            for spec in specs:
+                info = _maybe_decouple(kg, doc, spec["llm_id"], new_head_m=spec["head_height_m"])
+                if info["decoupled"]:
+                    decoupled_count += 1
+                    if info["auto_variant_created"]:
+                        auto_variants_created += 1
         for spec in specs:
             kg.modify_node(spec["llm_id"], {"head_height": spec["head_height_m"]})
         out = bulk_setter_summary([], count=len(specs), revit_modified=False)
@@ -1779,9 +1856,18 @@ def set_head_height_many(
 
     drifts: List[Dict[str, Any]] = []
     with rp.transaction(doc, "openings.set_head_height_many"):
+        if preserve_sill:
+            for spec in specs:
+                info = _maybe_decouple(kg, doc, spec["llm_id"], new_head_m=spec["head_height_m"])
+                if info["decoupled"]:
+                    decoupled_count += 1
+                    if info["auto_variant_created"]:
+                        auto_variants_created += 1
         for spec in specs:
-            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
-            element = doc.GetElement(eid)
+            element = rp.get_element_or_raise(
+                doc, kg.get_revit_id(spec["llm_id"]), spec["llm_id"],
+                kind="opening",
+            )
             param = element.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
             if param is None or param.IsReadOnly:
                 raise ValueError(

@@ -14,6 +14,212 @@
 
 ---
 
+## 2026-05-12 (session f) — UC1 DWG/DXF ingest : reader + classifier + tools (V0 Sem.4-5)
+
+### Contexte & objectif
+
+§9 V0 Sem.4-5 : dernier morceau, UC1 = ingest DWG/DXF avec `dwg_reader.py`
++ `dwg_classifier.py` + tools `dwg_import_*`. Pose la mécanique
+préprocesseur → wall segments → `walls_create_many` qui sera réutilisée
+pour UC6 raster (cf. note d'intention plan d'après image).
+
+Cadrage utilisateur en début de session (3 questions structurantes
+posées) :
+- Formats : **DXF + DWG via ODA File Converter** (utilitaire externe gratuit).
+- Détection murs : **paires de lignes parallèles + centerline** (pas
+  paire = orphelin rejeté).
+- Layer mapping : **heuristique nom + override LLM/user** (pas
+  explicite-only ni persistence).
+
+### Décisions
+
+1. **`ezdxf` 1.4.3** ajouté à `pyproject.toml` + installé en venv.
+   Pure-Python. Le pyRevit embarqué nécessitera un `pip install ezdxf`
+   au déploiement (procédure CLAUDE.md déjà documentée).
+
+2. **`config.oda_converter_path()`** : résolution 3 sources (fichier
+   `~/.config/claude-in-revit/oda_converter_path.txt` → env var
+   `ODA_FILE_CONVERTER` → glob sur paths standard Windows
+   `C:\Program Files\ODA\ODAFileConverter*\`). Retourne `None` si rien
+   trouvé. **Pas d'exception au démarrage** — seul un `.dwg`
+   effectivement présenté déclenche `ConfigError` actionnable (workflow
+   DXF-only ne doit pas exiger ODA installé).
+
+3. **Conversion d'unités à la lecture** via `$INSUNITS` du DXF. Table
+   explicite `_DXF_UNIT_TO_METERS` (0..10 = unitless, inch, feet,
+   miles, mm, cm, m, km, etc.). `scale_override` exposé pour les
+   fichiers unitless ou mal annotés. Le KG et tout le pipeline en
+   aval travaillent toujours en mètres.
+
+4. **`DwgEntity` dataclass agnostique** du backend — `kind`, `layer`,
+   `coords` (liste de points 3D en mètres), `attrs`. V0 supporte
+   LINE / LWPOLYLINE / POLYLINE / ARC / CIRCLE / INSERT / TEXT / MTEXT.
+   SPLINE, HATCH, DIMENSION, IMAGE → `_SkipEntity` silencieux (V1+).
+   LWPolyline `bulge` ignoré (segments droits uniquement).
+
+5. **Heuristique layer name** : 17 patterns regex multi-langue FR + EN
+   + AIA. Mappe noms vers `"wall" | "door" | "window" | "text" | "ignore"`.
+   Normalisation `_/-` → espace avant matching, parce que `\b` Python
+   considère `_` comme word char (gotcha rencontré au test) — donc
+   `\bMURS\b` aurait raté `MURS_PORTEUR` sans normalisation.
+   Ê/É/È/Ë acceptés pour `FENÊTRE`.
+
+6. **Pair detection algorithme** :
+   - O(N²) sur segments d'un layer wall. Acceptable jusqu'à ~quelques
+     milliers de lignes (les plans archi typiques sont < 1000).
+   - Conditions pour qu'une paire `(i, j)` forme un mur :
+     - même layer ;
+     - angles parallèles mod π à `angle_tol_rad` (défaut 2°) ;
+     - distance perpendiculaire dans `[0.05, 0.50] m` ;
+     - overlap projeté ≥ 50% du segment court.
+   - Synthèse : centerline = milieux appariés (gestion du cas
+     dessin en sens inverse via projection ordering), thickness =
+     distance perpendiculaire, confidence = overlap ratio.
+   - Lignes orphelines → `rejected` avec raison explicite.
+
+7. **3 tools tier-2** (chargés via routing keyword `dwg` / `dxf` /
+   `importe` / `plan d'archi`) :
+   - `dwg_inspect(file_path)` : preview layers + `suggested_role`.
+   - `dwg_classify(file_path, layer_mapping)` : preview walls détectés.
+   - `dwg_import_walls(file_path, level_ref, wall_type_ref,
+     layer_mapping, dx_m, dy_m, height_m, ...)` : orchestre classify
+     + dispatch direct vers `walls_create_many` (sans nested
+     transaction, même pattern que `bulk_apply_to_filter` session e).
+
+8. **`max_walls` garde-fou** (défaut 500) — refus du batch si la
+   classification produit plus de N candidats. Évite l'import
+   accidentel d'un layer sur-segmenté qui créerait des milliers de
+   murs parasites.
+
+9. **Type unique en V0 phase 1** : tous les murs créés avec le même
+   `wall_type_ref`. Phase 2 : mapper `thickness_m` → `wall_type_ref`
+   compatible (lookup dans le catalog des WallTypes par épaisseur).
+
+### Phase 1 — `config.py` extension
+
+- Ajout `oda_converter_path() -> Optional[Path]` (file → env → glob).
+- Constantes `ODA_PATH_FILENAME`, `ODA_ENV_VAR`, `_ODA_DEFAULT_GLOBS`.
+- Renvoie `None` plutôt que de lever — `dwg_reader` lève
+  `ConfigError` actionnable seulement quand un `.dwg` est rencontré.
+
+### Phase 2 — `lib/dwg_reader.py`
+
+- `DwgEntity` dataclass.
+- `parse(file_path, scale_override=None) -> (entities, meta)`.
+- `_dwg_to_dxf_via_oda(dwg_path) -> Path` : shell-out subprocess vers
+  ODA Converter CLI, écrit dans temp dir, retourne le DXF généré.
+  Timeout 120s, vérifie présence du DXF en sortie (ODA Converter ne
+  renvoie pas toujours un return code propre).
+- `_convert_entity(entity, factor)` : dispatch par `dxftype()`.
+  `_SkipEntity` pour les types non supportés.
+- `entities_by_layer(...)` helper.
+
+### Phase 3 — `lib/dwg_classifier.py`
+
+- `_LAYER_ROLE_PATTERNS` : 17 regex + rôles, multi-langue.
+- `suggest_layer_role(layer_name)` : normalisation + match.
+- `annotate_layers(meta["layers"])` : mutate-in-place.
+- `Segment` dataclass, `extract_straight_segments(entities, ...)`.
+- `WallCandidate` dataclass.
+- `detect_wall_segments(segments, ...)` : O(N²) avec early-exit sur
+  used. Renvoie `(walls, rejected)`.
+- `Classification` dataclass.
+- `classify(entities, layer_mapping, ...)` : entrée publique.
+
+### Phase 4 — `lib/tools/dwg_import.py` (3 tools tier-2)
+
+- `dwg_inspect` : preview layers + suggested_role.
+- `dwg_classify` : preview walls (KG / Revit read-only).
+- `dwg_import_walls` : commit avec dispatch direct vers
+  `walls_create_many` (registry lookup, `entry.fn(kg, doc, items)`).
+
+### Phase 5 — Fixtures DXF synthétiques + tests (+41)
+
+`tests/test_dwg.py` :
+
+- **Génération DXF programmatique** via `ezdxf` au temps d'exécution.
+  Pas de binaires DXF versionnés. Helper `_make_rectangle_room_dxf`
+  produit une pièce 5×4m avec 4 murs orthogonaux d'épaisseur 0.20m
+  (8 lignes paires) + optionnellement extras (orphelin sur WALL, ligne
+  FURNITURE à ignorer).
+- **Reader** (4 tests) : parsing simple, conversion mm → m,
+  `scale_override` cumulé, `ConfigError` actionnable sur .dwg sans ODA.
+- **`suggest_layer_role`** paramétrique (21 cas) : EN, FR, AIA, casse,
+  Ê/É, MOBILIER/FURNITURE/HATCH ignorés, layer `"0"` et noms
+  arbitraires → None.
+- **`annotate_layers`** : mutation in-place + chaînage.
+- **Pair detection** (6 tests) : pair orthogonale, refus trop loin,
+  refus non-parallèle, refus no-overlap, dessin sens inverse, refus
+  layers différents, pièce complète 4 walls.
+- **`classify`** (2 tests) : mapping → walls, layers non-mappés
+  silencieux (orphelins WALL signalés).
+- **Tools** (6 tests) : inspect (layer summary + suggested_role),
+  classify (preview), import_walls (création KG), translation dx/dy,
+  garde-fou max_walls, mapping ignore = no-op.
+
+### Bugs rencontrés + fix
+
+1. **`\bMURS_PORTEUR` ne matche pas `\bMURS\b`.** Cause racine : `_`
+   est `\w` en Python regex, donc pas de word boundary après "MURS".
+   **Fix** : normaliser `_/-` → espace dans `suggest_layer_role`.
+2. **`FENÊTRES` (Ê circonflexe) ne matche pas `[EÉ]`.** Cause racine :
+   character class limité. **Fix** : `[EÉÈÊË]`.
+3. **`A-WIND-FRAME` ne matche pas `\bA[-_]?WIND\b` après
+   normalisation.** Cause racine : après normalisation `-/_ → espace`,
+   le pattern `[-_]?` devient inutile mais la condition d'adjacence
+   immédiate de A et WIND est rompue. **Fix** : patterns AIA-style
+   utilisent `A ?` (espace optionnel) au lieu de `A[-_]?`.
+
+### Validation
+
+- `pytest -q` (suite complète) : **330 verts en 11.52s** (289 → +41).
+- 41 nouveaux tests, dont 21 paramétriques sur `suggest_layer_role`.
+- Aucune régression sur les 289 tests existants.
+
+### État final & reste à faire
+
+**Acquis session f (UC1 V0 phase 1)** :
+- `config.oda_converter_path()` ✓
+- `lib/dwg_reader.py` : parsing DXF + DWG-via-ODA, 8 kinds entités,
+  conversion `$INSUNITS` ✓
+- `lib/dwg_classifier.py` : heuristique 17 patterns multi-langue,
+  pair detection O(N²) + reject reasons ✓
+- 3 tools tier-2 : `dwg_inspect`, `dwg_classify`, `dwg_import_walls` ✓
+- 41 tests, **330 verts** ✓
+- `ezdxf>=1.3` dans `pyproject.toml` ✓
+- §9 V0 Sem.4-5 (UC1+UC7) **bouclé**.
+
+**Dettes ouvertes (héritage)** :
+- DWG support testé runtime (nécessite ODA installé sur poste de dev) —
+  pas de CI machine avec ODA disponible. Validation manuelle au
+  prochain run terrain.
+- Drift utilisateur hors pipeline (`DocumentChanged`).
+- `boundary_walls` Rooms V1 compliance.
+- `connects_at` peuplé au rescan.
+- `catalog_list_views`.
+
+**Phases UC1 ultérieures** (V0 → V1) :
+- **Phase 2** : openings (portes = arcs sur layer DOOR, fenêtres =
+  double-trait sur layer WINDOW). Réutilise `_maybe_decouple` session
+  c pour les fenêtres dont le head/sill diverge.
+- **Phase 3** : map `thickness_m` → `wall_type_ref` compatible (lookup
+  WallType par épaisseur dans le catalog).
+- **Phase 4** : import polylines fermées comme room boundaries (préreq
+  `Room.boundary_walls`).
+- **Phase 5** : INSERT blocks → familles Revit (porte, fenêtre,
+  mobilier). Sophistiqué — mapping block_name → FamilyType.
+
+**Suite immédiate (V0 → V1 ou V0.5)** :
+- Validation runtime Revit cumulée (rooms+levels session a,
+  setters_many b, auto-découple c, purge d, bulk e, DWG f) — idéalement
+  sur un projet concret pour mesurer les gains.
+- Préreqs auto-cotation (`connects_at` + `boundary_walls` +
+  `catalog_list_views`) — débloquant multiple notes d'intention.
+- V1 compliance UC8 — le KG projet est maintenant solide, le moment
+  est bon pour attaquer le modèle compliance.
+
+---
+
 ## 2026-05-12 (session e) — `tools/bulk.py` : filter-based dispatch (UC7 V0 Sem.4-5)
 
 ### Contexte & objectif

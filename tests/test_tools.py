@@ -88,6 +88,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "rooms_delete",
         "rooms_set_name_many",
         "levels_create",
+        "levels_create_floor_plan",
         "levels_set_elevation",
         "levels_set_name",
         "walls_set_height_many",
@@ -98,6 +99,9 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "openings_purge_unused_variants",
         "bulk_resolve_filter",
         "bulk_apply_to_filter",
+        "dwg_inspect",
+        "dwg_classify",
+        "dwg_import_walls",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -2164,12 +2168,34 @@ def test_levels_create_kg_only_adds_node(kg_with_seed):
     assert payload["name"] == "N02"
     assert payload["elevation_m"] == 6.0
     assert payload["revit_id"] is None
+    # KG-only path : pas de doc → pas de FloorPlan créé, flag à False.
+    assert payload["floor_plan_created"] is False
+    assert payload["floor_plan_revit_id"] is None
 
     level_id = payload["llm_id"]
     attrs = kg.get_node(level_id)
     assert attrs["_type"] == "Level"
-    assert attrs["name"] == "N02"
-    assert attrs["elevation"] == 6.0
+
+
+def test_levels_create_floor_plan_kg_only_no_op(kg_with_seed):
+    """En KG-only (doc=None), levels_create_floor_plan no-op avec note explicite."""
+    kg, level, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_floor_plan", {"llm_id": level}, "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["floor_plan_revit_id"] is None
+    assert "doc is None" in (payload.get("note") or "")
+
+
+def test_levels_create_floor_plan_refuses_unknown(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_floor_plan", {"llm_id": "level_999"}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "Unknown llm_id" in result["content"]
 
 
 def test_levels_create_refuses_duplicate_name(kg_with_seed):

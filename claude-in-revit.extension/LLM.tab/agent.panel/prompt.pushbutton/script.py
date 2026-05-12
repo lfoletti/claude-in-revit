@@ -59,8 +59,20 @@ from System.Windows.Forms import (
 )
 
 
-def _show(title, body):
+def _show_error(title, body):
+    """TaskDialog brut pour les chemins d'erreur — pas de dépendance
+    autre que Autodesk.Revit.UI, donc survit même si `lib.*` casse."""
     TaskDialog.Show("claude-in-revit — {}".format(title), body)
+
+
+def _show(title, body):
+    """Dialog sélectionnable + bouton "Copier" pour les outputs normaux.
+    Fallback TaskDialog si `lib.ui_dialogs` n'est pas importable."""
+    try:
+        from lib.ui_dialogs import show_selectable_text
+        show_selectable_text("claude-in-revit — {}".format(title), body)
+    except Exception:  # noqa: BLE001
+        _show_error(title, body)
 
 
 _MAX_ATTACHMENT_BYTES = 1 * 1024 * 1024  # mirror lib.llm_api.MAX_ATTACHMENT_BYTES.
@@ -274,6 +286,24 @@ _STATIC_SYSTEM_PROMPT = (
     "  refs entre tools.\n"
     "- Avant de créer des murs, appelle `catalog_list_levels` et "
     "  `catalog_list_wall_types` pour découvrir les références.\n"
+    "- **Résolution des noms de niveaux** : quand l'utilisateur cite un "
+    "  niveau par son nom (« SS01 », « Niveau 1 », « rez », « toiture »), "
+    "  **TOUJOURS** appeler `catalog_list_levels` *au début du tour* pour "
+    "  mapper nom → llm_id, **avant** d'agir. Ne jamais deviner un llm_id "
+    "  de niveau depuis l'historique conversationnel : ces refs peuvent "
+    "  avoir changé entre tours (rescan, soft-delete, etc.). Si plusieurs "
+    "  niveaux ont des noms ambigus pour le contexte, demande à "
+    "  l'utilisateur de préciser plutôt que choisir au hasard.\n"
+    "- **Flags `preserve_*` des setters d'openings (`preserve_sill`, "
+    "  `preserve_head`)** : NE LES PASSE JAMAIS. Le défaut `True` est "
+    "  la SEULE valeur correcte pour 99% des cas (auto-découple sill↔head "
+    "  via création de variant). Tu ne dois passer `preserve_*=False` "
+    "  que si l'utilisateur **explicitement** demande de laisser dériver "
+    "  l'autre dimension (phrase type : « accepte que l'allège bouge » ou "
+    "  « ne crée pas de variant »). Sans cette demande explicite, omettre "
+    "  le flag entièrement et faire confiance au défaut. Mauvaise "
+    "  manipulation du flag = bug rapporté 2026-05-12 : sill recomputé "
+    "  par Revit alors que l'utilisateur voulait le préserver.\n"
     "- Si la requête utilise des démonstratifs (« ce mur », « ces », "
     "  « this/these ») ou des pronoms implicites (« supprime-le », "
     "  « déplace-les »), prends les llm_ids de la *sélection active* "
@@ -432,7 +462,7 @@ def _main():
 
     uidoc = uiapp.ActiveUIDocument
     if uidoc is None:
-        _show("Prompt", "Aucun document Revit actif. Ouvre un projet, puis recommence.")
+        _show_error("Prompt", "Aucun document Revit actif. Ouvre un projet, puis recommence.")
         return
 
     doc = uidoc.Document
@@ -441,7 +471,7 @@ def _main():
 
     path_name = (getattr(doc, "PathName", "") or "").strip()
     if not path_name:
-        _show(
+        _show_error(
             "Prompt",
             "Le projet Revit n'est pas encore sauvegardé.\n\n"
             "Enregistre-le d'abord (Fichier → Enregistrer sous), puis "
@@ -457,7 +487,7 @@ def _main():
     # walls_create has no refs to use. Point them at the right button
     # rather than letting them spend tokens on a dead-end conversation.
     if not kg.find_by_type("Level") and not kg.find_by_type("WallType"):
-        _show(
+        _show_error(
             "Prompt",
             "Le KG du projet est vide.\n\n"
             "Clique d'abord sur « Refresh KG » pour synchroniser le KG "
@@ -561,7 +591,7 @@ def _main():
 try:
     _main()
 except BaseException as exc:  # noqa: BLE001 — surface everything to the UI.
-    _show(
+    _show_error(
         "Prompt failed",
         "{}: {}\n\n{}".format(type(exc).__name__, exc, traceback.format_exc()),
     )

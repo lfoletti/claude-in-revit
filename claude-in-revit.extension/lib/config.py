@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 CONFIG_SUBPATH = Path(".config") / "claude-in-revit"
 API_KEY_FILENAME = "api_key"
@@ -38,6 +39,12 @@ PROJECTS_SUBDIR = "projects"
 KG_FILE_SUFFIX = ".kg.json"
 HISTORY_FILE_SUFFIX = ".history.json"
 SHARED_PARAMS_FILENAME = "shared_params.txt"
+ODA_PATH_FILENAME = "oda_converter_path.txt"
+ODA_ENV_VAR = "ODA_FILE_CONVERTER"
+_ODA_DEFAULT_GLOBS = (
+    r"C:\Program Files\ODA\ODAFileConverter*\ODAFileConverter.exe",
+    r"C:\Program Files (x86)\ODA\ODAFileConverter*\ODAFileConverter.exe",
+)
 
 
 class ConfigError(RuntimeError):
@@ -91,6 +98,46 @@ def shared_params_file() -> Path:
     both at once.
     """
     return config_dir() / SHARED_PARAMS_FILENAME
+
+
+def oda_converter_path() -> Optional[Path]:
+    """Résout le chemin de l'ODA File Converter, ou None s'il n'est pas trouvé.
+
+    Précédence :
+    1. Fichier `~/.config/claude-in-revit/oda_converter_path.txt` (canonique).
+    2. Env var `ODA_FILE_CONVERTER`.
+    3. Glob sur les paths d'installation standard Windows
+       (`C:\\Program Files\\ODA\\ODAFileConverter*\\ODAFileConverter.exe`).
+
+    L'ODA File Converter est un utilitaire gratuit (oda.org/products/ODA-file-
+    converter) qui convertit `.dwg → .dxf` en CLI. Nécessaire pour ingest DWG
+    (DXF ASCII est parsé directement par ezdxf, pas besoin d'ODA pour DXF).
+
+    Renvoie `None` si rien n'est trouvé — le caller (`dwg_reader.parse`) lève
+    une `ConfigError` actionnable seulement quand un .dwg est rencontré, pas
+    au démarrage (DXF-only workflow ne doit pas exiger ODA installé).
+    """
+    import glob as _glob
+    cfg_file = config_dir() / ODA_PATH_FILENAME
+    if cfg_file.exists():
+        try:
+            content = cfg_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            content = ""
+        if content:
+            p = Path(content)
+            if p.exists():
+                return p
+    env_value = os.environ.get(ODA_ENV_VAR, "").strip()
+    if env_value:
+        p = Path(env_value)
+        if p.exists():
+            return p
+    for pattern in _ODA_DEFAULT_GLOBS:
+        matches = sorted(_glob.glob(pattern), reverse=True)
+        if matches:
+            return Path(matches[0])
+    return None
 
 
 def get_api_key() -> str:
