@@ -95,6 +95,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "openings_set_sill_height_many",
         "openings_set_head_height_many",
         "openings_set_type_many",
+        "openings_purge_unused_variants",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -2545,3 +2546,372 @@ def test_rooms_set_name_many_atomic_rollback(kg_with_seed):
     assert "non-empty" in result["content"]
     # Atomic : "after" n'a pas été appliqué.
     assert kg.get_node(r1)["name"] == "before"
+
+
+# ----- Auto-decouple sill ↔ head (session 2026-05-12 c) ---------------------
+
+
+@pytest.fixture
+def kg_with_window_with_rigid_type(kg_with_wall):
+    """KG avec un FamilyType Window qui expose `dimensions.height_m=1.2`
+    (= opening_height rigide côté famille) et 2 fenêtres déjà bindées
+    dans le mur avec `sill=1.0, head=2.2` (cohérent : head − sill = 1.2)."""
+    kg, level, wt, wall = kg_with_wall
+    window_type = kg.add_node("FamilyType", {
+        "family_name": "Fenêtre fixe",
+        "type_name": "1200 x 1200 mm",
+        "category": "Windows",
+        "dimensions": {"height_m": 1.2, "width_m": 1.2},
+    })
+    w1 = kg.add_node("Window", {
+        "type_ref": window_type,
+        "host_wall_ref": wall,
+        "position": [1.0, 0.0],
+        "sill_height": 1.0,
+        "head_height": 2.2,
+    })
+    kg.add_edge(wall, w1, "hosts")
+    kg.add_edge(w1, window_type, "is_type")
+    kg.add_edge(w1, level, "at_level")
+    w2 = kg.add_node("Window", {
+        "type_ref": window_type,
+        "host_wall_ref": wall,
+        "position": [3.0, 0.0],
+        "sill_height": 1.0,
+        "head_height": 2.2,
+    })
+    kg.add_edge(wall, w2, "hosts")
+    kg.add_edge(w2, window_type, "is_type")
+    kg.add_edge(w2, level, "at_level")
+    return kg, level, wall, window_type, w1, w2
+
+
+def test_set_head_height_auto_decouples_creates_variant(
+    kg_with_window_with_rigid_type,
+):
+    """Setter head=2.0 sur fenêtre avec sill=1.0 et family h=1.2 :
+    target_opening = 2.0 − 1.0 = 1.0 ≠ 1.2 → auto-découple :
+    variant créé + swap + sill préservé à 1.0."""
+    kg, _, _, source_type, w1, _ = kg_with_window_with_rigid_type
+    pre_types = kg.count_by_type("FamilyType")
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["decoupled"] is True
+    assert payload["auto_variant_created"] is True
+    assert payload["new_type_ref"] is not None
+    # Variant créé.
+    assert kg.count_by_type("FamilyType") == pre_types + 1
+    new_type = kg.get_node(payload["new_type_ref"])
+    assert new_type["family_name"] == "Fenêtre fixe"
+    assert new_type["dimensions"]["height_m"] == 1.0
+    assert "[auto h100cm]" in new_type["type_name"]
+    # Sill préservé à 1.0, head committé à 2.0, type swap-é.
+    assert kg.get_node(w1)["sill_height"] == 1.0
+    assert kg.get_node(w1)["head_height"] == 2.0
+    assert kg.get_node(w1)["type_ref"] == payload["new_type_ref"]
+
+
+def test_set_sill_height_auto_decouples_creates_variant(
+    kg_with_window_with_rigid_type,
+):
+    """Symétrique : setter sill=0.6, head=2.2 → target_opening = 1.6 → auto."""
+    kg, _, _, _, w1, _ = kg_with_window_with_rigid_type
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height",
+        {"llm_id": w1, "sill_height_m": 0.6}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["decoupled"] is True
+    assert payload["auto_variant_created"] is True
+    new_type = kg.get_node(payload["new_type_ref"])
+    assert new_type["dimensions"]["height_m"] == 1.6
+    # head préservé à 2.2, sill committé à 0.6.
+    assert kg.get_node(w1)["head_height"] == 2.2
+    assert kg.get_node(w1)["sill_height"] == 0.6
+
+
+def test_set_head_height_reuses_existing_variant(
+    kg_with_window_with_rigid_type,
+):
+    """Premier appel crée le variant, second appel sur sibling le réutilise."""
+    kg, _, _, _, w1, w2 = kg_with_window_with_rigid_type
+    # 1er appel sur w1 → crée variant h=1.0
+    first = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0}, "t1", kg,
+    )
+    variant_id = json.loads(first["content"])["new_type_ref"]
+    types_after_first = kg.count_by_type("FamilyType")
+    # 2e appel sur w2 (même sill=1.0, même cible head=2.0) → réutilise.
+    second = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w2, "head_height_m": 2.0}, "t2", kg,
+    )
+    payload2 = json.loads(second["content"])
+    assert payload2["decoupled"] is True
+    assert payload2["auto_variant_created"] is False  # réutilisé !
+    assert payload2["new_type_ref"] == variant_id
+    # Aucun nouveau FamilyType.
+    assert kg.count_by_type("FamilyType") == types_after_first
+
+
+def test_set_head_height_no_decouple_when_target_matches_family(
+    kg_with_window_with_rigid_type,
+):
+    """sill=1.0, head=2.2, family_h=1.2. Setter head=2.2 (no-op réel) :
+    target_opening = 1.2 = family_h → pas de drift → pas de découple."""
+    kg, _, _, source_type, w1, _ = kg_with_window_with_rigid_type
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.2}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["decoupled"] is False
+    assert payload["auto_variant_created"] is False
+    assert payload["new_type_ref"] is None
+    assert kg.get_node(w1)["type_ref"] == source_type  # type inchangé.
+
+
+def test_set_head_height_no_decouple_when_family_has_no_dimensions(
+    kg_with_opening_setup,
+):
+    """FamilyType sans `dimensions` → pas de prédiction → pas de découple
+    (fallback legacy : Set direct, drift signalé au post-mortem)."""
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    # window_type de la fixture base n'a PAS de dimensions.
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["decoupled"] is False
+
+
+def test_set_head_height_preserve_sill_false_bypasses(
+    kg_with_window_with_rigid_type,
+):
+    """Escape hatch : preserve_sill=False désactive le pré-flight. Pas
+    de variant créé, type inchangé, comportement legacy."""
+    kg, _, _, source_type, w1, _ = kg_with_window_with_rigid_type
+    pre_types = kg.count_by_type("FamilyType")
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0, "preserve_sill": False}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["decoupled"] is False
+    assert payload["auto_variant_created"] is False
+    # Aucun variant créé, type identique.
+    assert kg.count_by_type("FamilyType") == pre_types
+    assert kg.get_node(w1)["type_ref"] == source_type
+
+
+def test_set_head_height_many_aggregates_decouple_counters(
+    kg_with_window_with_rigid_type,
+):
+    """3 fenêtres mêmes refs, _many doit créer 1 variant et réutiliser
+    pour les 2 autres."""
+    kg, level, wall, source_type, w1, w2 = kg_with_window_with_rigid_type
+    # Ajoute une 3e fenêtre.
+    w3 = kg.add_node("Window", {
+        "type_ref": source_type,
+        "host_wall_ref": wall,
+        "position": [4.0, 0.0],
+        "sill_height": 1.0,
+        "head_height": 2.2,
+    })
+    kg.add_edge(wall, w3, "hosts")
+    kg.add_edge(w3, source_type, "is_type")
+    kg.add_edge(w3, level, "at_level")
+    pre_types = kg.count_by_type("FamilyType")
+
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height_many",
+        {"items": [
+            {"llm_id": w1, "head_height_m": 2.0},
+            {"llm_id": w2, "head_height_m": 2.0},
+            {"llm_id": w3, "head_height_m": 2.0},
+        ]}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 3
+    assert payload["decoupled_count"] == 3
+    # 1 seul variant créé, réutilisé pour les 2 autres.
+    assert payload["auto_variants_created"] == 1
+    assert kg.count_by_type("FamilyType") == pre_types + 1
+    # Toutes les fenêtres pointent vers le même nouveau type.
+    new_type = kg.get_node(w1)["type_ref"]
+    assert kg.get_node(w2)["type_ref"] == new_type
+    assert kg.get_node(w3)["type_ref"] == new_type
+    # Sill préservé partout, head à 2.0.
+    for w in (w1, w2, w3):
+        assert kg.get_node(w)["sill_height"] == 1.0
+        assert kg.get_node(w)["head_height"] == 2.0
+
+
+def test_set_sill_height_many_preserve_head_false(
+    kg_with_window_with_rigid_type,
+):
+    """_many avec escape hatch : decoupled_count = 0."""
+    kg, _, _, source_type, w1, w2 = kg_with_window_with_rigid_type
+    pre_types = kg.count_by_type("FamilyType")
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height_many",
+        {"items": [
+            {"llm_id": w1, "sill_height_m": 0.6},
+            {"llm_id": w2, "sill_height_m": 0.6},
+        ], "preserve_head": False}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["decoupled_count"] == 0
+    assert payload["auto_variants_created"] == 0
+    assert kg.count_by_type("FamilyType") == pre_types
+    # Types inchangés.
+    assert kg.get_node(w1)["type_ref"] == source_type
+    assert kg.get_node(w2)["type_ref"] == source_type
+
+
+# ----- Purge unused auto-variants (session 2026-05-12 d) --------------------
+
+
+def test_purge_unused_variants_drops_orphans_keeps_used(
+    kg_with_window_with_rigid_type,
+):
+    """Crée 2 auto-variants : un utilisé par une fenêtre, un orphelin.
+    Purge → seul l'orphelin est supprimé."""
+    kg, _, _, _, w1, _ = kg_with_window_with_rigid_type
+    # Trigger 1er auto-variant via set_head_height (utilisé par w1).
+    used_variant = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0}, "t1", kg,
+    )["content"])["new_type_ref"]
+    # Crée manuellement un 2e variant orphelin (porte la marque [auto h140cm]).
+    orphan = kg.add_node("FamilyType", {
+        "family_name": "Fenêtre fixe",
+        "type_name": "1200 x 1200 mm [auto h140cm]",
+        "category": "Windows",
+        "dimensions": {"height_m": 1.4, "width_m": 1.2},
+    })
+    pre_types = kg.count_by_type("FamilyType")
+
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants", {}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["scanned"] == 2
+    assert payload["purged"] == 1
+    assert payload["revit_deleted"] is False
+    # used_variant doit apparaître dans kept (reason=in_use).
+    kept_ids = [k["llm_id"] for k in payload["kept"]]
+    assert used_variant in kept_ids
+    assert any(k["reason"] == "in_use" for k in payload["kept"])
+    # Orphelin soft-deleted.
+    assert kg.get_node(orphan)["deleted_at_turn"] is not None
+    # Le compteur baisse de 1 (orphan filtré par find_by_type).
+    assert kg.count_by_type("FamilyType") == pre_types - 1
+
+
+def test_purge_unused_variants_ignores_non_auto_types(
+    kg_with_window_with_rigid_type,
+):
+    """Un FamilyType normal (sans marqueur [auto]) ne doit JAMAIS être
+    purgé, même s'il n'est utilisé par rien."""
+    kg, _, _, source_type, w1, _ = kg_with_window_with_rigid_type
+    # Crée un type normal orphelin.
+    normal = kg.add_node("FamilyType", {
+        "family_name": "Porte simple",
+        "type_name": "Variante manuelle 0900 x 2100 mm",
+        "category": "Doors",
+        "dimensions": {"height_m": 2.1, "width_m": 0.9},
+    })
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants", {}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["scanned"] == 0   # le type normal n'a pas le marqueur.
+    assert payload["purged"] == 0
+    # Le type normal est toujours vivant.
+    assert kg.get_node(normal)["deleted_at_turn"] is None
+
+
+def test_purge_unused_variants_filter_by_category(
+    kg_with_window_with_rigid_type,
+):
+    """Crée 2 orphans, un Windows + un Doors. Purge avec category=Windows
+    ne touche que les Windows."""
+    kg, _, _, _, _, _ = kg_with_window_with_rigid_type
+    win_orphan = kg.add_node("FamilyType", {
+        "family_name": "Fenêtre fixe",
+        "type_name": "f [auto h100cm]",
+        "category": "Windows",
+        "dimensions": {"height_m": 1.0},
+    })
+    door_orphan = kg.add_node("FamilyType", {
+        "family_name": "Porte simple",
+        "type_name": "p [auto h200cm]",
+        "category": "Doors",
+        "dimensions": {"height_m": 2.0},
+    })
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants",
+        {"category": "Windows"}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["scanned"] == 1   # filtré sur Windows.
+    assert payload["purged"] == 1
+    assert kg.get_node(win_orphan)["deleted_at_turn"] is not None
+    # Door orphan préservé (autre catégorie).
+    assert kg.get_node(door_orphan)["deleted_at_turn"] is None
+
+
+def test_purge_unused_variants_treats_soft_deleted_openings_as_unused(
+    kg_with_window_with_rigid_type,
+):
+    """Variant dont la seule fenêtre référente est soft-deleted = unused."""
+    kg, _, _, _, w1, _ = kg_with_window_with_rigid_type
+    variant = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_set_head_height",
+        {"llm_id": w1, "head_height_m": 2.0}, "t1", kg,
+    )["content"])["new_type_ref"]
+    # Soft-delete la fenêtre.
+    llm_protocol.dispatch_tool_use(
+        "openings_delete", {"llm_id": w1}, "t2", kg,
+    )
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants", {}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["purged"] == 1
+    assert kg.get_node(variant)["deleted_at_turn"] is not None
+
+
+def test_purge_unused_variants_no_auto_types_present(kg_with_seed):
+    """Aucun auto-variant dans le projet → scanned=0, purged=0."""
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants", {}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["scanned"] == 0
+    assert payload["purged"] == 0
+    assert payload["kept"] == []
+
+
+def test_purge_unused_variants_refuses_invalid_category(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "openings_purge_unused_variants",
+        {"category": "Walls"}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "Doors" in result["content"]

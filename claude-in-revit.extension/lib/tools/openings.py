@@ -27,11 +27,20 @@ créée (pas de fenêtre via `openings_create_door`).
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 from ._helpers import bulk_setter_summary, bulk_summary, stamp_llm_id
+
+
+# Regex de détection des variants auto-créés par `_maybe_decouple`. Le
+# format est figé par `_variant_name` : `<src> [auto h<NN>cm]`. On match
+# uniquement le suffixe pour rester tolérant aux renommages utilisateur
+# qui auraient *préservé* la partie [auto h<NN>cm] (cas peu probable
+# mais on reste robuste).
+_AUTO_VARIANT_MARKER_RE = re.compile(r"\[auto h\d+cm\]")
 
 
 # ----- Internal helpers --------------------------------------------------
@@ -551,6 +560,325 @@ def create_many(
 _DRIFT_EPSILON_M = 5e-4
 
 
+# ----- Auto-decouple helpers (session 2026-05-12 c) -------------------------
+#
+# Pré-flight applied by `set_sill_height` / `set_head_height` (+ leurs `_many`)
+# pour empêcher la dérive sill ↔ head induite par la contrainte
+# familiale `opening_height = head − sill`. Trois sous-problèmes :
+#
+# 1. Détecter le drift à venir via `FamilyType.dimensions.height_m`.
+# 2. Trouver un variant compatible existant (idempotence — évite
+#    l'explosion de FamilyTypes dans le browser Revit après N appels).
+# 3. Sinon, créer un variant + swap.
+#
+# Le résultat est invisible côté Revit user-side (le swap se fait
+# silencieusement) mais visible côté tool_result (`decoupled: bool`,
+# `new_type_ref`, `auto_variant_created`).
+
+
+def _create_type_variant_internal(
+    kg: ProjectKG,
+    doc: Any,
+    *,
+    source_type_ref: str,
+    new_name: str,
+    opening_height_m: float,
+    opening_width_m: Optional[float] = None,
+) -> str:
+    """Logique commune entre `openings_create_type_variant` (tool) et
+    l'auto-découple (helper). Crée un FamilyType variant et retourne
+    son nouveau llm_id.
+
+    Branchements KG-only / Revit symétriques au tool. Aucune
+    `revit_primitives.transaction` ouverte ici — le caller (`set_*`)
+    est *déjà* dans sa propre Tx. C'est ce découplage qui justifie
+    d'extraire le helper plutôt que d'appeler le tool via dispatch.
+    """
+    source_node = kg.get_node(source_type_ref)
+    family_name = source_node.get("family_name")
+    category = source_node.get("category")
+
+    if doc is None:
+        dims: Dict[str, Any] = {"height_m": float(opening_height_m)}
+        if opening_width_m is not None:
+            dims["width_m"] = float(opening_width_m)
+        return kg.add_node("FamilyType", {
+            "family_name": family_name,
+            "type_name": new_name,
+            "category": category,
+            "dimensions": dims,
+        })
+
+    source_eid_raw = kg.get_revit_id(source_type_ref)
+    if source_eid_raw is None:
+        raise ValueError(
+            "FamilyType {} has no Revit binding — run Refresh KG.".format(
+                source_type_ref,
+            )
+        )
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    source_eid = ElementId(source_eid_raw)
+    source_symbol = doc.GetElement(source_eid)
+    new_symbol = source_symbol.Duplicate(new_name)
+    revit_id = int(new_symbol.Id.Value)
+
+    height_ok = rp.opening_set_height(new_symbol, opening_height_m)
+    if not height_ok:
+        raise ValueError(
+            "Family {} doesn't expose a writable opening height "
+            "parameter — cannot auto-decouple.".format(family_name)
+        )
+    if opening_width_m is not None:
+        width_ok = rp.opening_set_width(new_symbol, opening_width_m)
+        if not width_ok:
+            raise ValueError(
+                "Family {} doesn't expose a writable opening width "
+                "parameter.".format(family_name)
+            )
+    if not new_symbol.IsActive:
+        new_symbol.Activate()
+
+    height_m = rp.opening_read_height_m(new_symbol)
+    width_m = rp.opening_read_width_m(new_symbol)
+    final_dims: Dict[str, Any] = {}
+    if height_m is not None:
+        final_dims["height_m"] = round(height_m, 6)
+    if width_m is not None:
+        final_dims["width_m"] = round(width_m, 6)
+
+    new_llm_id = kg.add_node("FamilyType", {
+        "family_name": family_name,
+        "type_name": new_name,
+        "category": category,
+        "dimensions": final_dims,
+    })
+    kg.set_revit_id(new_llm_id, revit_id)
+    stamp_llm_id(new_symbol, new_llm_id)
+    return new_llm_id
+
+
+def _find_compatible_variant(
+    kg: ProjectKG,
+    *,
+    source_type_ref: str,
+    target_opening_height_m: float,
+) -> Optional[str]:
+    """Cherche dans le KG un FamilyType de la même famille + catégorie
+    que `source_type_ref` dont `dimensions.height_m` matche
+    `target_opening_height_m` (à `_DRIFT_EPSILON_M` près).
+
+    Renvoie le llm_id du candidat, ou None si aucun match. Idempotence
+    de l'auto-découple : N appels successifs réutilisent le même
+    variant au lieu d'en créer N.
+    """
+    source_node = kg.get_node(source_type_ref)
+    family_name = source_node.get("family_name")
+    category = source_node.get("category")
+    for nid in kg.find_by_type("FamilyType"):
+        cand = kg.get_node(nid)
+        if cand.get("family_name") != family_name:
+            continue
+        if cand.get("category") != category:
+            continue
+        dims = cand.get("dimensions") or {}
+        cand_height = dims.get("height_m")
+        if cand_height is None:
+            continue
+        if abs(float(cand_height) - float(target_opening_height_m)) <= _DRIFT_EPSILON_M:
+            return nid
+    return None
+
+
+def _variant_name(source_type_name: str, opening_height_m: float) -> str:
+    """Convention de nommage des variants auto-créés : `<src> [auto hNNNcm]`.
+
+    Marqueur `[auto]` lisible dans le browser Revit, hauteur en cm pour
+    la concision (Revit affiche les noms tronqués). Idempotent : pour
+    une même hauteur, le nom est strictement identique → si jamais le
+    KG est rechargé sans le variant, le rescan le matchera par name.
+    """
+    return "{} [auto h{}cm]".format(
+        source_type_name, round(float(opening_height_m) * 100),
+    )
+
+
+def _swap_to_type_internal(
+    kg: ProjectKG,
+    doc: Any,
+    llm_id: str,
+    new_family_type_ref: str,
+) -> Dict[str, float]:
+    """Swap le `Symbol` d'une opening + reroute l'edge `is_type` dans le KG.
+
+    Caller *déjà dans une `rp.transaction` ouverte* — pas de Tx imbriquée
+    ici. Renvoie `{sill_height_m, head_height_m}` lus post-swap depuis
+    Revit (KG-only path : renvoie les valeurs courantes du KG).
+    """
+    node = kg.get_node(llm_id)
+    old_type_ref = node.get("type_ref")
+
+    if doc is None:
+        kg.remove_edge(llm_id, old_type_ref, "is_type")
+        kg.modify_node(llm_id, {"type_ref": new_family_type_ref})
+        kg.add_edge(llm_id, new_family_type_ref, "is_type")
+        return {
+            "sill_height_m": float(node.get("sill_height", 0.0)),
+            "head_height_m": float(node.get("head_height", 0.0)),
+        }
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    inst_eid = ElementId(kg.get_revit_id(llm_id))
+    new_type_eid = ElementId(kg.get_revit_id(new_family_type_ref))
+    instance = doc.GetElement(inst_eid)
+    new_symbol = doc.GetElement(new_type_eid)
+    if not new_symbol.IsActive:
+        new_symbol.Activate()
+        doc.Regenerate()
+    instance.Symbol = new_symbol
+
+    sill_param = instance.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+    head_param = instance.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+    sill_m = rp.internal_to_meters(sill_param.AsDouble()) if sill_param else float(node.get("sill_height", 0.0))
+    head_m = rp.internal_to_meters(head_param.AsDouble()) if head_param else float(node.get("head_height", 0.0))
+
+    kg.remove_edge(llm_id, old_type_ref, "is_type")
+    kg.modify_node(llm_id, {
+        "type_ref": new_family_type_ref,
+        "sill_height": float(sill_m),
+        "head_height": float(head_m),
+    })
+    kg.add_edge(llm_id, new_family_type_ref, "is_type")
+    return {"sill_height_m": float(sill_m), "head_height_m": float(head_m)}
+
+
+def _maybe_decouple(
+    kg: ProjectKG,
+    doc: Any,
+    llm_id: str,
+    *,
+    new_head_m: Optional[float] = None,
+    new_sill_m: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Pré-flight pour `set_sill_height` / `set_head_height`.
+
+    Exactement un de `new_head_m` / `new_sill_m` doit être fourni —
+    c'est la valeur que l'utilisateur veut imposer. L'autre dimension
+    est préservée à sa valeur courante.
+
+    Logique :
+    1. Lit `FamilyType.dimensions.height_m` du type actuel de l'opening.
+       Si absent, on ne sait pas prédire → retourne `decoupled=False`
+       et le caller fait le Set direct (le drift sera signalé au
+       post-mortem comme avant).
+    2. Calcule `target_opening = head − sill` que l'utilisateur veut
+       *réellement* (en préservant l'autre dimension).
+    3. Si `|target_opening − family_height| <= ε`, pas de drift attendu →
+       retourne `decoupled=False`, Set direct.
+    4. Sinon, cherche un variant compatible (`_find_compatible_variant`).
+       Si trouvé → swap vers lui.
+       Sinon → crée un nouveau variant + swap.
+    5. Renvoie `{decoupled: True, new_type_ref, auto_variant_created}`.
+
+    Idempotence : N appels successifs avec la même cible réutilisent le
+    même variant (find puis swap, jamais 2 créations).
+    """
+    if (new_head_m is None) == (new_sill_m is None):
+        raise ValueError(
+            "_maybe_decouple: exactly one of new_head_m / new_sill_m must be set"
+        )
+    node = kg.get_node(llm_id)
+    current_sill = float(node.get("sill_height", 0.0))
+    current_head = float(node.get("head_height", 0.0))
+    type_ref = node.get("type_ref")
+    if not type_ref or not kg.has_node(type_ref):
+        return {"decoupled": False, "new_type_ref": None, "auto_variant_created": False}
+    type_node = kg.get_node(type_ref)
+    dims = type_node.get("dimensions") or {}
+    family_height = dims.get("height_m")
+    if family_height is None:
+        # Famille sans hauteur d'ouverture exposée — on ne peut pas
+        # prédire le drift. Le Set direct se passera bien si la famille
+        # est libre, ou signalera un drift sinon (chemin legacy).
+        return {"decoupled": False, "new_type_ref": None, "auto_variant_created": False}
+
+    if new_head_m is not None:
+        target_opening = float(new_head_m) - current_sill
+    else:
+        target_opening = current_head - float(new_sill_m)
+
+    if abs(target_opening - float(family_height)) <= _DRIFT_EPSILON_M:
+        return {"decoupled": False, "new_type_ref": None, "auto_variant_created": False}
+
+    # Drift prédit. Cherche un variant compatible.
+    existing = _find_compatible_variant(
+        kg,
+        source_type_ref=type_ref,
+        target_opening_height_m=target_opening,
+    )
+    if existing is not None:
+        _swap_to_type_internal(kg, doc, llm_id, existing)
+        return {
+            "decoupled": True,
+            "new_type_ref": existing,
+            "auto_variant_created": False,
+        }
+
+    # Crée un nouveau variant + swap.
+    new_name = _variant_name(type_node.get("type_name", "type"), target_opening)
+    # Préserve la largeur d'origine (None = duplicate sans changer la
+    # largeur, comportement déjà géré par `_create_type_variant_internal`).
+    new_type_ref = _create_type_variant_internal(
+        kg, doc,
+        source_type_ref=type_ref,
+        new_name=new_name,
+        opening_height_m=target_opening,
+        opening_width_m=None,
+    )
+    _swap_to_type_internal(kg, doc, llm_id, new_type_ref)
+    return {
+        "decoupled": True,
+        "new_type_ref": new_type_ref,
+        "auto_variant_created": True,
+    }
+
+
+# ----- Purge helpers (session 2026-05-12 d — nettoyage variants [auto]) -----
+
+
+def _is_auto_variant(node: Dict[str, Any]) -> bool:
+    """True si le type_name du FamilyType contient le marqueur `[auto h<NN>cm]`.
+
+    Conservateur — si l'utilisateur a renommé manuellement le variant en
+    enlevant le marqueur, le tool ne le purgera pas (et c'est tant mieux :
+    le renommage signale une réappropriation du type comme variant normal).
+    """
+    if node.get("_type") != "FamilyType":
+        return False
+    name = node.get("type_name") or ""
+    return bool(_AUTO_VARIANT_MARKER_RE.search(name))
+
+
+def _is_family_type_in_use(kg: ProjectKG, family_type_ref: str) -> bool:
+    """True iff au moins une Door ou Window vivante référence ce
+    FamilyType comme `type_ref`. Itère uniquement les nodes vivants
+    (filtre soft-deleted automatique via `find_by_type`).
+
+    O(N) sur le nombre d'openings — typiquement < 100, négligeable même
+    appelé en boucle dans `purge_unused_variants`.
+    """
+    for opening_type in ("Door", "Window"):
+        for nid in kg.find_by_type(opening_type):
+            attrs = kg.get_node(nid)
+            if attrs.get("type_ref") == family_type_ref:
+                return True
+    return False
+
+
 def _read_sill_head_m(element: Any) -> Dict[str, Optional[float]]:
     """Read both sill / head heights from a Revit Door / Window. Returns
     `{sill_height_m, head_height_m}` with None for any param not exposed
@@ -615,22 +943,28 @@ def set_sill_height(
     doc: Any,
     llm_id: str,
     sill_height_m: float,
+    preserve_head: bool = True,
 ) -> Dict[str, Any]:
     """Règle la hauteur d'allège (`INSTANCE_SILL_HEIGHT_PARAM`) d'une porte
-    ou d'une fenêtre.
+    ou d'une fenêtre, en préservant par défaut la hauteur de linteau.
 
-    **Couplage sill ↔ head côté Revit.** La hauteur d'ouverture
-    `head − sill` est presque toujours un paramètre de TYPE (fixé par
-    le FamilySymbol). Setter le sill décale donc automatiquement le
-    head. Si l'utilisateur veut sill ET head indépendants, il faut
-    changer de type (`openings_set_type`) ou dupliquer le type avec
-    une hauteur d'ouverture compatible (`openings_create_type_variant`).
-    Quand Revit refuse silencieusement de tenir la valeur demandée
-    (cas où sill + opening_height violerait le contour), le champ
-    `drift` du résultat est True et une `drift_note` explique le
-    contournement.
+    **Auto-découple sill ↔ head (défaut, session 2026-05-12 c).** La
+    hauteur d'ouverture `head − sill` est fixée par le TYPE (`opening_height`
+    du FamilySymbol). Sans découplage, setter le sill décalerait le
+    head. Le tool détecte en pré-flight l'incompatibilité via
+    `FamilyType.dimensions.height_m`, cherche dans le projet un variant
+    de type compatible (même famille + bonne `opening_height`), sinon
+    crée silencieusement un variant nommé `<type> [auto h<NN>cm]` et
+    swap l'instance dessus. **Le head est préservé**, le sill committé
+    est exactement la valeur demandée. Variants réutilisés sur appels
+    suivants → pas d'explosion du browser Revit.
 
-    Concepts: allège, sill, hauteur, modification, porte, fenêtre
+    L'escape hatch `preserve_head=False` désactive le pré-flight :
+    comportement legacy (Set direct, drift signalé dans la réponse si
+    Revit a recomputé le head).
+
+    Concepts: allège, sill, hauteur, modification, porte, fenêtre,
+              découplage, variant
     Phrases: "passe l'allège à X cm", "lève l'allège",
              "set the sill at", "abaisse la fenêtre"
     Similar: openings_set_head_height, openings_set_type,
@@ -640,6 +974,9 @@ def set_sill_height(
         llm_id: llm_id de la porte ou fenêtre à modifier.
         sill_height_m: nouvelle hauteur d'allège en mètres (distance au
             niveau hôte).
+        preserve_head: si True (défaut), bascule auto vers un variant de
+            type avec la bonne `opening_height` pour conserver le head.
+            Si False, Set direct legacy (head peut dériver).
 
     Returns:
         {"ok": bool, "llm_id": str,
@@ -647,10 +984,23 @@ def set_sill_height(
          "head_height_m": float,        # head après recompute Revit
          "requested_sill_height_m": float,
          "drift": bool, "drift_note": str | None,
+         "decoupled": bool,             # True si swap automatique
+         "new_type_ref": str | None,    # type swap-é si decoupled
+         "auto_variant_created": bool,  # True si variant créé (pas réutilisé)
          "revit_modified": bool}
     """
     node = _require_live_opening(kg, llm_id)
     sill_value = float(sill_height_m)
+
+    decouple_info: Dict[str, Any] = {
+        "decoupled": False, "new_type_ref": None, "auto_variant_created": False,
+    }
+    if preserve_head:
+        decouple_info = _maybe_decouple(kg, doc, llm_id, new_sill_m=sill_value)
+        # Re-load node attrs after potential swap (sill/head may have
+        # shifted post-swap toward the family's new opening_height ;
+        # the explicit Set below realigns sill exactly).
+        node = kg.get_node(llm_id)
 
     if doc is None:
         # Hors-Revit : pas de recompute familial, le KG trust la valeur
@@ -665,6 +1015,7 @@ def set_sill_height(
             "drift": False,
             "drift_note": None,
             "revit_modified": False,
+            **decouple_info,
         }
 
     eid_raw = kg.get_revit_id(llm_id)
@@ -729,6 +1080,7 @@ def set_sill_height(
         "drift": note is not None,
         "drift_note": note,
         "revit_modified": True,
+        **decouple_info,
     }
 
 
@@ -738,16 +1090,25 @@ def set_head_height(
     doc: Any,
     llm_id: str,
     head_height_m: float,
+    preserve_sill: bool = True,
 ) -> Dict[str, Any]:
     """Règle la hauteur de linteau (`INSTANCE_HEAD_HEIGHT_PARAM`) d'une
-    porte ou d'une fenêtre.
+    porte ou d'une fenêtre, en préservant par défaut la hauteur d'allège.
 
-    **Couplage sill ↔ head.** Voir `openings_set_sill_height` — même
-    contrainte symétrique. Setter le head décale le sill via la hauteur
-    d'ouverture du type. Drift signalé dans la réponse quand Revit
-    n'a pas tenu la valeur demandée.
+    **Auto-découple sill ↔ head (défaut, session 2026-05-12 c).**
+    Symétrique de `openings_set_sill_height`. Sans découplage, setter le
+    head décalerait le sill via la contrainte familiale
+    `opening_height`. Pré-flight via `FamilyType.dimensions.height_m` :
+    si la cible `head − sill_courant` diverge de la `opening_height`
+    familiale, le tool cherche / crée un variant compatible et swap
+    l'instance dessus silencieusement avant le Set. **Le sill est
+    préservé**, le head committé est exactement la valeur demandée.
 
-    Concepts: linteau, lintel, head, hauteur, modification, porte, fenêtre
+    L'escape hatch `preserve_sill=False` désactive le pré-flight :
+    comportement legacy.
+
+    Concepts: linteau, lintel, head, hauteur, modification, porte,
+              fenêtre, découplage, variant
     Phrases: "passe le linteau à X cm", "lève le linteau",
              "set the head at", "abaisse le haut de la porte"
     Similar: openings_set_sill_height, openings_set_type
@@ -756,6 +1117,9 @@ def set_head_height(
         llm_id: llm_id de la porte ou fenêtre à modifier.
         head_height_m: nouvelle hauteur de linteau en mètres (distance
             au niveau hôte, mesurée au haut de l'ouverture).
+        preserve_sill: si True (défaut), bascule auto vers un variant de
+            type avec la bonne `opening_height` pour conserver le sill.
+            Si False, Set direct legacy (sill peut dériver).
 
     Returns:
         {"ok": bool, "llm_id": str,
@@ -763,10 +1127,20 @@ def set_head_height(
          "sill_height_m": float,        # sill après recompute Revit
          "requested_head_height_m": float,
          "drift": bool, "drift_note": str | None,
+         "decoupled": bool,             # True si swap automatique
+         "new_type_ref": str | None,    # type swap-é si decoupled
+         "auto_variant_created": bool,  # True si variant créé (pas réutilisé)
          "revit_modified": bool}
     """
     node = _require_live_opening(kg, llm_id)
     head_value = float(head_height_m)
+
+    decouple_info: Dict[str, Any] = {
+        "decoupled": False, "new_type_ref": None, "auto_variant_created": False,
+    }
+    if preserve_sill:
+        decouple_info = _maybe_decouple(kg, doc, llm_id, new_head_m=head_value)
+        node = kg.get_node(llm_id)
 
     if doc is None:
         kg.modify_node(llm_id, {"head_height": head_value})
@@ -779,6 +1153,7 @@ def set_head_height(
             "drift": False,
             "drift_note": None,
             "revit_modified": False,
+            **decouple_info,
         }
 
     eid_raw = kg.get_revit_id(llm_id)
@@ -837,6 +1212,7 @@ def set_head_height(
         "drift": note is not None,
         "drift_note": note,
         "revit_modified": True,
+        **decouple_info,
     }
 
 
@@ -1227,16 +1603,21 @@ def set_sill_height_many(
     kg: ProjectKG,
     doc: Any,
     items: List[Dict[str, Any]],
+    preserve_head: bool = True,
 ) -> Dict[str, Any]:
     """Règle l'allège (`INSTANCE_SILL_HEIGHT_PARAM`) de N ouvertures en
-    **une seule** Tx Revit + une seule Tx KG.
+    **une seule** Tx Revit + une seule Tx KG, en préservant par défaut
+    la hauteur de linteau.
 
-    Couplage sill ↔ head identique au tool solo : la hauteur d'ouverture
-    est fixée par le TYPE (FamilySymbol), donc setter le sill décale le
-    head. Pour découpler, switcher de type via `openings_set_type_many`
-    (ou créer une variante avec `openings_create_type_variant`).
+    **Auto-découple sill ↔ head (défaut, session 2026-05-12 c).** Pré-flight
+    par item via `FamilyType.dimensions.height_m` : si la cible
+    `head_courant − sill_demandé` diverge de la `opening_height` familiale,
+    bascule l'instance sur un variant compatible (cherché dans le KG,
+    créé sinon — voir `_variant_name`). Les variants sont réutilisés
+    entre items et entre appels → pas d'explosion du browser Revit.
+    `preserve_head=False` désactive le découplage (Set direct legacy).
 
-    Concepts: allège, sill, bulk, batch, plusieurs, masse
+    Concepts: allège, sill, bulk, batch, plusieurs, masse, découplage
     Phrases: "passe toutes ces allèges à 0.80 m", "uniformise les sill",
              "bulk set sill heights"
     Similar: openings_set_sill_height, openings_set_head_height_many,
@@ -1246,11 +1627,13 @@ def set_sill_height_many(
         items: liste de specs `{llm_id: str, sill_height_m: float}`. Au
             moins un item, chaque `llm_id` pointe sur une Door ou Window
             vivante.
+        preserve_head: défaut True. Voir `openings_set_sill_height`.
 
     Returns:
-        Réponse compacte (`_helpers.bulk_setter_summary`). Drifts pointent
-        les ouvertures où sill final ≠ sill demandé (contrainte
-        `opening_height` du type incompatible).
+        Compact summary (`_helpers.bulk_setter_summary`) enrichie de
+        `decoupled_count` et `auto_variants_created` (compteurs agrégés
+        sur le batch). `drifts` reste à `[]` quand le découplage a fait
+        son travail.
     """
     if not isinstance(items, list) or not items:
         raise ValueError("items must be a non-empty list")
@@ -1259,10 +1642,23 @@ def set_sill_height_many(
         for i, it in enumerate(items)
     ]
 
+    decoupled_count = 0
+    auto_variants_created = 0
+    if preserve_head:
+        for spec in specs:
+            info = _maybe_decouple(kg, doc, spec["llm_id"], new_sill_m=spec["sill_height_m"])
+            if info["decoupled"]:
+                decoupled_count += 1
+                if info["auto_variant_created"]:
+                    auto_variants_created += 1
+
     if doc is None:
         for spec in specs:
             kg.modify_node(spec["llm_id"], {"sill_height": spec["sill_height_m"]})
-        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+        out = bulk_setter_summary([], count=len(specs), revit_modified=False)
+        out["decoupled_count"] = decoupled_count
+        out["auto_variants_created"] = auto_variants_created
+        return out
 
     for i, spec in enumerate(specs):
         if kg.get_revit_id(spec["llm_id"]) is None:
@@ -1308,7 +1704,10 @@ def set_sill_height_many(
             if note is not None:
                 drifts.append({"llm_id": spec["llm_id"], "note": note})
 
-    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+    out = bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+    out["decoupled_count"] = decoupled_count
+    out["auto_variants_created"] = auto_variants_created
+    return out
 
 
 @tool(name="openings_set_head_height_many", tier=1)
@@ -1316,15 +1715,19 @@ def set_head_height_many(
     kg: ProjectKG,
     doc: Any,
     items: List[Dict[str, Any]],
+    preserve_sill: bool = True,
 ) -> Dict[str, Any]:
     """Règle le linteau (`INSTANCE_HEAD_HEIGHT_PARAM`) de N ouvertures en
-    **une seule** Tx Revit + une seule Tx KG.
+    **une seule** Tx Revit + une seule Tx KG, en préservant par défaut
+    la hauteur d'allège.
 
-    Symétrique de `openings_set_sill_height_many`. Couplage sill ↔ head
-    identique : changer le head décale le sill via la hauteur
-    d'ouverture du type.
+    **Auto-découple sill ↔ head (défaut, session 2026-05-12 c).** Pré-flight
+    par item identique à `openings_set_sill_height_many`. Bascule auto
+    sur un variant compatible si la cible diverge de la `opening_height`
+    familiale. `preserve_sill=False` désactive le découplage.
 
-    Concepts: linteau, head, lintel, bulk, batch, plusieurs, masse
+    Concepts: linteau, head, lintel, bulk, batch, plusieurs, masse,
+              découplage
     Phrases: "passe tous ces linteaux à 2.10 m", "uniformise les head",
              "bulk set head heights"
     Similar: openings_set_head_height, openings_set_sill_height_many,
@@ -1332,9 +1735,11 @@ def set_head_height_many(
 
     Args:
         items: liste de specs `{llm_id: str, head_height_m: float}`.
+        preserve_sill: défaut True. Voir `openings_set_head_height`.
 
     Returns:
-        Réponse compacte (`_helpers.bulk_setter_summary`).
+        Compact summary enrichie de `decoupled_count` et
+        `auto_variants_created`.
     """
     if not isinstance(items, list) or not items:
         raise ValueError("items must be a non-empty list")
@@ -1343,10 +1748,23 @@ def set_head_height_many(
         for i, it in enumerate(items)
     ]
 
+    decoupled_count = 0
+    auto_variants_created = 0
+    if preserve_sill:
+        for spec in specs:
+            info = _maybe_decouple(kg, doc, spec["llm_id"], new_head_m=spec["head_height_m"])
+            if info["decoupled"]:
+                decoupled_count += 1
+                if info["auto_variant_created"]:
+                    auto_variants_created += 1
+
     if doc is None:
         for spec in specs:
             kg.modify_node(spec["llm_id"], {"head_height": spec["head_height_m"]})
-        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+        out = bulk_setter_summary([], count=len(specs), revit_modified=False)
+        out["decoupled_count"] = decoupled_count
+        out["auto_variants_created"] = auto_variants_created
+        return out
 
     for i, spec in enumerate(specs):
         if kg.get_revit_id(spec["llm_id"]) is None:
@@ -1392,7 +1810,10 @@ def set_head_height_many(
             if note is not None:
                 drifts.append({"llm_id": spec["llm_id"], "note": note})
 
-    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+    out = bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+    out["decoupled_count"] = decoupled_count
+    out["auto_variants_created"] = auto_variants_created
+    return out
 
 
 def _validate_set_type_item(
@@ -1545,3 +1966,120 @@ def set_type_many(
             kg.add_edge(spec["llm_id"], spec["new_family_type_ref"], "is_type")
 
     return bulk_setter_summary([], count=len(specs), revit_modified=True)
+
+
+# ----- Purge unused auto-variants (session 2026-05-12 d) --------------------
+
+
+@tool(name="openings_purge_unused_variants", tier=1)
+def purge_unused_variants(
+    kg: ProjectKG,
+    doc: Any,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Supprime les FamilyType auto-créés (marqueur `[auto h<NN>cm]`) qui
+    ne sont plus référencés par aucune Door / Window vivante.
+
+    Maintenance occasionnelle après plusieurs cycles d'auto-découple (cf.
+    `openings_set_sill_height` / `_set_head_height`). Conservateur :
+    purge UNIQUEMENT les variants reconnaissables par leur marqueur
+    `[auto h<NN>cm]`. Un variant renommé manuellement par l'utilisateur
+    (marqueur enlevé) est traité comme un type normal et préservé.
+
+    Côté Revit : `doc.Delete(eid)` du FamilySymbol. Si Revit refuse
+    (rare — l'usage est déjà vérifié côté KG), l'item reste dans
+    `kept` avec la raison.
+
+    Concepts: purge, cleanup, nettoyage, variants, auto, types orphelins
+    Phrases: "nettoie les types orphelins", "purge les variants auto",
+             "remove unused types", "delete orphan family types"
+    Similar: openings_create_type_variant, openings_set_type
+
+    Args:
+        category: optionnel. "Doors" ou "Windows" pour filtrer. None
+            (défaut) purge les deux.
+
+    Returns:
+        {"ok": bool, "scanned": int, "purged": int,
+         "kept": [{"llm_id", "type_name", "reason"}, …],
+         "revit_deleted": bool}
+        `scanned` = nombre total de variants `[auto]` matchés (avant
+        filtrage usage). `purged` = nombre effectivement supprimés.
+        `kept` n'enumère que les variants conservés *pour une raison
+        autre que "non-auto"* (typiquement `in_use`) — token compact.
+    """
+    if category is not None and category not in ("Doors", "Windows"):
+        raise ValueError(
+            "category must be 'Doors', 'Windows' or None, got {!r}".format(category)
+        )
+
+    # 1. Collecte les FamilyType auto, filtre par catégorie si demandée.
+    candidates: List[str] = []
+    for nid in kg.find_by_type("FamilyType"):
+        attrs = kg.get_node(nid)
+        if not _is_auto_variant(attrs):
+            continue
+        if category is not None and attrs.get("category") != category:
+            continue
+        candidates.append(nid)
+
+    # 2. Sépare unused vs in_use.
+    to_purge: List[str] = []
+    kept: List[Dict[str, Any]] = []
+    for nid in candidates:
+        if _is_family_type_in_use(kg, nid):
+            kept.append({
+                "llm_id": nid,
+                "type_name": kg.get_node(nid).get("type_name"),
+                "reason": "in_use",
+            })
+        else:
+            to_purge.append(nid)
+
+    if doc is None:
+        # KG-only : soft-delete les unused, pas de Revit-side.
+        for nid in to_purge:
+            kg.soft_delete(nid)
+        return {
+            "ok": True,
+            "scanned": len(candidates),
+            "purged": len(to_purge),
+            "kept": kept,
+            "revit_deleted": False,
+        }
+
+    # 3. Branche Revit : doc.Delete chaque FamilySymbol unused.
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    purged: List[str] = []
+    with rp.transaction(doc, "openings.purge_unused_variants"):
+        for nid in to_purge:
+            eid_raw = kg.get_revit_id(nid)
+            if eid_raw is None:
+                # KG-only variant (pas de binding Revit) — soft-delete KG
+                # uniquement, pas d'erreur.
+                kg.soft_delete(nid)
+                purged.append(nid)
+                continue
+            try:
+                doc.Delete(ElementId(eid_raw))
+                kg.soft_delete(nid)
+                purged.append(nid)
+            except Exception as exc:  # noqa: BLE001
+                # Revit refuse la suppression (rare : usage caché par un
+                # élément hors KG, par exemple). On garde le variant
+                # côté KG et on remonte l'info au LLM.
+                kept.append({
+                    "llm_id": nid,
+                    "type_name": kg.get_node(nid).get("type_name"),
+                    "reason": "revit_refused_delete: {}".format(exc),
+                })
+
+    return {
+        "ok": True,
+        "scanned": len(candidates),
+        "purged": len(purged),
+        "kept": kept,
+        "revit_deleted": True,
+    }

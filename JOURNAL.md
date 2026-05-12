@@ -14,6 +14,363 @@
 
 ---
 
+## 2026-05-12 (session d) — `openings_purge_unused_variants`
+
+### Contexte & objectif
+
+Dette de la session c (point 1 « Pollution du browser Revit sur le long
+terme ») : l'auto-découple crée des FamilyTypes `[auto h<NN>cm]` qui
+s'accumulent. Idempotence (variants réutilisés) limite déjà l'explosion,
+mais après des cycles de modifications variées (sill 0.6, sill 0.8,
+head 2.0, head 2.4…) on finit avec une famille qui a 5-10 variants
+auto, dont certains plus utilisés. Tool de maintenance ciblé pour
+nettoyer.
+
+### Décisions
+
+1. **Détection par marqueur de nom `[auto h<NN>cm]`** (regex). Cohérent
+   avec la convention de la session c. Conservateur : un variant renommé
+   par l'utilisateur (marqueur enlevé) est *préservé* — le renommage
+   signale une réappropriation du variant comme type normal.
+
+2. **Pas de tag explicite `_auto_generated: True`.** Option envisagée
+   puis écartée : nécessiterait une extension de schéma sur `FamilyType`,
+   et le marqueur de nom suffit. Si l'utilisateur enlève le marqueur
+   pour éviter la purge, c'est un signal volontaire — pas un bug.
+
+3. **Soft-delete côté KG, hard-delete côté Revit.** Symétrique aux
+   autres `*_delete`. Le node FamilyType reste tracé avec
+   `deleted_at_turn` (audits, lineage). Le FamilySymbol Revit disparaît.
+
+4. **Filtre catégorie optionnel.** `category="Doors"` / `"Windows"` /
+   `None` (défaut = tout). Utile si l'utilisateur veut purger
+   sélectivement (« nettoie seulement les variants de fenêtres »).
+
+5. **Vérification d'usage avant suppression.** `_is_family_type_in_use`
+   itère les Door/Window vivants et matche `type_ref`. Variants
+   référencés uniquement par des openings soft-deleted = unused
+   (`find_by_type` filtre déjà les soft-deleted). Évite un
+   `doc.Delete` qui ferait crasher si Revit avait des refs cachées.
+
+6. **Tolérance à un refus Revit.** Si `doc.Delete` lève (rare : usage
+   par un élément hors KG, lock, etc.), on ajoute l'item dans `kept`
+   avec `reason: "revit_refused_delete: <exc>"`. Le batch continue.
+
+7. **Pas de dry-run en V0.** Tentation : flag `dry_run: bool = False`
+   pour preview. Reporté — l'utilisateur peut toujours appeler le
+   tool, voir `purged` dans la réponse, et undo Revit si nécessaire
+   (le `doc.Delete` est dans une Tx Revit, donc Ctrl+Z annule). Si
+   le cas devient critique, ajout trivial.
+
+### Phase 1 — Helpers privés
+
+`lib/tools/openings.py` :
+
+- **`_AUTO_VARIANT_MARKER_RE = re.compile(r"\[auto h\d+cm\]")`**.
+  Module-level constante. Match suffixe, tolérant aux modifications
+  utilisateur tant qu'elles préservent le marqueur.
+- **`_is_auto_variant(node) -> bool`** : check `_type == "FamilyType"`
+  + regex search sur `type_name`.
+- **`_is_family_type_in_use(kg, family_type_ref) -> bool`** : itère
+  `find_by_type("Door")` + `("Window")` (filtre soft-deleted
+  automatique), compare `type_ref`.
+
+### Phase 2 — Tool `openings_purge_unused_variants`
+
+Signature : `(kg, doc, category=None) -> Dict`. Logique en 3 étapes :
+
+1. Collecte les FamilyType auto, filtre par catégorie si demandée.
+2. Sépare unused vs in_use (`_is_family_type_in_use` per candidat).
+3. Pour chaque unused : `doc.Delete` (Revit) + `kg.soft_delete` (KG).
+
+Réponse compacte : `{ok, scanned, purged, kept, revit_deleted}`. `kept`
+n'enumère QUE les variants conservés pour usage (token compact —
+typiquement [] sur un projet fraîchement purgé). Refusé : `category`
+non valide → `ValueError` claire (`"category must be 'Doors',
+'Windows' or None"`).
+
+### Phase 3 — Tests (+6)
+
+`tests/test_tools.py`, basés sur la fixture `kg_with_window_with_rigid_type`
+(session c) :
+
+1. **`test_purge_unused_variants_drops_orphans_keeps_used`** : 2 auto-variants,
+   1 utilisé par w1, 1 orphelin. Purge → scanned=2, purged=1,
+   utilisé apparaît dans kept avec reason=in_use.
+2. **`test_purge_unused_variants_ignores_non_auto_types`** : un
+   FamilyType normal sans marqueur, orphelin → scanned=0 (pas
+   touché).
+3. **`test_purge_unused_variants_filter_by_category`** : 2 orphans
+   un Windows + un Doors, category="Windows" → seul le Windows
+   purgé.
+4. **`test_purge_unused_variants_treats_soft_deleted_openings_as_unused`** :
+   variant dont la seule fenêtre référente est soft-deleted → purgé.
+5. **`test_purge_unused_variants_no_auto_types_present`** : projet
+   vierge → scanned=0, purged=0, kept=[].
+6. **`test_purge_unused_variants_refuses_invalid_category`** :
+   category="Walls" → erreur explicite.
+
+### Validation
+
+- `pytest -q` : **275 verts en 8.99s** (269 → +6). Aucune régression.
+- Test live Revit : à coupler avec le scénario de la session c
+  (head=2m × 20 fenêtres mixtes) + un appel `purge_unused_variants`
+  en fin pour observer le ménage. Critère : variants `[auto]`
+  effectivement supprimés du browser Revit.
+
+### État final & reste à faire
+
+**Acquis session d** :
+- `openings_purge_unused_variants` tool ✓
+- Détection conservatrice par marqueur de nom ✓
+- Filtre catégorie ✓
+- Symétrie KG / Revit (soft / hard) ✓
+- Tolérance refus Revit ✓
+- 6 tests, baseline **275 verts** ✓
+
+**Dettes / TODO ouverts** :
+- Dry-run reporté (Ctrl+Z Revit fait office).
+- Cas Top Constraint murs (analogie sill/head, prévention préemptive)
+  toujours ouvert. Pas un blocker tant qu'aucun cas réel ne remonte.
+- Drift utilisateur hors pipeline (events `DocumentChanged`) toujours
+  ouvert.
+
+**Boucle vertueuse** : auto-découple (session c) ajoute des variants
+proprement nommés, purge (session d) les nettoie quand orphelins.
+L'utilisateur peut maintenant modifier sill/head librement sans gérer
+manuellement les FamilyTypes — c'était l'invariant attendu (« je
+pensais que ce comportement était acquis »).
+
+**Suite immédiate (§9 V0 Sem.4-5)** : inchangée — `dwg_reader.py` +
+`tools/bulk.py`.
+
+---
+
+## 2026-05-12 (session c) — Auto-découple sill ↔ head dans les setters d'openings
+
+### Contexte & objectif
+
+Bug report utilisateur : « passe la hauteur sous linteau à 2 m » sur
+une sélection de fenêtres (sill=1.0, head=2.2, family `opening_height=1.2`)
+a produit head=2.0 ET sill=0.8 — Revit a recomputé l'allège pour
+préserver `opening_height = head − sill = 1.2`. Comportement attendu
+côté utilisateur : « il faut découpler les deux et créer un nouveau
+type si nécessaire. je pensais que ce comportement était acquis ».
+
+Diagnostic : sessions 5 + b livraient un canal *réactif* (drift_note
+post-mortem dans `tool_result`) mais aucun pré-flight *préemptif* — le
+LLM voyait le drift après que la mutation avait déjà eu lieu, et en
+pratique ne corrigeait pas systématiquement (et même s'il le faisait,
+l'utilisateur avait déjà subi la mutation parasite). La donnée pour
+prédire était pourtant *déjà dans le KG* (`FamilyType.dimensions.height_m`
+peuplé par `_family_type_to_attrs` au rescan, session 4).
+
+L'invariant KG = Revit *post-mutation* tient grâce à la discipline
+read-back. Mais l'invariant utilisateur = Revit *post-mutation* nécessite
+en plus un pré-flight qui empêche les mutations parasites de se
+produire. C'est cette deuxième couche qui manquait.
+
+### Décisions
+
+1. **Auto-découple par défaut (option A retenue après échange UX).**
+   `set_sill_height` / `set_head_height` (+ `_many`) préservent par
+   défaut l'autre dimension. Le pré-flight bascule sur un variant de
+   type compatible si la cible diverge de la `opening_height` familiale.
+   Escape hatch : `preserve_head=False` / `preserve_sill=False`.
+
+2. **Recherche-puis-création (idempotence).** Avant de créer un
+   variant, le helper `_find_compatible_variant` cherche dans le KG un
+   FamilyType de la même famille + catégorie dont
+   `dimensions.height_m` matche la cible (`5e-4 m` près). Si trouvé,
+   swap vers lui. Sinon, création + swap. **N appels successifs avec
+   la même cible réutilisent le même variant** — pas d'explosion du
+   browser Revit.
+
+3. **Convention de nommage `<type> [auto h<NN>cm]`** (option choisie
+   par l'utilisateur). Marqueur `[auto]` rend le variant identifiable
+   dans le browser ; hauteur en cm pour la concision. Idempotent par
+   construction : pour une même cible, le nom est déterministe.
+
+4. **Fallback gracieux** quand `dimensions.height_m` est absent.
+   Familles non-paramétrées (ou dont le cascade `WINDOW_HEIGHT` /
+   `DOOR_HEIGHT` / `LookupParameter` a échoué au rescan) → pas de
+   prédiction possible → `decoupled=False`, Set direct, drift signalé
+   au post-mortem comme avant. Pas de blocage, pas d'exception.
+
+5. **Helpers privés extraits** plutôt que d'appeler les tools via
+   dispatch. `_create_type_variant_internal` et `_swap_to_type_internal`
+   peuvent être appelés depuis l'intérieur d'une transaction Revit
+   ouverte par le setter, alors que les tools `openings_create_type_variant`
+   et `openings_set_type` ouvrent leur propre transaction (incompatible
+   avec une Tx en cours). Pas de duplication de logique — les tools
+   originaux délèguent aussi aux helpers (à terme).
+
+6. **Compteurs agrégés dans les `_many`** : `decoupled_count` et
+   `auto_variants_created` dans la réponse en plus de
+   `bulk_setter_summary`. Le LLM voit en un coup d'œil que sur 20
+   fenêtres, 20 ont été découplées et 1 seul variant créé (les 19
+   autres l'ont réutilisé).
+
+7. **`set_type` (solo + many) volontairement non touchés.** Ces tools
+   ont une sémantique propre — l'utilisateur les utilise quand il veut
+   *explicitement* changer de type, et la question du découple ne se
+   pose pas (c'est ce qu'il fait, par définition).
+
+8. **Stratégie drift confirmée** (cf. réponse au cours de la session
+   b) : tolerance + early exit + zero-token-for-clean + no-re-echo
+   restent les leviers. L'auto-découple ne *remplace* pas la discipline
+   read-back, il l'augmente d'une couche préemptive — la défense reste
+   en profondeur.
+
+### Phase 1 — Helpers privés (lib/tools/openings.py)
+
+Ajoutés (~200 lignes) après `_DRIFT_EPSILON_M`, avant les setters
+solo :
+
+- **`_create_type_variant_internal(kg, doc, *, source_type_ref, new_name,
+  opening_height_m, opening_width_m=None) -> str`** : duplication
+  KG / Revit, write opening_height via la cascade
+  `rp.opening_set_height`, lecture post-Set des dimensions, retour du
+  nouveau llm_id. Aucune `rp.transaction` ouverte ici — le caller est
+  *déjà* dans la sienne.
+
+- **`_find_compatible_variant(kg, *, source_type_ref,
+  target_opening_height_m) -> Optional[str]`** : itère
+  `kg.find_by_type("FamilyType")`, filtre par `family_name` +
+  `category`, compare `dimensions.height_m` à la cible (tolérance
+  `_DRIFT_EPSILON_M`). O(N) sur le nombre de FamilyType — typiquement
+  <50, donc négligeable.
+
+- **`_variant_name(source_type_name, opening_height_m) -> str`** :
+  format `<src> [auto h<NN>cm]`. `round(h*100)` pour les centimètres.
+
+- **`_swap_to_type_internal(kg, doc, llm_id, new_family_type_ref) -> Dict`** :
+  swap `Symbol` + reroute edge `is_type` + lecture sill/head post-swap.
+  Symétrie KG-only / Revit.
+
+- **`_maybe_decouple(kg, doc, llm_id, *, new_head_m=None,
+  new_sill_m=None) -> Dict`** : orchestre les 4 helpers ci-dessus.
+  Renvoie `{decoupled, new_type_ref, auto_variant_created}`. Validation :
+  exactement un de `new_head_m` / `new_sill_m` doit être fourni.
+
+### Phase 2 — Patch des 4 setters
+
+Modifications minimales par tool :
+
+- **Signature** : ajout du flag `preserve_head=True` /
+  `preserve_sill=True` (défaut auto-découple).
+- **Corps** : appel à `_maybe_decouple` *avant* le path KG-only ou Revit
+  quand le flag est True. Re-lecture de `node` après swap potentiel
+  (sill/head ont pu changer post-swap, l'écriture explicite qui suit
+  réaligne le param visé).
+- **Retour** : merge de `decouple_info` (`decoupled`, `new_type_ref`,
+  `auto_variant_created`) dans le dict de réponse via `**decouple_info`.
+- **Docstring** : section dédiée « Auto-découple sill ↔ head », mention
+  de l'escape hatch.
+
+`_many` variants : compteurs agrégés (`decoupled_count`,
+`auto_variants_created`) ajoutés post-`bulk_setter_summary`.
+
+### Phase 3 — Tests (+8)
+
+`tests/test_tools.py` :
+
+- Fixture dédiée `kg_with_window_with_rigid_type` : 2 fenêtres + 1
+  FamilyType avec `dimensions.height_m=1.2` (= contrainte familiale
+  rigide). État initial cohérent : sill=1.0, head=2.2.
+- **`test_set_head_height_auto_decouples_creates_variant`** : cible
+  head=2.0 → target_opening=1.0 ≠ 1.2 → découple, variant créé,
+  sill préservé à 1.0.
+- **`test_set_sill_height_auto_decouples_creates_variant`** : symétrique
+  côté sill.
+- **`test_set_head_height_reuses_existing_variant`** : 2 appels
+  successifs sur sibling, le second réutilise (auto_variant_created=False).
+- **`test_set_head_height_no_decouple_when_target_matches_family`** :
+  no-op réel (cible=état courant) → pas de découple.
+- **`test_set_head_height_no_decouple_when_family_has_no_dimensions`** :
+  FamilyType sans dimensions → fallback legacy.
+- **`test_set_head_height_preserve_sill_false_bypasses`** : escape
+  hatch.
+- **`test_set_head_height_many_aggregates_decouple_counters`** : 3
+  fenêtres, decoupled_count=3, auto_variants_created=1 (1 créé,
+  2 réutilisés).
+- **`test_set_sill_height_many_preserve_head_false`** : escape hatch
+  côté `_many`.
+
+### Validation
+
+- `pytest -q` (suite complète) : **269 verts en 8.46s** (261 → +8).
+- Aucune régression sur les 261 tests existants.
+- Validation runtime Revit : non tentée ce tour (la mécanique est
+  unit-testable end-to-end côté KG, les helpers Revit-side sont des
+  re-uses des chemins éprouvés `Duplicate` + `Symbol assignment` des
+  sessions 4 / b). À couvrir à la prochaine session Revit avec
+  exactement le scénario rapporté par l'utilisateur (« head=2m sur
+  fenêtres sélectionnées »).
+
+### Couverture du bug rapporté
+
+Avant : `set_head_height(w, 2.0)` sur fenêtre sill=1.0 head=2.2 avec
+family h=1.2 → Revit committe sill=0.8 head=2.0 (recompute parasite).
+KG mirror la réalité (session 5 read-back), `drift_note` posée — mais
+l'utilisateur subit la mutation.
+
+Après : même appel → pré-flight calcule target_opening=1.0, détecte
+divergence avec family.h=1.2, cherche un variant compatible, n'en
+trouve pas, crée `<src> [auto h100cm]` avec opening_height=1.0,
+swap, *puis* setter le head=2.0. Résultat Revit : sill=1.0 (préservé)
++ head=2.0. Réponse au LLM signale `decoupled=True,
+auto_variant_created=True, new_type_ref=<id>` → l'utilisateur voit
+explicitement qu'un variant a été créé.
+
+### État final & reste à faire
+
+**Acquis session c** :
+- 4 setters d'openings auto-découplent par défaut ✓
+- Helpers privés réutilisables (`_create_type_variant_internal`,
+  `_find_compatible_variant`, `_swap_to_type_internal`,
+  `_maybe_decouple`) ✓
+- Idempotence (variants réutilisés entre appels) ✓
+- Convention `<type> [auto h<NN>cm]` ✓
+- Escape hatch documenté ✓
+- 8 tests KG-only, baseline **269 verts** ✓
+- Bug utilisateur (head=2m → sill=0.8 parasite) **réglé** ✓
+
+**Dettes ouvertes héritage** :
+- Filter-based bulks reporté à `tools/bulk.py` Sem.4-5.
+- Drift utilisateur hors pipeline (events `DocumentChanged`).
+- `boundary_walls` Rooms reporté pour compliance V1.
+
+**Nouvelles considérations** :
+
+1. **Pollution du browser Revit** sur le long terme. Même avec
+   idempotence, un projet où l'utilisateur change souvent les
+   sill/head finit par accumuler des variants `[auto h<NN>cm]`. Pas
+   un blocker (les variants restent groupés par famille, lisibles),
+   mais un nettoyage périodique peut s'avérer utile. Tool potentiel :
+   `openings_purge_unused_variants` qui supprime les FamilyType avec
+   préfixe `[auto]` qui n'ont plus d'instance les utilisant. Reporté.
+
+2. **Test live `head=2m sur 20 fenêtres mixtes`** : à reproduire avec
+   l'auto-découple actif. Attendu : ~3 round-trips (1 catalog + 1 set
+   par catégorie de type unique) au lieu de ~44 (session 5
+   pré-setters_many) ou ~6 (session b sans auto-découple). Critère
+   d'acceptation : sill préservé sur les 20, autant de variants
+   `[auto h100cm]` créés que de familles distinctes dans la sélection.
+
+3. **Ne couvre PAS le cas Top Constraint sur les murs** — analogue
+   au sill/head : Top Constraint sur un mur fige la hauteur ; un
+   `set_height` sur ce mur va dériver. La discipline read-back +
+   drift_note l'attrape post-mortem, mais aucune auto-correction
+   préemptive. À traiter si le cas devient courant — note pour le
+   futur.
+
+**Suite immédiate (§9 V0 Sem.4-5)** : inchangée — `dwg_reader.py` +
+`tools/bulk.py`. La dette session 5 est désormais réglée tant en
+*couverture bulk* (session b) qu'en *prévention drift* (session c).
+
+---
+
 ## 2026-05-12 (session b) — Setters multi-objets (dette 4 session 5)
 
 ### Contexte & objectif
