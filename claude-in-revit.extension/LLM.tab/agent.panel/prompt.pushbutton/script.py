@@ -597,7 +597,28 @@ def _main():
 try:
     _main()
 except BaseException as exc:  # noqa: BLE001 — surface everything to the UI.
-    _show_error(
-        "Prompt failed",
-        "{}: {}\n\n{}".format(type(exc).__name__, exc, traceback.format_exc()),
-    )
+    # Diagnostic ciblé pour `overloaded_error` Anthropic 529 (serveurs
+    # saturés). Différent du crash code Python — le user doit savoir
+    # que c'est un problème serveur Anthropic transient, pas un bug
+    # de l'agent. Message court + suggestion de retry.
+    status_code = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None) or {}
+    error_obj = body.get("error", {}) if isinstance(body, dict) else {}
+    error_type = error_obj.get("type") if isinstance(error_obj, dict) else None
+
+    if status_code == 529 or error_type == "overloaded_error":
+        _show_error(
+            "Anthropic saturé — réessayer",
+            "Les serveurs Anthropic sont en surcharge (`overloaded_error` "
+            "529) malgré les retries automatiques (~3 min cumulés). "
+            "C'est un pic côté Anthropic, pas un bug de l'agent.\n\n"
+            "L'historique de conversation n'a PAS été modifié (le tour "
+            "n'a pas eu lieu). Tu peux relancer le pushbutton dans "
+            "quelques minutes — le pic se résorbera.\n\n"
+            "Statut Anthropic en direct : https://status.anthropic.com",
+        )
+    else:
+        _show_error(
+            "Prompt failed",
+            "{}: {}\n\n{}".format(type(exc).__name__, exc, traceback.format_exc()),
+        )

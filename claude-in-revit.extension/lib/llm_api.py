@@ -16,11 +16,72 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import anthropic
+
+
+# ----- Retry policy for Anthropic transient errors --------------------------
+#
+# Le SDK Anthropic a son propre retry exponentiel intégré (configuré via
+# `max_retries=` sur le constructeur). Il couvre 408/409/429/5xx avec
+# backoff 2^n secondes. Mais pour les pics de saturation prolongés
+# (`overloaded_error` 529, observé 2026-05-12 sur demande de suppression
+# en masse), les 30s de backoff cumulé du SDK ne suffisent pas toujours.
+#
+# Cette couche additionnelle wrappe `client.messages.create` avec un
+# retry SUPPLÉMENTAIRE plus tolérant : si le SDK épuise ses retries
+# avec une erreur transient (529 / 503 / 504), on attend 30s et on
+# retente, jusqu'à `MAX_OUTER_RETRIES`. Total max ~3 min d'attente.
+
+MAX_OUTER_RETRIES = 4
+OUTER_RETRY_SLEEP_S = 30.0
+
+# Exceptions Anthropic considérées comme transient (= retryable au niveau
+# outer). Tout le reste (BadRequest, AuthError, etc.) remonte tel quel.
+_TRANSIENT_STATUS = (408, 429, 500, 502, 503, 504, 529)
+
+
+def _is_transient_anthropic_error(exc: BaseException) -> bool:
+    """True iff `exc` est une erreur Anthropic réseau/serveur transient
+    (overloaded, rate limit, gateway, etc.). Ces erreurs valent la peine
+    d'être retentées après un délai."""
+    # APIStatusError porte un status_code numérique.
+    status = getattr(exc, "status_code", None)
+    if status is not None and status in _TRANSIENT_STATUS:
+        return True
+    # Connection / timeout errors du SDK = retryables.
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+        return True
+    return False
+
+
+def _create_with_outer_retry(client, **kwargs):
+    """Wrappe `client.messages.create(**kwargs)` avec un retry outer
+    pour les erreurs Anthropic transient qui auraient épuisé le retry
+    interne du SDK. Backoff fixe `OUTER_RETRY_SLEEP_S` entre tentatives
+    (pas exponentiel — le SDK a déjà fait son backoff exponentiel
+    interne, on attend juste plus longtemps).
+
+    Lève la dernière exception si toutes les tentatives échouent.
+    """
+    last_exc = None
+    for attempt in range(MAX_OUTER_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            if not _is_transient_anthropic_error(exc):
+                raise
+            last_exc = exc
+            if attempt < MAX_OUTER_RETRIES - 1:
+                time.sleep(OUTER_RETRY_SLEEP_S)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
 
 from . import config
 from .llm_protocol import dispatch_tool_use, tools_as_anthropic_payload
@@ -497,7 +558,8 @@ class LLMClient:
         response = None
         try:
             for _ in range(self.max_iterations):
-                response = self.client.messages.create(
+                response = _create_with_outer_retry(
+                    self.client,
                     model=self.model,
                     max_tokens=self.max_tokens,
                     system=system_blocks,
