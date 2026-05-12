@@ -397,9 +397,20 @@ class LLMClient:
         effort: Optional[str] = DEFAULT_EFFORT,
         max_iterations: int = 16,
         api_key: Optional[str] = None,
+        max_retries: int = 6,
     ) -> None:
         resolved_key = api_key if api_key is not None else config.get_api_key()
-        self.client = anthropic.Anthropic(api_key=resolved_key)
+        # `max_retries` est le nombre de retries internes du SDK Anthropic
+        # avec backoff exponentiel. Défaut SDK = 2 (rapidement épuisé sur
+        # une période de saturation `overloaded_error` 529 — observé en
+        # runtime 2026-05-12). On monte à 6 → couvre ~30s de backoff
+        # cumulé (2, 4, 8, 16, 32s), suffisant pour la plupart des pics.
+        # Le SDK retry sur : 408, 409, 429, 5xx (529 inclus). Pas sur
+        # les erreurs client genre 400 (BadRequest, qu'on traite ailleurs
+        # via sanitize_history).
+        self.client = anthropic.Anthropic(
+            api_key=resolved_key, max_retries=max_retries,
+        )
         self.model = model
         self.max_tokens = max_tokens
         self.thinking = thinking
