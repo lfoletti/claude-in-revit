@@ -14,6 +14,182 @@
 
 ---
 
+## 2026-05-12 (session i) — Validation runtime UC1 DWG : routing tier-2, centerline fallback, delete_many
+
+### Contexte & objectif
+
+Suite directe de session h. Test 6 de validation runtime : ingest
+DWG/DXF sur un fichier `.dxf` réel (`Projet4 - Plan d'étage - Niveau 0.dxf`).
+4 issues remontées en cascade, toutes adressées.
+
+### Issue 1 : routing tier-2 inexistant → tools dwg_* invisibles au LLM
+
+Les tools `dwg_inspect`, `dwg_classify`, `dwg_import_walls` sont déclarés
+`tier=2`. Le pushbutton appelait `run_turn(tier_max=1)` en dur — le LLM
+ne voyait jamais ces tools. Premier prompt utilisateur : « je n'ai pas
+d'outil pour lire des fichiers ». Dette d'infrastructure : DESIGN
+prévoyait un `routing.py` avec `ROUTING_RULES`, jamais implémenté.
+
+**Fix minimal** : helper `preprocess.infer_tier_max(prompt)` qui détecte
+les keywords DWG/DXF via regex. `prompt.pushbutton/script.py` calcule
+`tier_max` dynamiquement à partir du prompt avant `run_turn`. Couvre
+les phrases « importe dxf », « inspecte dwg », « ingest plan cad », etc.
+
+À étendre quand d'autres domaines tier-2 arrivent (compliance UC8,
+vision UC6). Pour V0 c'est la solution minimale.
+
+### Issue 2 : bytecode .pyc cached bloquait les fixes hot-reload
+
+`AttributeError: module 'lib.preprocess' has no attribute 'infer_tier_max'`
+au prochain test. Le fichier `.pyc` cached était postérieur à mes
+modifs (race entre pushbutton click et save). Python ne recompilait pas.
+
+**Fix** : purge manuelle de `__pycache__/preprocess.cpython-312.pyc`.
+Note pour la suite : pyRevit / CPython embarqué peut garder du
+bytecode stale. Si une modif n'est pas reflétée au prochain click,
+purger `__pycache__` en premier réflexe.
+
+### Issue 3 : `dwg_classify` preview "20 of 29" → LLM reconstitue 9 murs manuels
+
+Le tool tronquait le preview de walls à 20 et émettait :
+```
+"walls_truncated": true,
+"note": "Preview limited to 20 walls of 29. Apply via dwg_import_walls to commit all."
+```
+
+Le LLM a interprété « 20 of 29 » comme **« il en manque 9 »** au lieu
+de « le preview est tronqué mais l'import en commit 29 ». Du coup :
+1. Il a appelé `dwg_import_walls` → 29 murs créés correctement.
+2. Il a vu une « différence » de 9 et a tenté de reconstruire les 9
+   manquants via `walls_create_many` en extrapolant depuis le pattern.
+3. Résultat : **38 murs avec 9 doublons sur les fenêtres**. Revit
+   signale 9 avertissements « se chevauchent ».
+
+**Fix** :
+- `preview_limit=100` (au lieu de 20). La plupart des plans tiennent
+  sans troncature. Sur ton DXF (29 walls), pas de troncature du tout.
+- Au-delà de 100, note explicite : « **`dwg_import_walls` créera la
+  totalité (N), PAS seulement les 100 affichés ici. Ne reconstitue
+  PAS les murs manquants manuellement** ».
+
+C'est un **bug d'UX du tool**, pas du LLM. Lesson : tout message qui
+peut être lu de deux façons sera lu de la mauvaise.
+
+### Issue 4 : cloisons internes en simple-trait → fallback centerline (UC1 Phase 3)
+
+Après import + cleanup des doublons, l'enveloppe 10×20m apparaît mais
+**aucune cloison intérieure** n'est créée. Inspection du DXF : 4
+segments orphelins à x=3.70m, fragmentés par 3 portes (gaps de
+0.20m), longueur totale 14.79m. Une **cloison interne en simple-trait**
+(centerline only, pas de paire) — convention courante pour les
+cloisons légères.
+
+Notre pair-detection ne peut pas les détecter (il manque la 2e face).
+C'était identifié comme Phase 3 du roadmap UC1 dans la note d'intention.
+
+**Fix livré** (`lib/dwg_classifier.py`) :
+- **`_merge_collinear_segments(segments, max_gap_m=0.20)`** : groupe les
+  segments par droite portante (clé `(angle_bin, perp_signed_from_origin)`),
+  fusionne ceux qui se chevauchent ou ont un gap ≤ `max_gap_m`.
+  Absorbe les portes intérieures qui interrompent une cloison continue.
+- **`detect_centerline_walls(orphans, thickness_m=0.10, min_length_m=0.5)`** :
+  fusion collinéaire des orphelins + filtrage par longueur min
+  (exclut les épaulements de fenêtres). Synthétise des WallCandidate
+  avec `confidence=0.6` (inférence partielle).
+- **`_segment_in_shadow_of_pair`** : filtre anti-doublon. Rejette les
+  centerline candidates qui sont quasi-parallèles à un pair-wall
+  existant, perp distance < 0.30m, ET overlap projeté ≥ 0.80. Évite
+  de re-créer des doublons aux endroits où la pair detection a déjà
+  capté un mur. `overlap_threshold=0.80` (pas 0.30) : avec un seuil
+  bas, on filtrait à tort la vraie cloison qui chevauche partiellement
+  un mur intérieur fragmenté.
+
+**Flags propagés** dans `dwg_classify` + `dwg_import_walls` :
+`include_centerline`, `centerline_thickness_m`, `centerline_min_length_m`,
+`centerline_max_gap_m`. Tous on par défaut (cas d'usage standard).
+
+**Validation runtime** : sur le Projet4 DXF :
+- Avant fix : 29 paires + 124 rejected. La cloison à x=3.70 dans les
+  rejected.
+- Après fix : 29 paires + 3 centerlines = 32 walls. Centerlines : la
+  vraie cloison de 14.79m + 2 trumeaux de 1.20m entre fenêtres sur
+  les façades Est/Ouest. Pas de doublon.
+
+### Issue 5 (la plus critique) : suppression en masse manquante
+
+Pendant que je travaillais sur le centerline, le user a tenté un
+cleanup global du projet (98 walls + 100+ openings) sans tools
+`*_delete_many`. Résultat : **~200 round-trips API** (un
+`walls_delete` par mur, un `openings_delete` par ouverture).
+215K input tokens, $$$. Demande critique consignée : « la suppression
+en masse doit absolument être implémentée ».
+
+**Fix livré** :
+- **`walls_delete_many(items)`** dans `lib/tools/walls.py`.
+- **`openings_delete_many(items)`** dans `lib/tools/openings.py`.
+- **`rooms_delete_many(items)`** dans `lib/tools/rooms.py`.
+
+Caractéristiques communes :
+- **Items polymorphes** : accepte `["wall_001", "wall_002"]` (strings
+  bruts) OU `[{"llm_id": "wall_001"}, ...]` (dicts). Le LLM oscille
+  entre ces deux formats selon contexte ; `_validate_delete_item`
+  tolère les deux.
+- **Tolérance aux ElementId périmés** : si `doc.GetElement(eid)`
+  retourne None (orphelin), soft-delete KG seulement sans crash.
+  Signale `revit_already_gone: [llm_id]` dans le payload.
+- **Tolérance aux refus Revit** (exceptions sur `doc.Delete`) :
+  soft-delete KG quand même, signale dans `revit_already_gone`.
+- Réponse compacte : `{count, deleted_revit, deleted_kg_only,
+  revit_already_gone, deleted_at_turn, revit_modified}`.
+
+`bulk_apply_to_filter` peut désormais router vers ces tools :
+```
+bulk_apply_to_filter(
+    filter={"type": "Wall"},
+    target_tool="walls_delete_many",
+    tool_args={},
+)
+```
+
+**Gain attendu** : ~200 round-trips → 2-3 (un delete_many par catégorie,
+ou un bulk_apply_to_filter par filtre).
+
+### Validation
+
+- `pytest -q` : **348 verts** (342 → +6 nouveaux + 1 fixé). Aucune
+  régression.
+- Test centerline runtime sur Projet4 DXF : 32 walls détectés incluant
+  la cloison interne. Reste à valider l'import effectif dans Revit
+  (commit puis user relance).
+- Test delete_many runtime : à valider quand user reprend.
+
+### Dettes ouvertes
+
+- **Routing tier-2 propre** : `preprocess.infer_tier_max` est une
+  solution minimale par regex. Quand d'autres domaines tier-2 arrivent
+  (compliance, vision), il faudra factoriser dans un vrai `routing.py`
+  avec `ROUTING_RULES` map keyword→liste tools.
+- **Helper `get_element_or_raise`** non étendu aux walls/columns
+  (toujours, dette session g). Avec `walls_delete_many` qui maintenant
+  fait le check None manuellement et tolère, ce n'est plus critique
+  pour `_delete`. Mais setters / movers walls/columns restent
+  exposés au crash NoneType.
+- **Test runtime delete_many** non lancé (user a déjà cleané via le
+  vieux pattern ~200 calls).
+- **Test runtime ré-import DXF avec centerline** : à venir.
+
+### Bonus : .pyc stale gotcha
+
+À ajouter dans CLAUDE.md gotchas CPython : **si une modif Python
+n'est pas reflétée au prochain pushbutton click malgré le hot-reload
+(« nouveau process à chaque click »)**, vérifier
+`<extension>/lib/__pycache__/` et purger le `.pyc` du module modifié.
+Cas observé en session i : `preprocess.cpython-312.pyc` cached
+post-modif via une race condition save/click → AttributeError au next
+import. CPython ne recompile pas si le `.pyc` mtime ≥ `.py` mtime.
+
+---
+
 ## 2026-05-12 (session h) — Validation runtime suite : purge, bulk filter, fix nommage variants
 
 ### Contexte & objectif

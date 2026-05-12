@@ -288,15 +288,38 @@ def test_classify_with_mapping_yields_4_walls(tmp_path):
 
 
 def test_classify_ignores_layers_not_mapped_as_wall(tmp_path):
-    """Layers en dehors du mapping wall sont silencieusement ignorés."""
+    """Layers en dehors du mapping wall sont silencieusement ignorés.
+
+    Test exécuté avec `include_centerline=False` pour garder la
+    sémantique d'origine — la nouvelle passe centerline (session i)
+    convertirait l'orpheline de 1m en mur, ce qui est correct dans
+    le flow général mais brouillerait l'assertion ici."""
     path = _make_rectangle_room_dxf(tmp_path, extras=True)
     entities, _ = dwg_reader.parse(path)
     # On NE map PAS FURNITURE → ses lignes ignorées.
-    result = dwg_classifier.classify(entities, {"WALL": "wall"})
+    result = dwg_classifier.classify(
+        entities, {"WALL": "wall"}, include_centerline=False,
+    )
     # 8 lignes paires + 1 orpheline = 4 walls + 1 rejected sur WALL.
     assert len(result.walls) == 4
     assert len(result.rejected) == 1
     assert result.rejected[0]["layer"] == "WALL"
+
+
+def test_classify_centerline_fallback_picks_up_orphan(tmp_path):
+    """Avec include_centerline=True (défaut), l'orpheline de 1m
+    devient un mur centerline (thickness 0.10m)."""
+    path = _make_rectangle_room_dxf(tmp_path, extras=True)
+    entities, _ = dwg_reader.parse(path)
+    result = dwg_classifier.classify(entities, {"WALL": "wall"})
+    # 4 pairs + 1 centerline = 5 walls.
+    assert len(result.walls) == 5
+    pair_walls = [w for w in result.walls if w.confidence > 0.9]
+    center_walls = [w for w in result.walls if w.confidence < 0.9]
+    assert len(pair_walls) == 4
+    assert len(center_walls) == 1
+    assert center_walls[0].thickness == 0.10
+    assert result.centerline_walls_count == 1
 
 
 # ----- tools/dwg_import : inspect / classify / import_walls ------------

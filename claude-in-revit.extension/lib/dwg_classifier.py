@@ -347,6 +347,220 @@ def detect_wall_segments(
     return walls, rejected
 
 
+# ----- Centerline fallback (Phase 3 UC1, 2026-05-12) -----------------------
+#
+# Pour les DXF d'archi schématiques où certaines cloisons sont
+# dessinées en **simple-trait** (une seule ligne représentant l'axe du
+# mur, pas 2 lignes parallèles encadrant l'épaisseur). Convention
+# courante pour les cloisons légères dans les plans Suisse/FR.
+#
+# Stratégie en 2 étapes après le pair detection :
+#  1. **Merge collinéaire** : grouper les segments orphelins par
+#     droite portante, fusionner ceux qui sont collinéaires +
+#     adjacents avec un gap ≤ `max_gap_m` (typique : 0.20 m pour
+#     absorber les portes intérieures qui interrompent la cloison).
+#  2. **Filtrage par longueur** : ne retenir que les fusions ≥
+#     `min_length_m` (typique : 0.5 m pour exclure les épaulements
+#     de fenêtres et les petits artefacts).
+#  3. Chaque fusion devient un `WallCandidate` avec une `thickness`
+#     par défaut (typique : 0.10 m pour cloison standard).
+
+
+def _line_portante_key(s: Segment, angle_tol_rad: float) -> Tuple[float, float]:
+    """Clé de hash approximative pour identifier la droite portant un segment.
+
+    Renvoie `(angle_normalisé_arrondi, perpendiculaire_signée)`. Deux
+    segments collinéaires (même droite) tombent dans la même clé, à la
+    tolérance d'angle/distance près.
+
+    Pour le bucket d'angle : on arrondi à la granularité `angle_tol_rad`
+    en degrés pour grouper sans drift cumulé. Pour la perpendiculaire :
+    on calcule la distance signée de l'origine (0,0) à la droite, ce
+    qui est invariant le long de la droite.
+    """
+    a = _segment_angle_normalized(s)
+    a_bin = round(a / max(angle_tol_rad, 1e-9))
+    # Distance signée de (0,0) à la droite portant `s`.
+    dx = s.p2[0] - s.p1[0]
+    dy = s.p2[1] - s.p1[1]
+    norm = math.sqrt(dx * dx + dy * dy)
+    if norm < 1e-12:
+        return (a_bin, 0.0)
+    nx = -dy / norm
+    ny = dx / norm
+    perp = s.p1[0] * nx + s.p1[1] * ny
+    # Arrondi à 1 mm pour absorber le bruit numérique sans coller des
+    # cloisons proches mais distinctes.
+    return (a_bin, round(perp, 3))
+
+
+def _merge_collinear_segments(
+    segments: List[Segment],
+    *,
+    max_gap_m: float = 0.20,
+    angle_tol_rad: float = math.radians(2.0),
+) -> List[Segment]:
+    """Fusionne les segments collinéaires + adjacents (gap ≤ `max_gap_m`).
+
+    Pour chaque groupe de segments sur la même droite (clé via
+    `_line_portante_key`), on les projette sur la droite, on trie par
+    position de projection, puis on fusionne les intervalles qui se
+    chevauchent ou sont séparés par un gap ≤ `max_gap_m`. Cas typique :
+    une cloison de 10 m interrompue par 3 portes de 0.20 m est
+    représentée par 4 segments. Avec `max_gap_m=0.20`, ils fusionnent
+    en un seul segment de 10 m. Avec `max_gap_m=0.0`, seuls les
+    segments contigus exact ou chevauchants fusionnent.
+
+    Layer préservé : on ne fusionne que des segments du même layer.
+
+    Renvoie la nouvelle liste de segments fusionnés (peut être plus
+    courte que l'entrée). Les segments isolés (pas de voisin
+    collinéaire) sont renvoyés tels quels.
+    """
+    if not segments:
+        return []
+    by_key: Dict[Tuple[float, float, str], List[Tuple[int, Segment]]] = {}
+    for i, s in enumerate(segments):
+        a_bin, perp = _line_portante_key(s, angle_tol_rad)
+        by_key.setdefault((a_bin, perp, s.layer), []).append((i, s))
+
+    merged: List[Segment] = []
+    for (_, _, layer), group in by_key.items():
+        if len(group) == 1:
+            merged.append(group[0][1])
+            continue
+        # Projette chaque segment sur sa droite portante (référence =
+        # le premier du groupe), trie par t_min.
+        ref = group[0][1]
+        intervals: List[Tuple[float, float, Tuple[float, float], Tuple[float, float]]] = []
+        for _, s in group:
+            t1 = _project_to_line(s.p1, ref)
+            t2 = _project_to_line(s.p2, ref)
+            if t1 <= t2:
+                intervals.append((t1, t2, s.p1, s.p2))
+            else:
+                intervals.append((t2, t1, s.p2, s.p1))
+        intervals.sort(key=lambda x: x[0])
+
+        # Fusion gloutonne des intervalles avec gap ≤ max_gap_m.
+        cur_lo, cur_hi = intervals[0][0], intervals[0][1]
+        cur_a = intervals[0][2]
+        cur_b = intervals[0][3]
+        for lo, hi, a, b in intervals[1:]:
+            if lo - cur_hi <= max_gap_m:
+                # Extend.
+                if hi > cur_hi:
+                    cur_hi = hi
+                    cur_b = b
+            else:
+                merged.append(Segment(p1=cur_a, p2=cur_b, layer=layer))
+                cur_lo, cur_hi = lo, hi
+                cur_a, cur_b = a, b
+        merged.append(Segment(p1=cur_a, p2=cur_b, layer=layer))
+    return merged
+
+
+def _segment_in_shadow_of_pair(
+    candidate: Segment,
+    pair_walls: List[WallCandidate],
+    *,
+    angle_tol_rad: float = math.radians(2.0),
+    exclusion_distance_m: float = 0.30,
+    overlap_threshold: float = 0.80,
+) -> bool:
+    """True si `candidate` se trouve dans l'« ombre » d'un wall détecté
+    en paire : quasi-parallèle, perp distance courte, overlap projeté
+    significatif. Évite que le fallback centerline ne re-crée des
+    doublons des murs extérieurs déjà identifiés."""
+    cand_angle = _segment_angle_normalized(candidate)
+    cand_midpoint = (
+        (candidate.p1[0] + candidate.p2[0]) / 2.0,
+        (candidate.p1[1] + candidate.p2[1]) / 2.0,
+    )
+    for w in pair_walls:
+        pair_seg = Segment(p1=w.p1, p2=w.p2, layer=w.layer)
+        pair_angle = _segment_angle_normalized(pair_seg)
+        if not _angle_close(cand_angle, pair_angle, angle_tol_rad):
+            continue
+        d_mid = _perp_distance(pair_seg, cand_midpoint)
+        if d_mid > exclusion_distance_m:
+            continue
+        _, ratio = _overlap_along_reference(pair_seg, candidate)
+        if ratio >= overlap_threshold:
+            return True
+    return False
+
+
+def detect_centerline_walls(
+    orphan_segments: List[Segment],
+    *,
+    thickness_m: float = 0.10,
+    min_length_m: float = 0.5,
+    max_gap_m: float = 0.20,
+    angle_tol_rad: float = math.radians(2.0),
+    pair_walls: Optional[List[WallCandidate]] = None,
+    exclusion_distance_m: float = 0.30,
+) -> Tuple[List[WallCandidate], List[Dict[str, Any]]]:
+    """Détection fallback : segments orphelins traités comme centerlines.
+
+    Étapes :
+    1. Fusion collinéaire (`_merge_collinear_segments`) pour réunir
+       les fragments séparés par des portes / ouvertures de largeur
+       ≤ `max_gap_m`.
+    2. Filtrage longueur : ≥ `min_length_m` (exclut épaulements de
+       fenêtres et autres artefacts courts).
+    3. **Filtre anti-doublon** (si `pair_walls` fourni) : rejette les
+       fusions qui sont dans l'ombre d'un wall pair-detected — évite
+       le bug observé sur DXF de session i (faux centerlines sur les
+       façades en plus des paires).
+    4. Conversion en `WallCandidate` (`thickness = thickness_m`).
+
+    Renvoie `(walls, rejected)` symétrique à `detect_wall_segments`.
+    `confidence` à 0.6 par défaut (centerline = inférence partielle).
+    """
+    merged = _merge_collinear_segments(
+        orphan_segments,
+        max_gap_m=max_gap_m,
+        angle_tol_rad=angle_tol_rad,
+    )
+    walls: List[WallCandidate] = []
+    rejected: List[Dict[str, Any]] = []
+    for s in merged:
+        length = _segment_length(s)
+        if length < min_length_m:
+            rejected.append({
+                "layer": s.layer,
+                "p1": list(s.p1),
+                "p2": list(s.p2),
+                "length_m": round(length, 4),
+                "reason": "centerline below min_length_m ({} < {})".format(
+                    round(length, 3), min_length_m,
+                ),
+            })
+            continue
+        if pair_walls is not None and _segment_in_shadow_of_pair(
+            s, pair_walls,
+            angle_tol_rad=angle_tol_rad,
+            exclusion_distance_m=exclusion_distance_m,
+        ):
+            rejected.append({
+                "layer": s.layer,
+                "p1": list(s.p1),
+                "p2": list(s.p2),
+                "length_m": round(length, 4),
+                "reason": "centerline shadowed by existing pair wall",
+            })
+            continue
+        walls.append(WallCandidate(
+            p1=s.p1, p2=s.p2,
+            thickness=thickness_m,
+            layer=s.layer,
+            confidence=0.6,
+            source=(-1, -1),
+        ))
+    return walls, rejected
+
+
 # ----- High-level classification ----------------------------------------
 
 
@@ -355,6 +569,7 @@ class Classification:
     walls: List[WallCandidate] = field(default_factory=list)
     rejected: List[Dict[str, Any]] = field(default_factory=list)
     layer_mapping_used: Dict[str, str] = field(default_factory=dict)
+    centerline_walls_count: int = 0
 
 
 def classify(
@@ -365,6 +580,10 @@ def classify(
     max_thickness_m: float = 0.50,
     angle_tol_rad: float = math.radians(2.0),
     min_overlap_ratio: float = 0.5,
+    include_centerline: bool = True,
+    centerline_thickness_m: float = 0.10,
+    centerline_min_length_m: float = 0.5,
+    centerline_max_gap_m: float = 0.20,
 ) -> Classification:
     """Entrée publique : entités + mapping layer→rôle → Classification.
 
@@ -372,21 +591,61 @@ def classify(
     fourni par le caller (LLM ou utilisateur), typiquement issu de
     `dwg_inspect` après confirmation des suggestions heuristiques.
 
+    **Deux passes** :
+    1. **Pair detection** (`detect_wall_segments`) — paires de lignes
+       parallèles distantes de [min_thickness_m, max_thickness_m].
+       C'est la voie principale, haute confidence (~1.0).
+    2. **Centerline fallback** (`detect_centerline_walls`, optionnel,
+       `include_centerline=True` par défaut) — sur les segments
+       orphelins de la 1ère passe : fusionne les collinéaires
+       (absorbe les ouvertures ≤ `centerline_max_gap_m`), filtre par
+       longueur min, et synthétise un wall avec
+       `thickness = centerline_thickness_m`. Confidence 0.6 (moins
+       fiable qu'une vraie paire).
+
     Phase 1 V0 : seul le rôle `"wall"` est traité ; les autres rôles
-    (door, window) seront ajoutés en phase 2. Les layers absents du
-    mapping sont ignorés silencieusement.
+    (door, window) seront ajoutés en phase 2.
     """
     wall_layers = [name for name, role in layer_mapping.items() if role == "wall"]
     segments = extract_straight_segments(entities, layer_filter=wall_layers)
-    walls, rejected = detect_wall_segments(
+    pair_walls, pair_rejected = detect_wall_segments(
         segments,
         min_thickness_m=min_thickness_m,
         max_thickness_m=max_thickness_m,
         angle_tol_rad=angle_tol_rad,
         min_overlap_ratio=min_overlap_ratio,
     )
+
+    centerline_walls: List[WallCandidate] = []
+    final_rejected: List[Dict[str, Any]] = list(pair_rejected)
+
+    if include_centerline and pair_rejected:
+        # Reconstruit les segments orphelins (depuis `pair_rejected` qui
+        # porte les p1/p2/layer).
+        orphan_segments = [
+            Segment(
+                p1=(r["p1"][0], r["p1"][1]),
+                p2=(r["p2"][0], r["p2"][1]),
+                layer=r["layer"],
+            )
+            for r in pair_rejected
+        ]
+        centerline_walls, cl_rejected = detect_centerline_walls(
+            orphan_segments,
+            thickness_m=centerline_thickness_m,
+            min_length_m=centerline_min_length_m,
+            max_gap_m=centerline_max_gap_m,
+            angle_tol_rad=angle_tol_rad,
+            pair_walls=pair_walls,
+        )
+        # Les rejected du pair detection qui ont été repris en
+        # centerline ne sont plus rejected.
+        final_rejected = cl_rejected
+
+    all_walls = pair_walls + centerline_walls
     return Classification(
-        walls=walls,
-        rejected=rejected,
+        walls=all_walls,
+        rejected=final_rejected,
         layer_mapping_used=dict(layer_mapping),
+        centerline_walls_count=len(centerline_walls),
     )

@@ -110,15 +110,31 @@ def classify(
     scale_override: Optional[float] = None,
     min_thickness_m: float = 0.05,
     max_thickness_m: float = 0.50,
+    include_centerline: bool = True,
+    centerline_thickness_m: float = 0.10,
+    centerline_min_length_m: float = 0.5,
+    centerline_max_gap_m: float = 0.20,
 ) -> Dict[str, Any]:
-    """Applique un mapping layer → rôle + détecte les paires de lignes
-    parallèles → wall candidates. Read-only — ne crée rien dans Revit / KG.
+    """Applique un mapping layer → rôle + détecte les murs (paires parallèles
+    + fallback centerline). Read-only — ne crée rien dans Revit / KG.
 
     Le LLM appelle ce tool *après* `dwg_inspect` pour valider la qualité
     de la détection avant `dwg_import_walls`. Permet d'ajuster
-    `layer_mapping` ou les seuils d'épaisseur sans engager de mutation.
+    `layer_mapping` ou les seuils sans engager de mutation.
 
-    Concepts: dwg, dxf, classification, murs, paires, layer mapping
+    **Deux passes** :
+    1. **Pair detection** : paires de lignes parallèles dans
+       [min_thickness_m, max_thickness_m]. Confidence ~1.0.
+    2. **Centerline fallback** (`include_centerline=True` par défaut) :
+       sur les segments orphelins après la 1ère passe, fusionne les
+       collinéaires (absorbe ouvertures ≤ `centerline_max_gap_m`),
+       filtre par longueur min, synthétise des walls avec
+       `thickness = centerline_thickness_m`. Confidence 0.6 (inférence
+       partielle). Sans ça, les cloisons légères dessinées en
+       simple-trait ne sont pas importées.
+
+    Concepts: dwg, dxf, classification, murs, paires, centerline,
+              cloison, layer mapping
     Phrases: "preview les murs détectés", "classifie ce DXF",
              "combien de murs trouve-t-on", "essaie d'abord sans créer"
     Similar: dwg_inspect, dwg_import_walls
@@ -129,17 +145,24 @@ def classify(
             "ignore" | "text"}`. Layers absents ignorés. Seul "wall"
             est traité en V0 phase 1.
         scale_override: voir `dwg_inspect`.
-        min_thickness_m: distance perpendiculaire min pour une paire
-            (défaut 0.05 m).
-        max_thickness_m: distance max (défaut 0.50 m).
+        min_thickness_m: épaisseur min des paires (défaut 0.05 m).
+        max_thickness_m: épaisseur max (défaut 0.50 m).
+        include_centerline: défaut True. Active la passe centerline
+            pour récupérer les cloisons en simple-trait.
+        centerline_thickness_m: épaisseur attribuée aux walls
+            centerline (défaut 0.10 m — cloison standard FR/CH).
+        centerline_min_length_m: longueur min pour qu'un centerline
+            devienne mur (défaut 0.5 m — filtre les épaulements de
+            fenêtres et autres artefacts courts).
+        centerline_max_gap_m: gap max entre fragments collinéaires
+            à fusionner (défaut 0.20 m — absorbe les portes
+            intérieures qui interrompent une cloison continue).
 
     Returns:
-        {"ok": bool, "walls_count": int,
+        {"ok": bool, "walls_count": int, "centerline_walls_count": int,
          "walls": [{"p1", "p2", "thickness_m", "layer", "confidence"}, …],
          "rejected_count": int,
          "rejected_summary": [{"layer", "count", "sample_reason"}, …]}
-        `walls` enuméré sous `preview_limit=20` ; au-delà tronqué avec
-        first/last pour rester compact.
     """
     path = Path(file_path)
     if not path.exists():
@@ -150,6 +173,10 @@ def classify(
         entities, layer_mapping,
         min_thickness_m=min_thickness_m,
         max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+        centerline_thickness_m=centerline_thickness_m,
+        centerline_min_length_m=centerline_min_length_m,
+        centerline_max_gap_m=centerline_max_gap_m,
     )
     walls_dicts = [_wall_candidate_to_dict(w) for w in result.walls]
 
@@ -165,18 +192,29 @@ def classify(
     out: Dict[str, Any] = {
         "ok": True,
         "walls_count": len(walls_dicts),
+        "centerline_walls_count": result.centerline_walls_count,
         "rejected_count": len(result.rejected),
         "rejected_summary": list(rejected_by_layer.values()),
     }
-    preview_limit = 20
+    # Le preview liste tous les murs jusqu'à 100 (assez pour la plupart
+    # des plans d'archi sans tronquer). Au-delà, on tronque + on rend
+    # la note explicite pour éviter la confusion LLM de session h+ qui
+    # avait pris "20 of 29" comme "il manque 9" et reconstitué
+    # manuellement 9 murs en doublon.
+    preview_limit = 100
     if len(walls_dicts) <= preview_limit:
         out["walls"] = walls_dicts
     else:
         out["walls"] = walls_dicts[:preview_limit]
         out["walls_truncated"] = True
         out["note"] = (
-            "Preview limited to {} walls of {}. Apply via dwg_import_walls "
-            "to commit all.".format(preview_limit, len(walls_dicts))
+            "Preview tronqué à {} sur {} murs détectés (économie tokens). "
+            "**IMPORTANT** : `dwg_import_walls` créera la totalité ({}), "
+            "PAS seulement les {} affichés ici. Ne reconstitue PAS les "
+            "murs manquants manuellement — appelle `dwg_import_walls` qui "
+            "porte la classification complète en interne.".format(
+                preview_limit, len(walls_dicts), len(walls_dicts), preview_limit,
+            )
         )
     return out
 
@@ -199,6 +237,10 @@ def import_walls(
     min_thickness_m: float = 0.05,
     max_thickness_m: float = 0.50,
     max_walls: int = 500,
+    include_centerline: bool = True,
+    centerline_thickness_m: float = 0.10,
+    centerline_min_length_m: float = 0.5,
+    centerline_max_gap_m: float = 0.20,
 ) -> Dict[str, Any]:
     """Importe les murs d'un fichier DXF / DWG en chaînant classify +
     walls_create_many (atomique KG + Revit).
@@ -257,6 +299,10 @@ def import_walls(
         entities, layer_mapping,
         min_thickness_m=min_thickness_m,
         max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+        centerline_thickness_m=centerline_thickness_m,
+        centerline_min_length_m=centerline_min_length_m,
+        centerline_max_gap_m=centerline_max_gap_m,
     )
     if len(result.walls) > max_walls:
         raise ValueError(

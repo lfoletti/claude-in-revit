@@ -153,3 +153,40 @@ def autoscan_payload(prompt: str, kg: Any) -> str:
         + "\n\n" + _AUTOSCAN_NOTE + "\n"
         + _AUTOSCAN_CLOSE + "\n\n"
     )
+
+
+# ----- Tier-2 routing (§9 DESIGN, dette infrastructure) ---------------------
+#
+# Le DESIGN doc prévoit un `ROUTING_RULES` dans `routing.py` pour charger
+# conditionnellement les tools tier-2 selon des keywords du prompt. Pas
+# encore implémenté en module dédié — version minimale ici en attendant.
+# Approche : regex sur le prompt utilisateur pour détecter les domaines
+# tier-2 dont les tools doivent devenir visibles ce tour-ci.
+
+_TIER2_KEYWORDS = (
+    # UC1 DWG ingest — tools/dwg_import.py
+    r"\bdxf\b|\bdwg\b|"
+    r"importer?\s+(?:depuis|le\s+)?(?:plan|cao|cad)|"
+    r"(?:ingest|import)\s+(?:plan|cad|dwg|dxf)|"
+    r"plan\s+(?:d['’]archi|cad|cao)"
+)
+
+_TIER2_RE = re.compile(_TIER2_KEYWORDS, re.IGNORECASE)
+
+
+def infer_tier_max(prompt: str) -> int:
+    """Renvoie le `tier_max` à passer à `LLMClient.run_turn` pour ce prompt.
+
+    Défaut : 1 (tier-1 only, payload minimal). Si le prompt mentionne
+    un domaine tier-2 (DWG ingest pour V0), monte à 2 → le LLM voit
+    les tools `dwg_*`. À étendre quand d'autres tier-2 arrivent
+    (compliance UC8, vision UC6, etc.).
+
+    Trade-off accepté : bump global ce tour. Filtrage plus fin
+    (« seulement les dwg_* mais pas d'autres tier-2 ») demanderait un
+    paramétrage par catégorie de tools — pas justifié à V0 où il n'y
+    a qu'un domaine tier-2.
+    """
+    if _TIER2_RE.search(prompt or ""):
+        return 2
+    return 1

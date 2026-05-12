@@ -967,3 +967,114 @@ def move_many(
                 })
 
     return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+
+
+def _validate_delete_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int,
+) -> str:
+    """Preflight one item from `walls_delete_many` : `{llm_id}` (string ou dict).
+    Tolère les deux formats : `{llm_id: "..."}` ou directement `"..."` —
+    le LLM oscille entre les deux selon le contexte. Retourne le llm_id
+    après validation."""
+    if isinstance(item, dict):
+        llm_id = item.get("llm_id")
+    else:
+        llm_id = item
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") != "Wall":
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Wall".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is already soft-deleted".format(index, llm_id)
+        )
+    return llm_id
+
+
+@tool(name="walls_delete_many", tier=1)
+def delete_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Any],
+) -> Dict[str, Any]:
+    """Supprime N murs en **une seule** Tx Revit + une seule Tx KG.
+
+    Tolère les ElementId périmés : si Revit n'a plus l'élément (orphelin
+    KG), on soft-delete le KG seul et on signale `revit_already_gone` dans
+    le payload. Évite le crash NoneType.
+
+    Concepts: mur, suppression, bulk, batch, plusieurs, masse, delete
+    Phrases: "supprime tous ces murs", "delete walls", "vire ces murs",
+             "remove walls"
+    Similar: walls_delete, walls_set_height_many
+
+    Args:
+        items: liste de llm_ids ou de specs `{"llm_id": str}`. Tolérant
+            aux deux formats.
+
+    Returns:
+        {"ok": bool, "count": int, "deleted_revit": int,
+         "deleted_kg_only": int, "revit_already_gone": [llm_id, …],
+         "deleted_at_turn": int}
+        `deleted_kg_only` compte les soft-deletes du KG sans Revit
+        correspondant (orphelins purifiés).
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    llm_ids = [_validate_delete_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for nid in llm_ids:
+            kg.soft_delete(nid)
+        return {
+            "ok": True,
+            "count": len(llm_ids),
+            "deleted_revit": 0,
+            "deleted_kg_only": len(llm_ids),
+            "revit_already_gone": [],
+            "deleted_at_turn": kg.turn,
+            "revit_modified": False,
+        }
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    deleted_revit = 0
+    revit_already_gone: List[str] = []
+    with rp.transaction(doc, "walls.delete_many"):
+        for nid in llm_ids:
+            eid_raw = kg.get_revit_id(nid)
+            if eid_raw is None:
+                # Pas de binding — soft-delete KG seulement.
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+                continue
+            element = doc.GetElement(ElementId(eid_raw))
+            if element is None:
+                # Binding périmé — soft-delete KG seulement (pas de crash).
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+                continue
+            try:
+                doc.Delete(ElementId(eid_raw))
+                kg.soft_delete(nid)
+                deleted_revit += 1
+            except Exception:  # noqa: BLE001 — Revit refuse parfois (relations).
+                # On laisse le KG soft-deleter quand même mais on signale.
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+
+    return {
+        "ok": True,
+        "count": len(llm_ids),
+        "deleted_revit": deleted_revit,
+        "deleted_kg_only": len(llm_ids) - deleted_revit,
+        "revit_already_gone": revit_already_gone,
+        "deleted_at_turn": kg.turn,
+        "revit_modified": True,
+    }

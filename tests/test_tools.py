@@ -93,6 +93,9 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "levels_set_name",
         "walls_set_height_many",
         "walls_move_many",
+        "walls_delete_many",
+        "openings_delete_many",
+        "rooms_delete_many",
         "openings_set_sill_height_many",
         "openings_set_head_height_many",
         "openings_set_type_many",
@@ -2244,6 +2247,88 @@ def test_levels_set_name_kg_only_no_drift(kg_with_seed):
     assert payload["name"] == "RDC"
     assert payload["drift"] is False
     assert kg.get_node(level)["name"] == "RDC"
+
+
+def test_walls_delete_many_kg_only(kg_with_levels_and_walltype):
+    """3 murs créés puis supprimés en 1 appel."""
+    kg, level, wt = kg_with_levels_and_walltype
+    ids = []
+    for k in range(3):
+        nid = kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+        ids.append(nid)
+    result = llm_protocol.dispatch_tool_use(
+        "walls_delete_many",
+        {"items": [{"llm_id": nid} for nid in ids]}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 3
+    assert payload["deleted_kg_only"] == 3
+    assert payload["revit_modified"] is False
+    for nid in ids:
+        assert kg.get_node(nid)["deleted_at_turn"] is not None
+
+
+def test_walls_delete_many_accepts_bare_string_ids(kg_with_wall):
+    """Items peut être [string, …] OU [{"llm_id": string}, …]."""
+    kg, _, _, wall = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "walls_delete_many", {"items": [wall]}, "t1", kg,
+    )
+    assert result["is_error"] is False
+    assert kg.get_node(wall)["deleted_at_turn"] is not None
+
+
+def test_walls_delete_many_refuses_non_wall(kg_with_wall):
+    kg, level, _, _ = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "walls_delete_many", {"items": [{"llm_id": level}]}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Wall" in result["content"]
+
+
+def test_openings_delete_many_kg_only(kg_with_opening_setup):
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    w2 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [3.0, 0.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_delete_many", {"items": [w1, w2]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert kg.get_node(w1)["deleted_at_turn"] is not None
+    assert kg.get_node(w2)["deleted_at_turn"] is not None
+
+
+def test_rooms_delete_many_kg_only(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    r2 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 0.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_delete_many", {"items": [r1, r2]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert kg.get_node(r1)["deleted_at_turn"] is not None
+    assert kg.get_node(r2)["deleted_at_turn"] is not None
 
 
 def test_levels_set_name_refuses_duplicate(kg_with_seed):

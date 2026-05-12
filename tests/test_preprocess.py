@@ -208,3 +208,28 @@ def test_autoscan_payload_handles_multi_collection(kg_with_two_windows):
     )
     assert "catalog_list_doors" in payload
     assert "catalog_list_windows" in payload
+
+
+# ----- infer_tier_max ----------------------------------------------------
+
+
+@pytest.mark.parametrize("prompt,expected", [
+    ("crée un mur de 5m", 1),
+    ("liste les fenêtres", 1),
+    ("place une porte", 1),
+    # DWG / DXF keywords → tier-2.
+    ("importe ce dxf", 2),
+    ("inspecte le fichier plan.DXF", 2),
+    ("ingest ce DWG", 2),
+    ("importer depuis ce plan CAD", 2),
+    ("import the DXF file", 2),
+    # No match — mots isolés sans contexte.
+    ("crée une nouvelle vue plan", 1),
+])
+def test_infer_tier_max(prompt, expected):
+    assert preprocess.infer_tier_max(prompt) == expected
+
+
+def test_infer_tier_max_empty_prompt():
+    assert preprocess.infer_tier_max("") == 1
+    assert preprocess.infer_tier_max(None) == 1

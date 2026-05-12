@@ -546,6 +546,12 @@ def _main():
     if autoscan_preamble:
         user_prompt = autoscan_preamble + user_prompt
 
+    # Routing tier-2 : détecte les keywords de domaines tier-2 (DWG/DXF
+    # en V0) et monte `tier_max` à 2 → le LLM voit les tools concernés.
+    # Sans ça, les `dwg_*` étaient invisibles depuis qu'ils ont été
+    # livrés (cf. session h, dette routing non implémentée).
+    tier_max = preprocess.infer_tier_max(user_prompt)
+
     # build_user_content wraps prompt + optional attachment into the shape
     # Anthropic expects in `messages=[{"role": "user", "content": …}]`: a
     # bare string when no attachment, a list of content blocks (text +
@@ -564,7 +570,7 @@ def _main():
             kg, selection_ids, unbound_by_category, refresh_actionable,
         ),
         history=history,
-        tier_max=1,
+        tier_max=tier_max,
         doc=doc,
     )
     save_history(history, history_path)

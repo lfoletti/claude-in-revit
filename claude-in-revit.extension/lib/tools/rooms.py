@@ -566,3 +566,103 @@ def set_name_many(
                 })
 
     return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+
+
+def _validate_delete_item(
+    kg: ProjectKG, item: Any, index: int,
+) -> str:
+    """Preflight one item from `rooms_delete_many` : `{llm_id}` ou string."""
+    if isinstance(item, dict):
+        llm_id = item.get("llm_id")
+    else:
+        llm_id = item
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") != "Room":
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Room".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is already soft-deleted".format(index, llm_id)
+        )
+    return llm_id
+
+
+@tool(name="rooms_delete_many", tier=1)
+def delete_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Any],
+) -> Dict[str, Any]:
+    """Supprime N pièces en une seule Tx Revit + KG.
+
+    Tolérant aux ElementId périmés (orphelins KG).
+
+    Concepts: pièce, room, suppression, bulk, batch, masse, delete
+    Phrases: "supprime toutes ces pièces", "delete rooms",
+             "vire les rooms", "remove rooms"
+    Similar: rooms_delete, rooms_set_name_many
+
+    Args:
+        items: liste de llm_ids ou specs `{"llm_id": str}`.
+
+    Returns:
+        {"ok", "count", "deleted_revit", "deleted_kg_only",
+         "revit_already_gone": [llm_id], "deleted_at_turn",
+         "revit_modified"}
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    llm_ids = [_validate_delete_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for nid in llm_ids:
+            kg.soft_delete(nid)
+        return {
+            "ok": True,
+            "count": len(llm_ids),
+            "deleted_revit": 0,
+            "deleted_kg_only": len(llm_ids),
+            "revit_already_gone": [],
+            "deleted_at_turn": kg.turn,
+            "revit_modified": False,
+        }
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    deleted_revit = 0
+    revit_already_gone: List[str] = []
+    with rp.transaction(doc, "rooms.delete_many"):
+        for nid in llm_ids:
+            eid_raw = kg.get_revit_id(nid)
+            if eid_raw is None:
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+                continue
+            element = doc.GetElement(ElementId(eid_raw))
+            if element is None:
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+                continue
+            try:
+                doc.Delete(ElementId(eid_raw))
+                kg.soft_delete(nid)
+                deleted_revit += 1
+            except Exception:  # noqa: BLE001
+                kg.soft_delete(nid)
+                revit_already_gone.append(nid)
+
+    return {
+        "ok": True,
+        "count": len(llm_ids),
+        "deleted_revit": deleted_revit,
+        "deleted_kg_only": len(llm_ids) - deleted_revit,
+        "revit_already_gone": revit_already_gone,
+        "deleted_at_turn": kg.turn,
+        "revit_modified": True,
+    }
