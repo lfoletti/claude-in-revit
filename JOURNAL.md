@@ -14,6 +14,247 @@
 
 ---
 
+## 2026-05-12 — Rooms + Levels (écriture) — clôture V0 Sem.2-3
+
+### Contexte & objectif
+
+Reprise après la session 5 du 2026-05-11 (228 tests, discipline read-back
+sur 14 tools mutants). Reste à boucler §9 Sem.2-3 V0 : `rooms.py` (create,
+recompute_boundaries, set_name, get_area) et `levels.py` côté écriture
+(create, modify_elevation, set_active). Une fois bouclé, la surface
+géométrique de base est complète et UC2/UC3 deviennent pleinement
+fonctionnels. Ouvre aussi la voie compliance (UC8, §4.5) qui s'appuie sur
+`Room.use_subcategory` + `ProjectContext`.
+
+### Décisions
+
+1. **`set_active` (Level) omis pour V0.** C'est une opération UX sur les
+   vues (changer le plan d'étage actif dans l'UIDocument), pas une
+   mutation du modèle. L'utilisateur peut basculer de vue directement
+   dans Revit. Documenté en tête de `levels.py`.
+
+2. **`levels_delete` également omis.** Supprimer un niveau casse les
+   refs `at_level` de tous les éléments hôtés (Walls, Columns, Rooms,
+   Doors, Windows) ; une stratégie de re-hosting / soft-cascade n'est
+   pas dans le scope de la session. Reporté.
+
+3. **`boundary_walls` resté à `[]` en V0.** Le calcul réel via
+   `Room.GetBoundarySegments` (qui retourne `IList<IList<BoundarySegment>>`)
+   nécessite de matcher chaque `seg.ElementId` contre le KG et de gérer
+   les segments non-wall (room separation lines). Brittle sans projet
+   Revit pour valider. Reporté à la compliance UC8 (§4.5) où la liste
+   devient load-bearing (audit hauteur sous plafond par room, parcours
+   d'évacuation, etc.).
+
+4. **`rooms_recompute_boundaries` plutôt que `rooms_refresh_areas`.**
+   Le tool fait deux choses sous le capot : `doc.Regenerate()` qui
+   force Revit à recalculer les loops de toutes les rooms, *puis*
+   `refresh_node_from_revit` qui mirror l'aire post-régen dans le KG.
+   Le nom du tool reflète la sémantique côté Revit (recompute) plutôt
+   que côté KG (refresh) — c'est ce que le LLM doit appeler quand
+   l'utilisateur ferme des murs après une création.
+
+5. **`rooms_get_area` lit le KG par défaut, refresh si `doc` présent.**
+   Pattern hybride : le KG est source de vérité, mais quand on a un
+   doc Revit en main, un read-back préalable est gratuit et évite de
+   renvoyer une valeur potentiellement périmée. Le champ `stale: bool`
+   dans la réponse permet au LLM de décider s'il doit suggérer un
+   `rooms_recompute_boundaries`.
+
+6. **Pré-check de collision de nom pour les Levels.** `levels_create`
+   et `levels_set_name` vérifient côté KG qu'aucun autre Level vivant
+   n'utilise déjà le nom demandé. Sans ce pré-check, Revit lèverait une
+   `InvalidOperationException` brute — message moins lisible pour le
+   LLM. Le check exclut les Level soft-deleted (légal de réutiliser un
+   nom libéré).
+
+7. **Drift detection sur strings (name) en open-coded.** `detect_drift`
+   couvre scalaires/vecteurs/None mais pas les chaînes (concept de
+   tolérance n'a pas de sens). Les setters `rooms_set_name` et
+   `levels_set_name` font une comparaison directe `actual != requested`
+   et formattent leur propre `drift_note`. Pas de helper partagé pour
+   ce cas — 4 lignes par tool, factoriser serait prématuré.
+
+### Phase 1 — Plomberie Room côté `kg_sync.py` + `revit_primitives.py`
+
+`revit_primitives.py` :
+- **`rooms(doc)`** : collector via `collect_by_category(doc, OST_Rooms)`.
+  Pas de tri placed/unplaced — le converter lit `Location` défensivement.
+
+`kg_sync.py` :
+- **`_room_to_attrs(room, *, level_ref)`** : extrait `name` (BIP
+  `ROOM_NAME`, fallback `"Room"` si vide pour respecter le required du
+  schéma), `area` (BIP `ROOM_AREA`, converti via `internal_to_sqm`),
+  `boundary_walls=[]` (deferred). `level_ref` fourni par le caller, pas
+  re-lu depuis `room.LevelId` (mêmes raisons que les openings — host /
+  level ref dérivés côté KG sont autoritatifs).
+- **Branche `full_rescan` rooms** : itère `rp.rooms(doc)`, résout
+  `level_ref` via `llm_id_of(kg, r.LevelId)`, skip si non bindé. Pose
+  l'arête `Room → Level` via `at_level`. Compteur `skipped["rooms"]`
+  ajouté.
+- **`_REFRESH_FIELDS["Room"] = ("name", "area")`** — les deux attrs
+  volatiles. `level_ref` exclu (n'est pas modifié par un read-back
+  géométrique ; un futur `rooms_move_to_level` posera un nouveau
+  level_ref explicitement). `boundary_walls` exclu (pas calculé).
+- **Dispatch `refresh_node_from_revit`** : branche `node_type == "Room"`
+  qui passe `level_ref=node.get("level_ref", "")` au converter.
+- **Summary `full_rescan`** : `rooms: kg.count_by_type("Room")` ajouté.
+
+`tests/test_kg_sync.py` : stub `_install_rescan_stub` étendu avec
+`stub.rooms = lambda doc: []` (sinon `AttributeError` au call
+`rp.rooms(doc)`).
+
+### Phase 2 — `tools/rooms.py` (5 tools)
+
+Pattern doc-aware standard (`walls.py` / `openings.py`). 5 tools tier-1 :
+- **`rooms_create(level_ref, point, name?)`** : `doc.Create.NewRoom(level, UV)`
+  + `doc.Regenerate()` post-placement (sinon `ROOM_AREA=0` même
+  enveloppe fermée). Pose le nom si fourni avant Regenerate. Read-back
+  via `refresh_node_from_revit` pour mirror l'aire effective. Réponse
+  inclut `note: str | None` qui prévient le LLM si `area=0`.
+- **`rooms_set_name(llm_id, name)`** : `param.Set(name)` sur
+  `ROOM_NAME`. Refus chaîne vide / whitespace-only. Drift detection
+  open-coded.
+- **`rooms_recompute_boundaries(llm_id?)`** : `doc.Regenerate()` puis
+  read-back par room (ciblé ou tous). Réponse compacte par room.
+- **`rooms_get_area(llm_id)`** : KG-read + optionnel read-back si doc
+  présent. `stale: bool` dans la réponse.
+- **`rooms_delete(llm_id)`** : symétrique à `walls_delete`. Soft KG +
+  hard Revit.
+
+`_record_in_kg` interne pose `Room` avec `boundary_walls=[]`. Une seule
+arête à la création : `at_level`. Pas de read-back drift à la création
+(création = pas de "requested" à comparer, cohérent avec décision 1 de
+la session 5).
+
+### Phase 3 — `tools/levels.py` (3 tools)
+
+3 tools tier-1 :
+- **`levels_create(name, elevation_m)`** : `Level.Create(doc, elev_ft)`
+  (static factory moderne, voir REVIT_API_NOTES). Revit auto-nomme
+  ("Level 3" / "Niveau 3" selon locale) — renomme via
+  `level.Name = new_name` après la création. Pré-check collision côté
+  KG avant ouverture de la Tx Revit (rapide, lisible).
+- **`levels_set_elevation(llm_id, elevation_m)`** : `level.Elevation =
+  meters_to_internal(elev)` (propriété writable directement). Read-back
+  + `detect_drift` numérique sur l'élévation.
+- **`levels_set_name(llm_id, name)`** : `level.Name = new_name` (idem).
+  Pré-check collision excluant le node courant. Drift detection
+  open-coded sur la chaîne.
+
+`_REFRESH_FIELDS["Level"]` était déjà déclaré session 5 — rien à
+toucher. Pas de `_record_in_kg` pour delete : `levels_delete` n'existe
+pas (cf. décision 2).
+
+### Phase 4 — `catalog_list_rooms` + tests
+
+`tools/catalog.py` : ajout de `catalog_list_rooms` (symétrique
+`_doors` / `_windows`). Retourne `{llm_id, name, level_ref, area_m2}`
+par room vivante.
+
+`tests/test_tools.py` : 17 nouveaux tests KG-only (pas de stub Revit
+nécessaire — la branche `doc is None` est exercée) :
+- 4 `rooms_create` (création OK, refus level inconnu / non-Level,
+  nom par défaut "Room").
+- 2 `rooms_set_name` (KG-only no drift, refus empty).
+- 1 `rooms_get_area` (stale=True quand pas de doc).
+- 2 `rooms_recompute_boundaries` (tous / ciblé llm_id).
+- 1 `rooms_delete` (soft delete).
+- 1 `catalog_list_rooms` (filtre les soft-deleted).
+- 3 `levels_create` (création, refus doublon, refus empty).
+- 1 `levels_set_elevation` (KG-only no drift).
+- 2 `levels_set_name` (KG-only no drift, refus doublon).
+
+Le registry expected set du test
+`test_canonical_registry_has_expected_tier1_tools` est étendu de 8
+entrées (`rooms_*` × 5 + `levels_*` × 3 + `catalog_list_rooms`) — soit
+9 nouvelles entrées exactement. Le test continue de passer (`issubset`).
+
+### Validation
+
+- `pytest -q` (suite complète, 245 tests) : **245 verts en 7.65s**.
+- Régression initiale : 4 tests `test_full_rescan_*` cassés sur
+  `AttributeError: module 'lib.revit_primitives' has no attribute 'rooms'`.
+  **Cause racine** : le stub `_install_rescan_stub` dans
+  `test_kg_sync.py` n'avait pas été mis à jour avec la nouvelle
+  itération sur `rp.rooms(doc)` dans `full_rescan`. **Fix** : ajout
+  d'une ligne `stub.rooms = lambda doc: []` dans le stub. La leçon —
+  toute extension de `full_rescan` doit accompagner son stub côté
+  tests. Note pour la suite : un futur Sem.4-5 tool (DWG ingest) qui
+  ajouterait un nouveau collector devra mettre à jour le stub aussi.
+
+Compteur de tests : 228 (session 5) → 245 (session courante), soit +17.
+
+### Validation runtime — pas tenté ce tour
+
+Décidé de **ne pas** lancer un test live Revit ce tour-ci : les tools
+sont KG-only-testable, la plomberie Revit est *isolée* dans le converter
++ `Document.Create.NewRoom` (déjà éprouvé sur openings via le même
+pattern doc-aware), et la dette des sessions précédentes (setters
+multi-objets, voir « Reste à faire ») a plus de valeur runtime que ce
+chemin déterministe. Test live à prévoir à la prochaine session Revit,
+de préférence couplé à un scénario UC2/UC3 réaliste (créer un
+appartement-type avec 4 rooms nommées et récupérer leurs aires).
+
+### État final & reste à faire
+
+**Acquis session 2026-05-12** :
+- `rooms.py` (5 tools : create, set_name, recompute_boundaries,
+  get_area, delete) ✓
+- `levels.py` (3 tools : create, set_elevation, set_name) ✓
+- `catalog_list_rooms` ✓
+- Plomberie kg_sync : `_room_to_attrs`, branche `full_rescan`,
+  `_REFRESH_FIELDS["Room"]`, dispatch `refresh_node_from_revit` ✓
+- Collector `rp.rooms(doc)` ✓
+- Stub `test_kg_sync.py` étendu ✓
+- 17 tests, baseline **245 verts** ✓
+- §9 V0 Sem.2-3 **bouclé** — toute la géométrie de base couverte côté
+  écriture.
+
+**Dettes / TODO ouverts (héritage + nouveaux)** :
+
+1. **Setters multi-objets** (dette session 5, toujours ouverte) —
+   gain mesuré ~44 tool_use blocks → ~2 pour 20 fenêtres. Avec rooms
+   maintenant en place, on peut chiffrer un scénario type :
+   « renomme toutes les rooms du N01 en concaténant le numéro » →
+   N tool_use blocks. Si N >= 5, ROI évident. À trancher avec UC8
+   compliance qui réclamera des bulk reads + bulk writes sur
+   `Room.use_subcategory`. Avec une vue maintenant complète des
+   mutants (15 sur 16, seul `walls_delete`/`openings_delete`/`rooms_delete`
+   restent solo), on a la matière pour décider entre :
+   - setters `*_many` ciblés par paire (mécaniste, lisible),
+   - `tools/bulk.py` générique (`apply_to_filter`, Sem.4-5 du plan).
+2. **`boundary_walls` non calculé** (nouvelle dette V0 → V1) — à
+   activer lors de l'arrivée du modèle compliance (§4.5 du DESIGN).
+   Chemin : `room.GetBoundarySegments(SpatialElementBoundaryOptions())`,
+   itérer les loops, matcher chaque `seg.ElementId` contre la KG via
+   `find_by_revit_id`. Skipper les room separation lines (à terme
+   un node `RoomSeparator` ou simplement filtré). Quand activé,
+   ajouter `boundary_walls` à `_REFRESH_FIELDS["Room"]` (pour le
+   recompute après modification de mur).
+3. **`levels_delete` reporté** — voir décision 2.
+4. **Validation runtime Revit pour rooms / levels** — non tenté ce
+   tour. Scénario test type pour la prochaine session Revit :
+   « crée un niveau N02 à 6 m, place une room au centre du RDC et
+   nomme-la 'Salon', recompute les aires, donne-moi le total m² du
+   N00 ». Devrait exercer : `levels_create` + `rooms_create` +
+   `rooms_set_name` + `rooms_recompute_boundaries` + `catalog_list_rooms` +
+   un éventuel `aggregations_*` (existant ? à vérifier — sinon pas
+   un blocker).
+
+**Suite immédiate (§9 V0 Sem.4-5)** :
+- `dwg_reader.py` + `dwg_classifier.py` (ezdxf) → UC1 (import DWG
+  paramétré comme calque de murs / fenêtres).
+- `tools/bulk.py` (`apply_to_filter`, `change_param_bulk`) → UC7
+  (modifications en masse). Couvre potentiellement la dette 1.
+
+**Couverture de risque** : aucune nouvelle exposition. La discipline
+read-back est respectée par construction sur tous les nouveaux
+mutants ; les pré-checks de collision sur les Levels rendent l'erreur
+lisible avant de toucher à Revit.
+
+---
+
 ## 2026-05-11 (session 5) — Discipline read-back KG↔Revit systématique sur tout objet
 
 ### Contexte & objectif

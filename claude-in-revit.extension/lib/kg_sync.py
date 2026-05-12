@@ -447,6 +447,46 @@ def _opening_to_attrs(
     }
 
 
+def _room_to_attrs(
+    room: Any,
+    *,
+    level_ref: str,
+) -> Dict[str, Any]:
+    """Extract Room attrs (`name`, `area`).
+
+    `name` is read from `ROOM_NAME` BIP. If absent / empty (e.g. unplaced
+    room with no user-set name), falls back to `"Room"` so the schema's
+    required `name` field is never empty.
+
+    `area` is read from `ROOM_AREA` BIP — Revit computes it from the
+    boundary loops. Unplaced rooms have area=0. The value flows through
+    `internal_to_sqm` (square feet → m²).
+
+    `boundary_walls` is set to `[]` in V0 — computing the actual list of
+    boundary `Wall` llm_ids requires walking `Room.GetBoundarySegments`
+    and matching each segment's `ElementId` against the KG, which is
+    brittle without a real Revit project to validate against. Deferred
+    to the compliance work (UC8) where this list becomes load-bearing.
+    """
+    from . import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter
+
+    name_param = room.get_Parameter(BuiltInParameter.ROOM_NAME)
+    raw_name = name_param.AsString() if name_param is not None else None
+    name = raw_name if raw_name else "Room"
+    area_param = room.get_Parameter(BuiltInParameter.ROOM_AREA)
+    area_m2 = (
+        _r(rp.internal_to_sqm(area_param.AsDouble()))
+        if area_param is not None else 0.0
+    )
+    return {
+        "name": name,
+        "level_ref": level_ref,
+        "area": area_m2,
+        "boundary_walls": [],
+    }
+
+
 def _wall_to_attrs(
     wall: Any,
     *,
@@ -534,6 +574,7 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         "window_types": 0,
         "doors": 0,
         "windows": 0,
+        "rooms": 0,
     }
 
     # Snapshot `revit_id → llm_id` BEFORE clearing — drives id stability.
@@ -786,6 +827,26 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             except Exception:  # noqa: BLE001
                 skipped["windows"] += 1
 
+        # 11. Rooms — depend on Levels already bound. Unplaced rooms (no
+        # location, area=0) are still ingested: they keep an action_log
+        # presence and can be picked up by `kg.refresh()` once the user
+        # encloses them with walls.
+        for r in rp.rooms(doc):
+            try:
+                level_ref = llm_id_of(kg, r.LevelId)
+                if level_ref is None:
+                    skipped["rooms"] += 1
+                    continue
+                attrs = _room_to_attrs(r, level_ref=level_ref)
+                nid = kg.add_node(
+                    "Room", attrs, llm_id=_preserved_id(r), _emit_log=False,
+                )
+                bind(kg, nid, r)
+                _stamp(r, nid)
+                kg.add_edge(nid, level_ref, "at_level")
+            except Exception:  # noqa: BLE001
+                skipped["rooms"] += 1
+
         reused = sum(
             1 for _, attrs in kg._g.nodes(data=True)  # noqa: SLF001
             if attrs.get("_revit_id") is not None
@@ -810,6 +871,7 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             "window_types": family_types_by_cat.get("Windows", 0),
             "doors": kg.count_by_type("Door"),
             "windows": kg.count_by_type("Window"),
+            "rooms": kg.count_by_type("Room"),
             "skipped": dict(skipped),
             "preserved_llm_ids": reused,
         }
@@ -845,6 +907,11 @@ _REFRESH_FIELDS: Dict[str, Tuple[str, ...]] = {
     "WallType": ("name", "total_thickness"),
     "ColumnType": ("family_name", "type_name", "kind"),
     "FamilyType": ("family_name", "type_name", "dimensions"),
+    # Room area is computed by Revit from the boundary loops. The
+    # `recompute_boundaries` tool calls `doc.Regenerate()` then
+    # `refresh_node_from_revit` to mirror the new value — without the
+    # area in this whitelist, the regenerate would be a no-op on the KG.
+    "Room": ("name", "area"),
 }
 
 
@@ -914,6 +981,10 @@ def refresh_node_from_revit(
     elif node_type == "FamilyType":
         fresh = _family_type_to_attrs(
             element, category=node.get("category", ""),
+        )
+    elif node_type == "Room":
+        fresh = _room_to_attrs(
+            element, level_ref=node.get("level_ref", ""),
         )
     else:
         return None

@@ -80,6 +80,15 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "catalog_list_window_types",
         "catalog_list_doors",
         "catalog_list_windows",
+        "catalog_list_rooms",
+        "rooms_create",
+        "rooms_set_name",
+        "rooms_recompute_boundaries",
+        "rooms_get_area",
+        "rooms_delete",
+        "levels_create",
+        "levels_set_elevation",
+        "levels_set_name",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -1934,3 +1943,284 @@ def test_catalog_list_doors_and_windows_return_geometry(kg_with_opening_setup):
     )
     assert len(json.loads(doors_result["content"])["doors"]) == 1
     assert len(json.loads(windows_result["content"])["windows"]) == 2
+
+
+# ----- Rooms + Levels (V0 Sem.2-3) ------------------------------------------
+
+
+def test_rooms_create_kg_only_adds_room_node_and_edge(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [2.5, 1.5], "name": "Salon"},
+        "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["name"] == "Salon"
+    assert payload["area_m2"] == 0.0
+    assert payload["revit_id"] is None
+    assert payload["note"] is None  # KG-only path : no Revit area check.
+
+    room_id = payload["llm_id"]
+    attrs = kg.get_node(room_id)
+    assert attrs["_type"] == "Room"
+    assert attrs["name"] == "Salon"
+    assert attrs["level_ref"] == level
+    assert attrs["boundary_walls"] == []
+
+    edges = list(kg._g.out_edges(room_id, keys=True))  # noqa: SLF001
+    assert [k for _, _, k in edges] == ["at_level"]
+
+
+def test_rooms_create_refuses_unknown_level(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": "level_999", "point": [0.0, 0.0]},
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "Unknown level_ref" in result["content"]
+
+
+def test_rooms_create_refuses_non_level_ref(kg_with_seed):
+    kg, _, wt = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": wt, "point": [0.0, 0.0]},
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Level" in result["content"]
+
+
+def test_rooms_create_defaults_name_to_room(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["name"] == "Room"
+
+
+def test_rooms_set_name_kg_only_updates_attr_no_drift(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    room_id = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "A"},
+        "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_set_name",
+        {"llm_id": room_id, "name": "Cuisine"},
+        "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["name"] == "Cuisine"
+    assert payload["requested_name"] == "Cuisine"
+    assert payload["drift"] is False
+    assert payload["drift_note"] is None
+    assert kg.get_node(room_id)["name"] == "Cuisine"
+
+
+def test_rooms_set_name_refuses_empty(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    room_id = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]},
+        "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_set_name",
+        {"llm_id": room_id, "name": "   "},
+        "t2", kg,
+    )
+    assert result["is_error"] is True
+    assert "non-empty" in result["content"]
+
+
+def test_rooms_get_area_returns_stale_kg_only(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    room_id = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "Bureau"},
+        "t1", kg,
+    )["content"])["llm_id"]
+    # Force une aire connue côté KG.
+    kg.modify_node(room_id, {"area": 12.34})
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_get_area", {"llm_id": room_id}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["area_m2"] == 12.34
+    assert payload["name"] == "Bureau"
+    assert payload["level_ref"] == level
+    assert payload["stale"] is True
+
+
+def test_rooms_recompute_boundaries_kg_only_lists_all_rooms(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "A"}, "t1", kg,
+    )["content"])["llm_id"]
+    r2 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 5.0], "name": "B"}, "t2", kg,
+    )["content"])["llm_id"]
+    kg.modify_node(r1, {"area": 10.0})
+    kg.modify_node(r2, {"area": 20.0})
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_recompute_boundaries", {}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["rooms_refreshed"] == 2
+    assert payload["revit_regenerated"] is False
+    areas = {e["llm_id"]: e["area_m2"] for e in payload["refreshed"]}
+    assert areas[r1] == 10.0
+    assert areas[r2] == 20.0
+
+
+def test_rooms_recompute_boundaries_single_room(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    _ = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 5.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_recompute_boundaries", {"llm_id": r1}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["rooms_refreshed"] == 1
+    assert payload["refreshed"][0]["llm_id"] == r1
+
+
+def test_rooms_delete_soft_deletes(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    room_id = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_delete", {"llm_id": room_id}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["revit_deleted"] is False
+    assert kg.get_node(room_id)["deleted_at_turn"] is not None
+
+
+def test_catalog_list_rooms_returns_live_rooms(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "Living"}, "t1", kg,
+    )["content"])["llm_id"]
+    r2 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 0.0], "name": "Kitchen"}, "t2", kg,
+    )["content"])["llm_id"]
+    # Soft-delete r2 — il ne doit PAS apparaître dans le catalog (find_by_type
+    # filtre les soft-deleted par défaut).
+    llm_protocol.dispatch_tool_use(
+        "rooms_delete", {"llm_id": r2}, "t3", kg,
+    )
+    result = llm_protocol.dispatch_tool_use(
+        "catalog_list_rooms", {}, "t4", kg,
+    )
+    payload = json.loads(result["content"])
+    ids = [r["llm_id"] for r in payload["rooms"]]
+    assert r1 in ids
+    assert r2 not in ids
+
+
+def test_levels_create_kg_only_adds_node(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create",
+        {"name": "N02", "elevation_m": 6.0}, "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["name"] == "N02"
+    assert payload["elevation_m"] == 6.0
+    assert payload["revit_id"] is None
+
+    level_id = payload["llm_id"]
+    attrs = kg.get_node(level_id)
+    assert attrs["_type"] == "Level"
+    assert attrs["name"] == "N02"
+    assert attrs["elevation"] == 6.0
+
+
+def test_levels_create_refuses_duplicate_name(kg_with_seed):
+    """N00 est déjà seedé. Recréer un Level homonyme doit échouer."""
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create",
+        {"name": "N00", "elevation_m": 5.0}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "already exists" in result["content"]
+
+
+def test_levels_create_refuses_empty_name(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create",
+        {"name": "   ", "elevation_m": 5.0}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "non-empty" in result["content"]
+
+
+def test_levels_set_elevation_kg_only_no_drift(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_set_elevation",
+        {"llm_id": level, "elevation_m": 3.5}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["elevation_m"] == 3.5
+    assert payload["requested_elevation_m"] == 3.5
+    assert payload["drift"] is False
+    assert payload["drift_note"] is None
+    assert kg.get_node(level)["elevation"] == 3.5
+
+
+def test_levels_set_name_kg_only_no_drift(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_set_name",
+        {"llm_id": level, "name": "RDC"}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["name"] == "RDC"
+    assert payload["drift"] is False
+    assert kg.get_node(level)["name"] == "RDC"
+
+
+def test_levels_set_name_refuses_duplicate(kg_with_seed):
+    """N00 existe → créer un autre Level puis tenter de le renommer N00."""
+    kg, _, _ = kg_with_seed
+    new_id = json.loads(llm_protocol.dispatch_tool_use(
+        "levels_create",
+        {"name": "N02", "elevation_m": 6.0}, "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "levels_set_name",
+        {"llm_id": new_id, "name": "N00"}, "t2", kg,
+    )
+    assert result["is_error"] is True
+    assert "already exists" in result["content"]

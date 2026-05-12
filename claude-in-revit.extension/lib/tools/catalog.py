@@ -212,6 +212,38 @@ def list_windows(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     return {"windows": out}
 
 
+@tool(name="catalog_list_rooms", tier=1)
+def list_rooms(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste toutes les pièces (Rooms) vivantes du projet avec leur aire et niveau.
+
+    Concepts: pièce, room, espace, locale, inventaire, aire, surface
+    Phrases: "liste les pièces", "quelles rooms", "all rooms",
+             "toutes les pièces", "donne-moi les surfaces"
+    Similar: catalog_list_levels, catalog_list_walls, rooms_get_area,
+             rooms_recompute_boundaries
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"rooms": [{llm_id, name, level_ref, area_m2}, ...]}
+        Les rooms « unplaced » (aire = 0) apparaissent normalement dans
+        la liste — le LLM peut les détecter via `area_m2 == 0` et
+        suggérer un `rooms_recompute_boundaries` après que l'utilisateur
+        ait fermé l'enveloppe murale.
+    """
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("Room"):
+        attrs = kg.get_node(nid)
+        out.append({
+            "llm_id": nid,
+            "name": attrs.get("name"),
+            "level_ref": attrs.get("level_ref"),
+            "area_m2": round(float(attrs.get("area", 0.0)), 3),
+        })
+    return {"rooms": out}
+
+
 @tool(name="catalog_list_lines", tier=1)
 def list_lines(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     """Liste toutes les lignes du projet (modèle 3D + détail view-bound).

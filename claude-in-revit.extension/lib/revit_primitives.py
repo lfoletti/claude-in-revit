@@ -198,6 +198,17 @@ def column_types(doc):
     return arch + struct
 
 
+def rooms(doc):
+    """All `Room` instances (`OST_Rooms`).
+
+    Returns placed AND unplaced rooms — an unplaced room has `Location is None`
+    and `area == 0`, but still lives in the document and is reachable by id.
+    Converters / tools filter them out when they need a placed instance
+    (e.g. `_room_to_attrs` reads `.Location.Point` defensively).
+    """
+    return collect_by_category(doc, BuiltInCategory.OST_Rooms)
+
+
 def doors(doc):
     """All hosted door instances (OST_Doors). Excludes door FamilySymbols."""
     return collect_by_category(doc, BuiltInCategory.OST_Doors)

@@ -466,6 +466,7 @@ def _install_rescan_stub(monkeypatch, *, levels=()):
     stub.window_types = lambda doc: []
     stub.doors = lambda doc: []
     stub.windows = lambda doc: []
+    stub.rooms = lambda doc: []
     stub.internal_to_meters = lambda x: float(x)
 
     @contextmanager
