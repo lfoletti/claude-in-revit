@@ -14,6 +14,183 @@
 
 ---
 
+## 2026-05-12 (session g) — Validation runtime cumulée : 6 bugs Revit-side + UX + system prompt
+
+### Contexte & objectif
+
+Première session de validation runtime end-to-end après l'enchaînement
+sessions a → f (rooms+levels, setters_many, auto-découple, purge,
+bulk, DWG). Test phare visé : reproduction du bug rapporté
+2026-05-12 matin (« head=2m sur fenêtres → sill recompute parasite »)
+avec le code post-session c (auto-découple) pour confirmer le fix
+en prévention. Plan de test à 7 scénarios (smoke + 6 sessions).
+
+**Modèle test** : Projet1/2 vierge, niveau SS01 à -3m, 4 murs
+rectangle 5×4m, 4 fenêtres standard.
+
+### Bugs trouvés et fixés
+
+La validation runtime a remonté **6 bugs sur le path Revit** que la
+suite unitaire KG-only ne couvre pas. Tous fixés avant push.
+
+**1. `_maybe_decouple` hors `rp.transaction`** (sessions c et b).
+Le pré-flight auto-découple appelait `_create_type_variant_internal`
++ `_swap_to_type_internal` *avant* l'ouverture de la Tx Revit. Or
+ces fonctions font des mutations Revit (`source_symbol.Duplicate`,
+`instance.Symbol = new_symbol`) qui exigent une Tx ouverte. Hors-Tx
+ces appels Revit retournent silencieusement `None` au lieu de lever
+→ cascade `AttributeError: NoneType` sur le `.Id.Value` suivant.
+
+Cause racine : refactor session c, manque de runtime check.
+Fix : déplacer `_maybe_decouple` *dans* le `with rp.transaction(...)`
+des 4 setters openings (solo + many). KG-only path reste exécuté hors-Tx
+(le helper a son propre branchement KG).
+
+**2. `NewFamilyInstance` overload 4-args : level par défaut Niveau 1.**
+`doc.Create.NewFamilyInstance(point, symbol, host, structuralType)`
+sans Level explicite → Revit assigne le **premier level du projet**
+(typiquement Niveau 1 à élévation 0) comme Reference Level de
+l'instance, *au lieu* d'hériter du level du host_wall. Sur un mur
+hosté sur SS01 (-3m), la fenêtre se retrouvait à
+`Reference Level=Niveau 1 + sill 1m = z=1m monde` → « un étage trop
+haut » visuellement.
+
+Diagnostic : l'utilisateur a confirmé `wall.Contrainte inférieure =
+SS01` via inspection visuelle, donc le mur était bon. Le décalage
+venait de la fenêtre.
+
+Fix : `NewFamilyInstance(XYZ, FamilySymbol, host, Level,
+StructuralType)` (overload 5-args) avec `Level` résolu depuis
+`level_ref` du host_wall.
+
+**3. XYZ.Z avec l'overload 5-args : sémantique world, pas relatif.**
+Mon premier fix passait `XYZ.Z = 0` avec le Level explicite, en
+supposant que Revit ajoutait `Level.Elevation` automatiquement.
+**Erreur d'interprétation** : avec l'overload 5-args, Revit attend
+le XYZ en **coordonnées monde absolues**. Sur SS01, `XYZ.Z=0` plaçait
+la fenêtre à z=0 monde, hors emprise du mur (qui va de -3 à -0.3)
+→ erreur Revit « occurrences de … ne coupent rien », fenêtres
+flottantes invisibles dans le mur.
+
+Trace décisive : utilisateur a noté « ça fonctionne en les créant
+au niveau 0 ». Sur Niveau 1 (elev=0), `XYZ.Z=0` et `XYZ.Z=level_elev`
+coïncidaient — d'où l'illusion que `0` était correct.
+
+Fix : `XYZ.Z = rp.meters_to_internal(level_elev_m)` (monde). Revit
+calcule sill = XYZ.Z − Level.Elevation = 0 à la création, puis
+`INSTANCE_SILL_HEIGHT_PARAM.Set(sill_height_m)` impose la sill voulue.
+
+**4. `doc.GetElement(eid)` retourne `None` silencieusement sur
+ElementId périmé.** Quand le KG porte un binding `_revit_id` vers
+un élément Revit déjà supprimé (orphelin causé par un workflow hors
+pipeline : utilisateur qui supprime via UI Revit, ou crash partiel
+d'une session précédente), `doc.GetElement(eid)` ne lève pas — il
+retourne juste `None`. Cascade : `element.get_Parameter(...)` →
+`AttributeError: 'NoneType' object has no attribute 'get_Parameter'`.
+Le LLM diagnostiquait à tort un « problème de session ElementId »
+qui n'existe pas en réalité.
+
+Fix : helper centralisé `revit_primitives.get_element_or_raise(doc,
+eid, llm_id, kind)`. Renvoie l'`Element` ou lève une `ValueError`
+actionnable : *« Revit binding stale for window window_X (ElementId
+N): element not found in document. Run Refresh KG to purge orphan
+KG nodes, then retry. »* Appliqué dans les 4 setters openings +
+`_swap_to_type_internal`. À étendre aux walls/columns à l'occasion
+(dette).
+
+**5. `levels_create` ne créait pas le FloorPlan associé.** L'API
+`Level.Create(doc, elev)` côté code crée le Level mais *pas* la vue
+Plan d'étage, contrairement à l'UI ruban Revit qui propose
+automatiquement la création. Du coup le nouveau niveau apparaissait
+en élévation et en arborescence Vue, mais pas dans la liste Plans
+d'étage — UX cassée par rapport à l'attente utilisateur.
+
+Fix : flag `create_floor_plan=True` par défaut sur `levels_create`
+qui appelle `ViewPlan.Create(doc, vft.Id, level.Id)` dans la même
+Tx après le Level. ViewFamilyType FloorPlan résolu via
+`FilteredElementCollector(doc).OfClass(ViewFamilyType)`. Nouveau
+tool `levels_create_floor_plan(llm_id)` pour réparer un niveau
+existant (cas du SS01 créé pré-fix). Le ViewPlan n'est pas bindé au
+KG (vues = V1, cf. dette `catalog_list_views`).
+
+**6. LLM passant `preserve_sill=False` par accident.** Le LLM,
+voyant les flags `preserve_sill` / `preserve_head` dans la docstring
+des setters et confondant leur sémantique, a passé `preserve_sill=False`
+sur un appel `openings_set_head_height_many`. Conséquence : pas de
+pré-flight `_maybe_decouple`, `param.Set(head=2.0)` direct → Revit
+recompute sill = head − family.opening_height = 2.0 − 1.2 = 0.8m
+(au lieu du 1.0m attendu). C'était **exactement** le bug rapporté
+2026-05-12 matin que session c devait éviter — mais en runtime,
+pas reproductible côté tests parce que les tests passent toujours
+le flag par défaut.
+
+Fix : durcissement du `_STATIC_SYSTEM_PROMPT` dans `prompt.pushbutton`
+avec une règle explicite : « **NE PASSE JAMAIS** les flags `preserve_*`
+sauf demande utilisateur explicite (« accepte que l'allège bouge »).
+Mauvaise manipulation = bug 2026-05-12. »
+
+### UX
+
+- **`lib/ui_dialogs.py`** : `show_selectable_text(title, body)` —
+  fenêtre WinForms `Form` + `TextBox` (Multiline, ReadOnly, Vertical
+  scroll, Consolas) + bouton « Copier » qui pousse au clipboard +
+  bouton « Fermer » + Esc=Close + Ctrl+A select-all. Préserve le
+  clipboard utilisateur (pas d'auto-copy par défaut).
+- `prompt.pushbutton/script.py` : `_show()` (réponse LLM finale)
+  passe par `show_selectable_text` ; `_show_error()` reste sur
+  `TaskDialog` (chemin d'erreur, pas de dépendance autre).
+- `refresh_kg.pushbutton/script.py` : pareil. Summary étendu avec
+  les nouveaux compteurs **Door types / Doors / Window types /
+  Windows / Rooms** + `preserved_llm_ids` (manquaient sur le
+  rendering du dialog, alors que les données étaient déjà calculées
+  par `kg_sync.full_rescan` depuis sessions 4 et a). Ligne « skipped »
+  rendue compacte (only-nonzero).
+
+### Validation runtime
+
+Après l'enchaînement des fixes, le scénario phare **test 3b
+auto-découple** a passé end-to-end :
+
+- Setup : 4 fenêtres sur SS01, sill=1.0 head=2.20, type
+  `0.60 × 1.20m (Appui en aluminium)`, opening_height=1.20m.
+- Prompt : « passe le linteau à 2.0m, préserve l'allège à 1.0m ».
+- Résultat : **`decoupled_count=4, auto_variants_created=0`** —
+  les 4 fenêtres swappées vers un variant `[auto h100cm]`
+  *préexistant* (créé lors d'une tentative antérieure puis réutilisé
+  → idempotence). sill=1.00m, head=2.00m réels dans Revit.
+
+C'est exactement le comportement spécifié par session c.
+
+### État final & reste à faire
+
+**Acquis session g** :
+- 6 bugs runtime fixés ✓
+- Helper `get_element_or_raise` ✓
+- `levels_create` + FloorPlan + tool de réparation ✓
+- Dialog sélectionnable + Copier ✓
+- Refresh KG summary complet ✓
+- System prompt durci (level naming + preserve_*) ✓
+- 332 tests verts, aucune régression ✓
+- Bug rapporté 2026-05-12 matin **réglé runtime end-to-end** ✓
+
+**Dettes ouvertes** (héritage + nouveau) :
+- Étendre `get_element_or_raise` aux setters walls/columns
+  (même classe de bug potentiel).
+- Validation runtime restante : test 4 (purge), test 5 (bulk filter),
+  test 6 (DWG ingest). À couvrir à la prochaine session.
+- Drift utilisateur hors pipeline (events `DocumentChanged`) toujours
+  ouvert.
+- `boundary_walls` Rooms, `connects_at`, `catalog_list_views`
+  toujours en dette (préreq auto-cotation).
+
+**Leçon générique** : la validation runtime sur projet Revit réel
+remonte des bugs que la couverture tests KG-only ne peut pas
+capturer (path Revit mocké au mieux, jamais exécuté). Pattern à
+réinjecter dans la roadmap : prévoir une session runtime *après*
+chaque livraison V0 majeure, pas seulement après V0 Sem.4-5.
+
+---
+
 ## 2026-05-12 (session f) — UC1 DWG/DXF ingest : reader + classifier + tools (V0 Sem.4-5)
 
 ### Contexte & objectif
