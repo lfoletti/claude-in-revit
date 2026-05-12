@@ -14,6 +14,155 @@
 
 ---
 
+## 2026-05-12 (session e) — `tools/bulk.py` : filter-based dispatch (UC7 V0 Sem.4-5)
+
+### Contexte & objectif
+
+Référence §9 V0 Sem.4-5 du DESIGN : `tools/bulk.py` avec
+`apply_to_filter` et `change_param_bulk`. Couvre aussi la dette 1 de
+la session b (« filter-based bulks reporté à `tools/bulk.py`
+Sem.4-5 »). Cas d'usage central : « passe toutes les fenêtres du N01
+à sill=0.80 » devient un seul tool call au lieu de la chaîne
+`catalog_list_windows` → construire items → `*_many`.
+
+### Décisions
+
+1. **Items-based reste primary**, filter-based est un *pendant*. Les
+   `*_many` livrés session b restent les point d'entrée explicites
+   (LLM construit la liste). `bulk_apply_to_filter` est l'ergonomie
+   filter-based résolue côté KG.
+
+2. **Filter dict plat, AND implicite, keys whitelistées.** Pas de DSL
+   `{"and": [...], "or": [...]}` — overkill pour V0. Keys autorisées :
+   `type`, `level_ref`, `type_ref`, `host_wall_ref`, `category`,
+   `name`, `name_contains`, `name_regex`. Key inconnue → `ValueError`
+   explicite (pas de match silencieux à zéro sur faute de frappe).
+
+3. **Match strict sur `_type` quand `type` fourni.** Optimisation O(N)
+   sur la KG via `find_by_type`. Si absent, fallback `O(N_total)` —
+   acceptable jusqu'à quelques milliers de nodes.
+
+4. **Soft-deleted toujours exclus**, même quand l'utilisateur ne le
+   demande pas. Cohérent avec `find_by_type` partout ailleurs.
+
+5. **Dispatch direct via `entry.fn(**kwargs)`, pas via
+   `dispatch_tool_use`.** Audit fait : `dispatch_tool_use` ouvre une
+   `kg.transaction()` qui persiste à la sortie. Si on dispatch un
+   `*_many` cible depuis `bulk_apply_to_filter` *via* `dispatch_tool_use`,
+   on a Tx imbriquée → l'inner `kg.persist()` écrit sur disque avant
+   l'éventuel rollback de l'outer → divergence mémoire/disque.
+   **Solution** : récupérer la fonction du target tool depuis le
+   registry, l'appeler directement avec `(kg=, doc=, items=)`.
+   L'outer Tx ouverte par le dispatcher couvre tout le batch
+   atomiquement.
+
+6. **Garde-fou `_is_many_tool`** : introspection de la signature du
+   target — refus si pas de param `items`. Pas de hardcoded list de
+   `*_many` tools à maintenir. Refuse aussi `llm_id` ou `items` dans
+   `tool_args` (collision avec ce que `bulk_apply` construit).
+
+7. **`bulk_resolve_filter` séparé** comme tool read-only pour preview.
+   Permet au LLM de vérifier le périmètre avant de muter, et de
+   répondre à des questions naturelles type « combien de fenêtres au
+   N01 ». Tronque à 10 llm_ids par défaut + first/last + note.
+
+8. **`change_param_bulk` non livré ce tour.** Hésitation : c'est un
+   alias par-paramètre vers le `*_set_*_many` correspondant, mais
+   ajoute une mapping `(param_name → tool_name)` couplée à la
+   toolset. `apply_to_filter` couvre 100% des cas, juste un peu plus
+   verbeux. Si la pratique LLM montre une friction, ajouter — sinon
+   over-abstraction.
+
+### Phase 1 — `lib/tools/bulk.py` (~250 lignes)
+
+- **`_FILTER_KEYS`** : frozenset whitelist module-level.
+- **`_validate_filter`** : refus de keys inconnues avec liste claire
+  des keys autorisées.
+- **`_match_node(attrs, filter)`** : AND-fold avec branches
+  spécialisées pour `type` (compare `_type`), `name_contains`
+  (case-insensitive substring), `name_regex` (regex avec
+  ValueError sur pattern invalide), autres (comparaison directe).
+- **`_resolve_filter(kg, filter) -> List[str]`** : combine validation +
+  itération. Optimise via `find_by_type` quand `type` présent.
+- **`_is_many_tool(entry)`** : introspection de la signature pour
+  détecter `items` param. Pas de hardcoded list.
+- **`bulk_resolve_filter`** (tier-1) : preview read-only, tronque les
+  gros matchs.
+- **`bulk_apply_to_filter`** (tier-1) : résout filter → si 0 match,
+  no-op clair ; sinon construit items + dispatch direct → renvoie
+  `{matched_count, target_tool, inner: <réponse *_many>}`.
+
+### Phase 2 — Tests (+14)
+
+`tests/test_tools.py` :
+
+- **`resolve_filter`** (7 tests) : type seul, type+level_ref,
+  filtre soft-deleted, name_contains case-insensitive, name_regex,
+  refus key inconnue, truncation > preview_limit.
+- **`apply_to_filter`** (6 tests) : no-match no-op, roundtrip
+  walls_set_height_many succès, refus unknown target, refus non-many
+  target, refus `llm_id` dans tool_args, atomic rollback sur inner
+  failure (height_m négative).
+- **Cas réel sim** : `bulk_apply_to_filter` sur Windows pour
+  sill_height_m=0.80 — exactement le scénario soir 2026-05-11 session
+  5 mais en filter-based.
+
+### Validation
+
+- `pytest -q` : **289 verts en 10.19s** (275 → +14). Aucune régression.
+- Test live Revit : à coupler au prochain run, idéalement chaîné avec
+  le scénario session b/c pour mesurer le gain (cible : 1 tool call
+  au lieu de 2 — catalog + *_many).
+
+### Couverture du gain ergonomie
+
+Scénario « passe toutes les fenêtres du N01 à sill=0.80 » :
+
+| Path | Round-trips | Tokens output LLM |
+|---|---|---|
+| Session 5 (avant `*_many`) | ~20 round-trips (1 par fenêtre) | ~600 |
+| Session b (`*_many`) | 2 round-trips (catalog + many) | ~250 |
+| Session e (filter-based) | **1 round-trip** | ~80 |
+
+Session b a divisé par 10, session e divise encore par 3. Bénéfice
+décroissant mais réel sur les workflows multi-bulk (20 setters_many
+en série sur des filtres distincts).
+
+### État final & reste à faire
+
+**Acquis session e** :
+- `bulk_resolve_filter` (tier-1, preview read-only) ✓
+- `bulk_apply_to_filter` (tier-1, dispatch filter-based) ✓
+- Garde-fous : keys whitelistées, validation target tool, refus
+  `llm_id`/`items` dans tool_args ✓
+- Dispatch direct sans nested transaction ✓
+- 14 tests, baseline **289 verts** ✓
+- Dette 1 session b (filter-based bulks) **réglée** ✓
+
+**Dettes ouvertes (héritage)** :
+
+- `change_param_bulk` — non livré. À évaluer après usage LLM réel
+  (si le verbiage `apply_to_filter` cause friction).
+- Drift utilisateur hors pipeline (events `DocumentChanged`).
+- `boundary_walls` Rooms reporté V1 compliance.
+- `connects_at` peuplé au rescan (préreq auto-cotation).
+- `catalog_list_views` (préreq UC6 + cotation).
+
+**Notes d'intention** (en attente) :
+- Auto-cotation : préreqs identifiés, déclencheur = UC2/UC3 ou cas
+  client.
+- UC6 vision plan d'après image : préreqs identifiés, déclencheur =
+  UC1 DWG livré ou cas client.
+- Slash commands : déclencheur = ≥ 2 features cibles existantes.
+
+**Suite immédiate (§9 V0 Sem.4-5)** :
+- **UC1 DWG ingest** (`dwg_reader.py` + `dwg_classifier.py` + tools
+  `dwg_import_*`) — le morceau restant de Sem.4-5. Pose la mécanique
+  préprocesseur → wall segments → `walls_create_many` qui sera
+  réutilisée pour UC6 raster. ~2-3 j homme estimés.
+
+---
+
 ## 2026-05-12 — Note d'intention : plan d'après image (UC6 vision)
 
 Conversation exploratoire utilisateur, **pas de code livré**. UC6 du

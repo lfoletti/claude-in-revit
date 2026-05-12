@@ -96,6 +96,8 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "openings_set_head_height_many",
         "openings_set_type_many",
         "openings_purge_unused_variants",
+        "bulk_resolve_filter",
+        "bulk_apply_to_filter",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -2915,3 +2917,299 @@ def test_purge_unused_variants_refuses_invalid_category(kg_with_seed):
     )
     assert result["is_error"] is True
     assert "Doors" in result["content"]
+
+
+# ----- Bulk filter-based (session 2026-05-12 e — UC7) -----------------------
+
+
+def test_bulk_resolve_filter_by_type(kg_with_levels_and_walltype):
+    """Filter type=Wall sur un KG vide de murs → count=0."""
+    kg, _, _ = kg_with_levels_and_walltype
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Wall"}}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 0
+
+
+def test_bulk_resolve_filter_by_type_and_level_ref(kg_with_levels_and_walltype):
+    """Crée 3 murs au N00 + 2 au N01, filter sur N01 → 2 hits."""
+    kg, level_n00, wt = kg_with_levels_and_walltype
+    # level_n01 ajouté par la fixture.
+    level_n01 = [
+        nid for nid in kg.find_by_type("Level")
+        if kg.get_node(nid)["name"] == "N01"
+    ][0]
+    # 3 murs N00.
+    for k in range(3):
+        kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level_n00,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+    # 2 murs N01.
+    for k in range(2):
+        kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level_n01,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Wall", "level_ref": level_n01}}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+
+
+def test_bulk_resolve_filter_ignores_soft_deleted(kg_with_wall):
+    kg, _, _, wall = kg_with_wall
+    llm_protocol.dispatch_tool_use("walls_delete", {"llm_id": wall}, "t1", kg)
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Wall"}}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 0
+
+
+def test_bulk_resolve_filter_name_contains(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "Salon principal"},
+        "t1", kg,
+    )
+    llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 0.0], "name": "Cuisine"},
+        "t2", kg,
+    )
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Room", "name_contains": "salon"}}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 1
+
+
+def test_bulk_resolve_filter_name_regex(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    for name in ("Chambre 1", "Chambre 2", "Cuisine", "Salon"):
+        llm_protocol.dispatch_tool_use(
+            "rooms_create",
+            {"level_ref": level, "point": [0.0, 0.0], "name": name},
+            "t" + name, kg,
+        )
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Room", "name_regex": "^Chambre"}}, "tx", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+
+
+def test_bulk_resolve_filter_refuses_unknown_key(kg_with_seed):
+    """Faute de frappe LLM (levle_ref au lieu de level_ref) → erreur,
+    pas un match silencieux à zéro."""
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Wall", "levle_ref": "level_001"}}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "Unknown filter keys" in result["content"]
+
+
+def test_bulk_resolve_filter_truncates_large_match(kg_with_levels_and_walltype):
+    """> preview_limit → tronque + first/last/note."""
+    kg, level, wt = kg_with_levels_and_walltype
+    for k in range(15):
+        kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_resolve_filter",
+        {"filter": {"type": "Wall"}, "preview_limit": 5}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 15
+    assert len(payload["llm_ids"]) == 5
+    assert "first_llm_id" in payload
+    assert "last_llm_id" in payload
+    assert "Truncated" in payload["note"]
+
+
+def test_bulk_apply_to_filter_no_match_is_noop(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height_many",
+            "tool_args": {"height_m": 3.0},
+        }, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["matched_count"] == 0
+    assert payload["inner"] is None
+
+
+def test_bulk_apply_to_filter_roundtrip_walls_set_height(
+    kg_with_levels_and_walltype,
+):
+    """3 murs créés → apply set_height_many=3.5 via filter → KG mis à jour."""
+    kg, level, wt = kg_with_levels_and_walltype
+    ids = []
+    for k in range(3):
+        nid = kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+        ids.append(nid)
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height_many",
+            "tool_args": {"height_m": 3.5},
+        }, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["matched_count"] == 3
+    assert payload["target_tool"] == "walls_set_height_many"
+    assert payload["inner"]["count"] == 3
+    assert payload["inner"]["drifted_count"] == 0
+    for nid in ids:
+        assert kg.get_node(nid)["height"] == 3.5
+
+
+def test_bulk_apply_to_filter_refuses_unknown_target(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height_many",  # OK
+            "tool_args": {"height_m": 3.0},
+        }, "t1", kg,
+    )
+    # Pas d'erreur (match=0 → no-op), juste vérifie que le path tient.
+    assert result["is_error"] is False
+
+    # Maintenant un tool inconnu — doit lever.
+    result2 = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_does_not_exist",
+            "tool_args": {"height_m": 3.0},
+        }, "t2", kg,
+    )
+    # Note: si filter matched 0, on n'atteint pas la résolution du tool.
+    # Donc il faut un wall pour exercer la branche d'erreur.
+    kg.add_node("Wall", {
+        "type_ref": "walltype_001", "level_ref": "level_001",
+        "p1": [0.0, 0.0], "p2": [1.0, 0.0], "length": 1.0, "height": 2.7,
+    })
+    result3 = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_does_not_exist",
+            "tool_args": {"height_m": 3.0},
+        }, "t3", kg,
+    )
+    assert result3["is_error"] is True
+    assert "Unknown target_tool" in result3["content"]
+
+
+def test_bulk_apply_to_filter_refuses_non_many_tool(kg_with_wall):
+    """target_tool sans param items → refus."""
+    kg, _, _, wall = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height",  # solo, pas _many
+            "tool_args": {"height_m": 3.0},
+        }, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "doesn't accept `items`" in result["content"]
+
+
+def test_bulk_apply_to_filter_refuses_llm_id_in_tool_args(kg_with_wall):
+    kg, _, _, wall = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height_many",
+            "tool_args": {"height_m": 3.0, "llm_id": wall},
+        }, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "llm_id" in result["content"]
+
+
+def test_bulk_apply_to_filter_with_openings(kg_with_opening_setup):
+    """Cas du soir 2026-05-11 simulé : bulk sill sur toutes les fenêtres."""
+    kg, _, _, wall, wall2, _, window_type = kg_with_opening_setup
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    w2 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall2, "family_type_ref": window_type,
+         "position": [1.0, 5.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Window"},
+            "target_tool": "openings_set_sill_height_many",
+            "tool_args": {"sill_height_m": 0.80},
+        }, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["matched_count"] == 2
+    assert payload["inner"]["count"] == 2
+    assert kg.get_node(w1)["sill_height"] == 0.80
+    assert kg.get_node(w2)["sill_height"] == 0.80
+
+
+def test_bulk_apply_to_filter_atomic_rollback_on_inner_failure(
+    kg_with_levels_and_walltype,
+):
+    """Si le tool cible lève (ex : valeur invalide pour un item),
+    l'outer kg.transaction rollback tout le batch."""
+    kg, level, wt = kg_with_levels_and_walltype
+    ids = []
+    for k in range(2):
+        nid = kg.add_node("Wall", {
+            "type_ref": wt, "level_ref": level,
+            "p1": [0.0, float(k)], "p2": [1.0, float(k)],
+            "length": 1.0, "height": 2.7,
+        })
+        ids.append(nid)
+    # height_m négative → _validate_set_height_item lève.
+    result = llm_protocol.dispatch_tool_use(
+        "bulk_apply_to_filter",
+        {
+            "filter": {"type": "Wall"},
+            "target_tool": "walls_set_height_many",
+            "tool_args": {"height_m": -1.0},
+        }, "t1", kg,
+    )
+    assert result["is_error"] is True
+    # Atomicité : heights inchangées.
+    for nid in ids:
+        assert kg.get_node(nid)["height"] == 2.7
