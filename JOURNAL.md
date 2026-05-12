@@ -14,6 +14,137 @@
 
 ---
 
+## 2026-05-12 — Note d'intention : auto-cotation + slash commands
+
+Conversation exploratoire utilisateur, **pas de code livré**. Consigne ici
+les décisions de design et les préreqs identifiés pour ne pas refaire
+l'analyse à la session suivante. Reprise : quand la roadmap §9 atteint
+UC2/UC3 musclés ou quand le cas client réclame des cotations
+automatiques.
+
+### Auto-cotation — scope et préreqs
+
+**Vision utilisateur** :
+- Cotes externes générales (4 côtés du bbox), offset 1 m.
+- Cotes internes par pièce.
+- Règles graphiques : alignement horizontal / vertical autant que
+  possible, pas de redondance (deux pièces juxtaposées de même largeur
+  → cote uniquement la plus extérieure).
+
+**3 difficultés majeures identifiées** :
+
+1. **API Revit `Reference` notoirement fragile.** Obtenir un Reference
+   stable depuis un mur multi-segments ou curtain demande de la
+   gymnastique (`HostObjectUtils.GetSideFaces`,
+   `FindReferencesByDirection`, etc.). C'est précisément ce que les
+   plugins commerciaux encapsulent et facturent.
+
+2. **L'algorithme de layout est où réside la valeur.** Décomposition
+   des règles utilisateur :
+   - Offset 1 m : paramètre trivial de `NewDimension`.
+   - Alignement orthogonal : snap si angle mur < ε d'un axe.
+   - Déduplication redondance : problème *graphe*. Deux approches :
+     - **Topologique** via le KG (`connects_at` edges) — cohérent avec
+       l'archi, mais nécessite de peupler `connects_at` au
+       `full_rescan` (dette implicite).
+     - **Géométrique** par clustering valeur + axe — plus simple, plus
+       brittle sur plans non orthogonaux.
+     Préférence : topologique (s'inscrit dans le KG, testable hors-Revit).
+
+3. **Cotation intérieure dépend de `Room.boundary_walls`** — actuellement
+   `[]` (reporté V0→V1, cf. session a 2026-05-12 décision 3). Donc
+   phase « cotes intérieures » bloquée derrière cette dette.
+
+**Décomposition en phases** (à exécuter dans l'ordre) :
+
+| Phase | Livre | Bloquants amont | Effort |
+|---|---|---|---|
+| 0 — préreqs | Peupler `connects_at` au rescan + `Room.boundary_walls` calculé via `GetBoundarySegments` + `catalog_list_views` | aucun, bénéfique indépendamment | ~½ jour |
+| 1 — externes seules | `dimensions_create_external(view_ref, offset_m=1.0)` : bbox + 4 chaînes + dédup horiz/vert | `catalog_list_views` (phase 0 partiel) | ~1 jour |
+| 2 — internes | `dimensions_create_room_interior(room_ref, offset_m)` + dédup inter-room | phase 0 complet (boundary_walls) | ~1-2 jours |
+| 3 — orchestrateur | `dimensions_auto_all(view_ref)` + `dimensions_clear` + `dimensions_purge_redundant` | phases 1+2 | ~½ jour |
+
+**Architecture** :
+- `lib/dimensioning_strategy.py` — pure logic (no Revit imports),
+  testable hors-Revit. Calcule les chaînes de cotes à poser à partir
+  d'une représentation abstraite des murs / refs / pièces.
+- `lib/tools/dimensioning.py` — wrappers tools, doc-aware comme
+  partout.
+- `revit_primitives.py` — extensions Reference handling
+  (`wall_face_references(wall, side)`, `room_boundary_references(room)`).
+- Schéma KG : décision à prendre — node type `Dimension` ou
+  annotations purement view-side hors KG ? Argument pour le KG :
+  permet la dédup et la "Refresh dim" symétrique au reste. Argument
+  contre : annotations sont view-bound, pas modèle, pollution du KG.
+  À trancher au moment de l'implémentation.
+
+**Estimation totale** : 3-4 jours homme. Significatif mais
+décomposable. Pas dans le scope V0 (§9 — Sem.4-5 = DWG + bulk
+génériques).
+
+**Déclencheur de reprise** : quand un client demande explicitement de
+l'auto-cotation, ou quand UC2/UC3 (modifications géométriques
+musclées) deviennent prioritaires et qu'on veut le pipeline complet
+« crée → cote → exporte ».
+
+### Slash commands — design retenu
+
+**Contrainte design** : CLAUDE.md §Vision verrouille un *unique point
+d'entrée conversationnel* (`prompt.pushbutton`). Pas de pushbutton
+par feature. Donc on reste dans la zone de texte avec du sucre
+syntaxique côté script.
+
+**Option retenue** : **A + D combinés** (voir réponse utilisateur
+in-conversation pour les 4 options évaluées) :
+
+- **D** (passive, déjà en place de facto) : le LLM route correctement
+  les phrases naturelles (« cote tout », « auto-cote ce plan ») vers
+  les bons tools via les `Phrases:` des docstrings. Pas de code à
+  écrire — c'est l'effet du registry tier-1 + routing.
+- **A** (active, à implémenter quand utile) : parser dans
+  `prompt.pushbutton/script.py` — `/<word>` en début de message est
+  remplacé par un prompt long pré-rédigé chargé depuis
+  `~/.config/claude-in-revit/slash_commands.json`. ~30 LoC.
+
+**Mapping initial** (à étendre au fil des features) :
+```json
+{
+  "/auto-cotation": "Génère les cotations auto sur la vue active : externes 1m offset puis intérieures par pièce, supprime redondances. Utilise dimensions_auto_all.",
+  "/audit-walls": "Compte les murs par niveau et par type, signale les anomalies (hauteurs incohérentes, types orphelins).",
+  "/refresh-rooms": "Lance rooms_recompute_boundaries sur toutes les pièces et rapporte les aires."
+}
+```
+
+**Tool optionnel** : `/help` qui liste les commandes disponibles
+(pratique pour la découverte).
+
+**Déclencheur de reprise** : quand au moins **2 features cibles
+existent** dont la commande aurait du sens (auto-cotation + une
+autre). Implémenter A pour un seul mapping est over-engineering.
+
+### Préreqs identifiés pour la suite (résumé exécutable)
+
+Ces 3 dettes sont **bénéfiques indépendamment** de l'auto-cotation :
+
+1. **Peupler `connects_at`** dans `kg_sync.full_rescan` — détection des
+   coins / T / cross entre murs. Le edge_type existe dans
+   `EDGE_TYPES` mais n'est jamais posé. Utile dès qu'on veut raisonner
+   sur l'enveloppe d'un bâtiment.
+
+2. **Calculer `Room.boundary_walls`** via `Room.GetBoundarySegments`
+   au `_room_to_attrs`. Permet aussi UC8 compliance (parcours
+   d'évacuation, hauteur sous plafond par room avec mur adjacent).
+
+3. **`catalog_list_views`** — Plan, Section, 3D. Inventaire des vues
+   du projet. Utile pour tout tool view-bound (annotations,
+   dimensions, tags, exports).
+
+Reprises naturelles : au prochain run où l'un de ces 3 manque,
+prioriser celui qui débloque le tool en cours plutôt que de tout
+faire d'un bloc.
+
+---
+
 ## 2026-05-12 (session d) — `openings_purge_unused_variants`
 
 ### Contexte & objectif
