@@ -86,9 +86,15 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "rooms_recompute_boundaries",
         "rooms_get_area",
         "rooms_delete",
+        "rooms_set_name_many",
         "levels_create",
         "levels_set_elevation",
         "levels_set_name",
+        "walls_set_height_many",
+        "walls_move_many",
+        "openings_set_sill_height_many",
+        "openings_set_head_height_many",
+        "openings_set_type_many",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",
@@ -2224,3 +2230,318 @@ def test_levels_set_name_refuses_duplicate(kg_with_seed):
     )
     assert result["is_error"] is True
     assert "already exists" in result["content"]
+
+
+# ----- Bulk setters (V0 session 2026-05-12 b — dette setters_many) -----------
+
+
+def test_bulk_setter_summary_no_drift_shape():
+    from lib.tools._helpers import bulk_setter_summary
+    out = bulk_setter_summary([], count=5, revit_modified=False)
+    assert out == {
+        "ok": True, "count": 5, "drifted_count": 0,
+        "drifts": [], "revit_modified": False,
+    }
+
+
+def test_bulk_setter_summary_with_drifts_preserves_order():
+    from lib.tools._helpers import bulk_setter_summary
+    drifts = [
+        {"llm_id": "wall_001", "note": "n1"},
+        {"llm_id": "wall_003", "note": "n2"},
+    ]
+    out = bulk_setter_summary(drifts, count=10, revit_modified=True)
+    assert out["drifted_count"] == 2
+    assert out["drifts"] == drifts
+    assert out["count"] == 10
+    assert out["revit_modified"] is True
+
+
+def test_walls_set_height_many_kg_only_updates_all(kg_with_levels_and_walltype):
+    kg, level, wt = kg_with_levels_and_walltype
+    # Crée 3 murs via create_many
+    items_create = [
+        {"level_ref": level, "wall_type_ref": wt,
+         "p1": [0.0, 0.0], "p2": [3.0, 0.0]},
+        {"level_ref": level, "wall_type_ref": wt,
+         "p1": [3.0, 0.0], "p2": [3.0, 4.0]},
+        {"level_ref": level, "wall_type_ref": wt,
+         "p1": [3.0, 4.0], "p2": [0.0, 4.0]},
+    ]
+    create_result = llm_protocol.dispatch_tool_use(
+        "walls_create_many", {"items": items_create}, "t1", kg,
+    )
+    ids = json.loads(create_result["content"])["llm_ids"]
+
+    set_items = [{"llm_id": lid, "height_m": 3.5} for lid in ids]
+    result = llm_protocol.dispatch_tool_use(
+        "walls_set_height_many", {"items": set_items}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 3
+    assert payload["drifted_count"] == 0
+    assert payload["drifts"] == []
+    assert payload["revit_modified"] is False
+    for lid in ids:
+        assert kg.get_node(lid)["height"] == 3.5
+
+
+def test_walls_set_height_many_atomic_rejects_invalid_item(kg_with_wall):
+    """Un item invalide → ValueError remontée, aucune mutation appliquée."""
+    kg, _, _, wall = kg_with_wall
+    pre = kg.get_node(wall)["height"]
+    result = llm_protocol.dispatch_tool_use(
+        "walls_set_height_many",
+        {"items": [
+            {"llm_id": wall, "height_m": 3.5},
+            {"llm_id": "wall_999", "height_m": 2.0},   # unknown
+        ]}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "items[1]" in result["content"]
+    # Atomicité : la première hauteur n'a pas été appliquée non plus.
+    assert kg.get_node(wall)["height"] == pre
+
+
+def test_walls_set_height_many_refuses_empty_items(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "walls_set_height_many", {"items": []}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "non-empty list" in result["content"]
+
+
+def test_walls_set_height_many_refuses_non_wall(kg_with_wall):
+    kg, level, _, _ = kg_with_wall
+    result = llm_protocol.dispatch_tool_use(
+        "walls_set_height_many",
+        {"items": [{"llm_id": level, "height_m": 3.0}]}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Wall" in result["content"]
+
+
+def test_walls_move_many_kg_only_translates_each(kg_with_levels_and_walltype):
+    kg, level, wt = kg_with_levels_and_walltype
+    create_result = llm_protocol.dispatch_tool_use(
+        "walls_create_many",
+        {"items": [
+            {"level_ref": level, "wall_type_ref": wt,
+             "p1": [0.0, 0.0], "p2": [3.0, 0.0]},
+            {"level_ref": level, "wall_type_ref": wt,
+             "p1": [0.0, 5.0], "p2": [3.0, 5.0]},
+        ]}, "t1", kg,
+    )
+    ids = json.loads(create_result["content"])["llm_ids"]
+
+    set_items = [
+        {"llm_id": ids[0], "dx": 1.0, "dy": 0.0},
+        {"llm_id": ids[1], "dx": 0.0, "dy": 2.0},
+    ]
+    result = llm_protocol.dispatch_tool_use(
+        "walls_move_many", {"items": set_items}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert payload["drifted_count"] == 0
+    assert payload["revit_modified"] is False
+    n1 = kg.get_node(ids[0])
+    n2 = kg.get_node(ids[1])
+    assert n1["p1"] == [1.0, 0.0]
+    assert n1["p2"] == [4.0, 0.0]
+    assert n2["p1"] == [0.0, 7.0]
+    assert n2["p2"] == [3.0, 7.0]
+
+
+def test_walls_move_many_atomic_rollback(kg_with_wall):
+    kg, _, _, wall = kg_with_wall
+    pre_p1 = list(kg.get_node(wall)["p1"])
+    result = llm_protocol.dispatch_tool_use(
+        "walls_move_many",
+        {"items": [
+            {"llm_id": wall, "dx": 1.0, "dy": 0.0},
+            {"llm_id": wall, "dx": "bad", "dy": 0.0},  # type error
+        ]}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert kg.get_node(wall)["p1"] == pre_p1
+
+
+def test_openings_set_sill_height_many_kg_only(kg_with_opening_setup):
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    # Crée 2 fenêtres.
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0], "sill_height": 0.9},
+        "t1", kg,
+    )["content"])["llm_id"]
+    w2 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [3.0, 0.0], "sill_height": 0.9},
+        "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height_many",
+        {"items": [
+            {"llm_id": w1, "sill_height_m": 0.80},
+            {"llm_id": w2, "sill_height_m": 0.80},
+        ]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert payload["drifted_count"] == 0
+    assert kg.get_node(w1)["sill_height"] == 0.80
+    assert kg.get_node(w2)["sill_height"] == 0.80
+
+
+def test_openings_set_head_height_many_kg_only(kg_with_opening_setup):
+    kg, _, _, wall, _, _, window_type = kg_with_opening_setup
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]},
+        "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_head_height_many",
+        {"items": [{"llm_id": w1, "head_height_m": 2.20}]}, "t2", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 1
+    assert payload["drifted_count"] == 0
+    assert kg.get_node(w1)["head_height"] == 2.20
+
+
+def test_openings_set_sill_height_many_refuses_non_opening(kg_with_opening_setup):
+    kg, _, _, wall, _, _, _ = kg_with_opening_setup
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_sill_height_many",
+        {"items": [{"llm_id": wall, "sill_height_m": 1.0}]}, "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "not a Door or Window" in result["content"]
+
+
+def test_openings_set_type_many_kg_only_swaps_each(kg_with_opening_setup):
+    kg, _, _, wall, wall2, door_type, window_type = kg_with_opening_setup
+    # 2 fenêtres sur window_type → swap les deux vers une nouvelle variante.
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    w2 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall2, "family_type_ref": window_type,
+         "position": [1.0, 5.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    # Crée une variante (KG-only) — pas besoin de Revit.
+    variant = kg.add_node("FamilyType", {
+        "family_name": "Fenêtre fixe",
+        "type_name": "1200 x 1400 mm",
+        "category": "Windows",
+        "dimensions": {"height_m": 1.40, "width_m": 1.20},
+    })
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_type_many",
+        {"items": [
+            {"llm_id": w1, "new_family_type_ref": variant},
+            {"llm_id": w2, "new_family_type_ref": variant},
+        ]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert payload["drifted_count"] == 0  # swap binaire, pas de drift KG-only.
+    assert kg.get_node(w1)["type_ref"] == variant
+    assert kg.get_node(w2)["type_ref"] == variant
+
+
+def test_openings_set_type_many_refuses_category_mismatch(kg_with_opening_setup):
+    """Une window ne peut pas swap vers un door type."""
+    kg, _, _, wall, _, door_type, window_type = kg_with_opening_setup
+    w1 = json.loads(llm_protocol.dispatch_tool_use(
+        "openings_create_window",
+        {"host_wall_ref": wall, "family_type_ref": window_type,
+         "position": [1.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "openings_set_type_many",
+        {"items": [{"llm_id": w1, "new_family_type_ref": door_type}]},
+        "t2", kg,
+    )
+    assert result["is_error"] is True
+    assert "category=Doors" in result["content"]
+    # Atomique : w1 n'a pas swap.
+    assert kg.get_node(w1)["type_ref"] == window_type
+
+
+def test_rooms_set_name_many_kg_only(kg_with_seed):
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "A"}, "t1", kg,
+    )["content"])["llm_id"]
+    r2 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 0.0], "name": "B"}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_set_name_many",
+        {"items": [
+            {"llm_id": r1, "name": "Salon"},
+            {"llm_id": r2, "name": "Cuisine"},
+        ]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert payload["drifted_count"] == 0
+    assert kg.get_node(r1)["name"] == "Salon"
+    assert kg.get_node(r2)["name"] == "Cuisine"
+
+
+def test_rooms_set_name_many_allows_duplicate_names(kg_with_seed):
+    """Revit autorise des Rooms homonymes (c'est Number qui est unique).
+    Vérifier que le bulk ne pose pas de pré-check de collision."""
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0]}, "t1", kg,
+    )["content"])["llm_id"]
+    r2 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [5.0, 0.0]}, "t2", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_set_name_many",
+        {"items": [
+            {"llm_id": r1, "name": "Salon"},
+            {"llm_id": r2, "name": "Salon"},  # doublon volontaire.
+        ]}, "t3", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["count"] == 2
+    assert kg.get_node(r1)["name"] == "Salon"
+    assert kg.get_node(r2)["name"] == "Salon"
+
+
+def test_rooms_set_name_many_atomic_rollback(kg_with_seed):
+    """Un name vide → tout le batch est refusé."""
+    kg, level, _ = kg_with_seed
+    r1 = json.loads(llm_protocol.dispatch_tool_use(
+        "rooms_create",
+        {"level_ref": level, "point": [0.0, 0.0], "name": "before"}, "t1", kg,
+    )["content"])["llm_id"]
+    result = llm_protocol.dispatch_tool_use(
+        "rooms_set_name_many",
+        {"items": [
+            {"llm_id": r1, "name": "after"},
+            {"llm_id": r1, "name": "  "},   # invalid
+        ]}, "t2", kg,
+    )
+    assert result["is_error"] is True
+    assert "non-empty" in result["content"]
+    # Atomic : "after" n'a pas été appliqué.
+    assert kg.get_node(r1)["name"] == "before"

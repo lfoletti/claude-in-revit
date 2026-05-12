@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
-from ._helpers import stamp_llm_id
+from ._helpers import bulk_setter_summary, stamp_llm_id
 
 
 # ----- Internal helpers --------------------------------------------------
@@ -454,3 +454,115 @@ def delete(
         "deleted_at_turn": kg.turn,
         "revit_deleted": True,
     }
+
+
+# ----- Bulk setters (V0 session 2026-05-12 b — dette setters_many) ----------
+
+
+def _validate_set_name_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int,
+) -> Dict[str, Any]:
+    """Preflight one item from `rooms_set_name_many` : `{llm_id, name}`.
+    Collision detection happens at batch level (cross-item + vs untouched),
+    not here."""
+    if not isinstance(item, dict):
+        raise ValueError(
+            "items[{}] must be a dict, got {}".format(index, type(item).__name__)
+        )
+    llm_id = item.get("llm_id")
+    name = item.get("name")
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") != "Room":
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Room".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is soft-deleted".format(index, llm_id)
+        )
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            "items[{}]: name must be a non-empty string".format(index)
+        )
+    return {"llm_id": llm_id, "name": name.strip()}
+
+
+@tool(name="rooms_set_name_many", tier=1)
+def set_name_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Renomme N pièces en une seule Tx Revit + une seule Tx KG.
+
+    **Note Revit** : contrairement aux Levels, les Rooms autorisent
+    plusieurs pièces avec le même nom (c'est le `Number` qui doit être
+    unique, pas le `Name`). Donc pas de pré-check de collision côté
+    KG — on laisse l'utilisateur libre de nommer deux salons "Salon".
+
+    Concepts: pièce, room, nom, renomme, bulk, batch, plusieurs, masse
+    Phrases: "renomme toutes ces pièces", "uniformise les noms",
+             "bulk rename rooms"
+    Similar: rooms_set_name, levels_set_name
+
+    Args:
+        items: liste de specs `{llm_id: str, name: str}`. Au moins un
+            item, chaque `llm_id` doit pointer sur une Room vivante.
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`). Drifts pointent
+        les rooms où le name committé ≠ name demandé (rare — Revit
+        accepte presque toujours un name string).
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [_validate_set_name_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for spec in specs:
+            kg.modify_node(spec["llm_id"], {"name": spec["name"]})
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: Room {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+
+    from .. import kg_sync, revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    drifts: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "rooms.set_name_many"):
+        for spec in specs:
+            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            room = doc.GetElement(eid)
+            param = room.get_Parameter(BuiltInParameter.ROOM_NAME)
+            if param is None:
+                raise ValueError(
+                    "Room {} has no ROOM_NAME parameter — unexpected.".format(
+                        spec["llm_id"],
+                    )
+                )
+            if param.IsReadOnly:
+                raise ValueError(
+                    "ROOM_NAME on {} is read-only.".format(spec["llm_id"])
+                )
+            param.Set(spec["name"])
+            kg_sync.refresh_node_from_revit(kg, doc, spec["llm_id"])
+            actual = kg.get_node(spec["llm_id"]).get("name", spec["name"])
+            if actual != spec["name"]:
+                drifts.append({
+                    "llm_id": spec["llm_id"],
+                    "note": "Revit a commit name={!r} au lieu de {!r}".format(
+                        actual, spec["name"],
+                    ),
+                })
+
+    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)

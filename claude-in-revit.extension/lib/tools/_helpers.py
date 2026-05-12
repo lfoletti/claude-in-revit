@@ -100,6 +100,47 @@ def bulk_summary(
     return out
 
 
+def bulk_setter_summary(
+    drifts: Sequence[Dict[str, Any]],
+    *,
+    count: int,
+    revit_modified: bool,
+) -> Dict[str, Any]:
+    """Compact response shape for any bulk setter / mover (`*_set_*_many`,
+    `*_move_many`).
+
+    Goal : keep the response under ~50 tokens when *nothing* drifted (the
+    common path) while still surfacing the per-item drift info when Revit
+    overrode a value. The LLM reads `drifted_count` first; if it's zero,
+    `drifts` is `[]` and there's nothing to react to. If it's positive,
+    the per-item entries give it enough to identify the affected
+    elements and suggest a follow-up (e.g. swap type via
+    `openings_set_type` when a sill drift signals a rigid `opening_height`).
+
+    Args:
+        drifts: per-item drift dicts emitted by the caller — each entry
+            is `{"llm_id": str, "note": str}` and is only included for
+            items that actually drifted. Items committed cleanly are
+            absent (intentionally — drives the token-compact common path).
+        count: total number of items the bulk applied to (drifted +
+            clean). Equals `len(items)` for the items-based shape.
+        revit_modified: whether the operation actually touched Revit
+            (False in KG-only / pytest paths).
+
+    Returns:
+        `{ok, count, drifted_count, drifts, revit_modified}`. `ok` is
+        always True — if the bulk failed atomically (validation, Revit
+        rollback) the caller raises rather than returning.
+    """
+    return {
+        "ok": True,
+        "count": count,
+        "drifted_count": len(drifts),
+        "drifts": list(drifts),
+        "revit_modified": revit_modified,
+    }
+
+
 def stamp_llm_id(element: Any, llm_id: str) -> None:
     """Mirror the KG-side llm_id onto the Revit element's shared parameter.
 

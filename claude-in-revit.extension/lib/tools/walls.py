@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 
-from ._helpers import bulk_summary, stamp_llm_id
+from ._helpers import bulk_setter_summary, bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 
@@ -725,3 +725,245 @@ def create_from_lines(
             "height": height,
         })
     return create_many(kg=kg, doc=doc, items=items)
+
+
+# ----- Bulk setters / movers (V0 session 2026-05-12 b — dette setters_many) -
+
+
+def _validate_set_height_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int,
+) -> Dict[str, Any]:
+    """Preflight one item from `walls_set_height_many` : `{llm_id, height_m}`."""
+    if not isinstance(item, dict):
+        raise ValueError(
+            "items[{}] must be a dict, got {}".format(index, type(item).__name__)
+        )
+    llm_id = item.get("llm_id")
+    height = item.get("height_m")
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") != "Wall":
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Wall".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is soft-deleted".format(index, llm_id)
+        )
+    if not isinstance(height, (int, float)) or height <= 0:
+        raise ValueError(
+            "items[{}]: height_m must be a positive number".format(index)
+        )
+    return {"llm_id": llm_id, "height_m": float(height)}
+
+
+@tool(name="walls_set_height_many", tier=1)
+def set_height_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Change la hauteur de N murs en **une seule** Tx Revit + une seule Tx KG.
+
+    Préférer ce tool à N appels séparés à `walls_set_height` dès qu'il y
+    a plusieurs murs à ajuster — un appel API au lieu de N, cache hit
+    rate meilleur, latence /N. Transactionnel : un item invalide
+    (llm_id inconnu, soft-deleted, height négative) → **aucune mutation**
+    n'est commitée.
+
+    Concepts: mur, hauteur, bulk, batch, plusieurs, masse, height
+    Phrases: "monte tous ces murs à 3 m", "uniformise les hauteurs",
+             "bulk set wall heights", "ajuste la hauteur de ces murs"
+    Similar: walls_set_height, walls_move_many, openings_set_sill_height_many
+
+    Args:
+        items: liste de specs `{llm_id: str, height_m: float}`. Au moins
+            un item, chaque `llm_id` doit pointer sur un Wall vivant.
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`) :
+        `{ok, count, drifted_count, drifts: [{llm_id, note}, ...],
+          revit_modified}`. Seuls les murs où Revit a refusé / décalé la
+        hauteur (Top Constraint, contrainte de niveau) apparaissent dans
+        `drifts` — les autres ont été commités tels que demandés.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [_validate_set_height_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for spec in specs:
+            kg.modify_node(spec["llm_id"], {"height": spec["height_m"]})
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    # Binding pre-checks before any Revit import : fail fast on missing
+    # _revit_id rather than crash inside the Tx.
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: Wall {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+
+    from .. import kg_sync, revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    drifts: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "walls.set_height_many"):
+        for spec in specs:
+            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            wall = doc.GetElement(eid)
+            param = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+            if param is None:
+                raise ValueError(
+                    "Wall {} has no WALL_USER_HEIGHT_PARAM — type may not be a "
+                    "Basic Wall (curtain walls don't expose this parameter).".format(
+                        spec["llm_id"],
+                    )
+                )
+            ok = param.Set(rp.meters_to_internal(spec["height_m"]))
+            if not ok:
+                raise ValueError(
+                    "Setting WALL_USER_HEIGHT_PARAM on {} returned False — "
+                    "parameter may be read-only (Top Constraint).".format(
+                        spec["llm_id"],
+                    )
+                )
+            kg_sync.refresh_node_from_revit(kg, doc, spec["llm_id"])
+            actual = kg.get_node(spec["llm_id"]).get("height", spec["height_m"])
+            drift, drift_note = kg_sync.detect_drift(
+                spec["height_m"], actual, field="height_m",
+            )
+            if drift:
+                drifts.append({
+                    "llm_id": spec["llm_id"],
+                    "note": (
+                        (drift_note or "")
+                        + " (probable Top Constraint)"
+                    ).strip(),
+                })
+
+    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+
+
+def _validate_move_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int,
+) -> Dict[str, Any]:
+    """Preflight one item from `walls_move_many` : `{llm_id, dx, dy}`."""
+    if not isinstance(item, dict):
+        raise ValueError(
+            "items[{}] must be a dict, got {}".format(index, type(item).__name__)
+        )
+    llm_id = item.get("llm_id")
+    dx = item.get("dx")
+    dy = item.get("dy")
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") != "Wall":
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Wall".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is soft-deleted".format(index, llm_id)
+        )
+    if not isinstance(dx, (int, float)) or not isinstance(dy, (int, float)):
+        raise ValueError(
+            "items[{}]: dx and dy must be numeric".format(index)
+        )
+    return {"llm_id": llm_id, "dx": float(dx), "dy": float(dy)}
+
+
+@tool(name="walls_move_many", tier=1)
+def move_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Translate N murs (chacun de son `(dx, dy)` propre) en **une seule**
+    Tx Revit + une seule Tx KG.
+
+    Cas typique : décaler tous les murs d'une trame de 50 mm, ajuster
+    une rangée de murs à une nouvelle ligne d'alignement. Préférer ce
+    tool à N appels séparés. Transactionnel.
+
+    Concepts: mur, déplacement, translation, bulk, batch, move, masse
+    Phrases: "déplace ces murs", "décale cette trame", "translate walls",
+             "bulk move"
+    Similar: walls_move, walls_set_height_many, elements_translate
+
+    Args:
+        items: liste de specs `{llm_id: str, dx: float, dy: float}`. Au
+            moins un item. Les déplacements sont *par item* — pour un
+            déplacement uniforme sur N murs, c'est plus compact d'appeler
+            `elements_translate` avec la liste de llm_ids.
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`). Drifts
+        signalent les murs dont Revit a snappé / refusé le déplacement
+        (alignement verrouillé, contrainte d'extrémité, etc.).
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [_validate_move_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for spec in specs:
+            node = kg.get_node(spec["llm_id"])
+            new_p1 = [node["p1"][0] + spec["dx"], node["p1"][1] + spec["dy"]]
+            new_p2 = [node["p2"][0] + spec["dx"], node["p2"][1] + spec["dy"]]
+            kg.modify_node(spec["llm_id"], {"p1": new_p1, "p2": new_p2})
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: Wall {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+
+    from .. import kg_sync, revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId, ElementTransformUtils, XYZ
+
+    drifts: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "walls.move_many"):
+        for spec in specs:
+            node = kg.get_node(spec["llm_id"])
+            requested_p1 = [
+                node["p1"][0] + spec["dx"],
+                node["p1"][1] + spec["dy"],
+            ]
+            requested_p2 = [
+                node["p2"][0] + spec["dx"],
+                node["p2"][1] + spec["dy"],
+            ]
+            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            translation = XYZ(
+                rp.meters_to_internal(spec["dx"]),
+                rp.meters_to_internal(spec["dy"]),
+                0.0,
+            )
+            ElementTransformUtils.MoveElement(doc, eid, translation)
+            kg_sync.refresh_node_from_revit(kg, doc, spec["llm_id"])
+            refreshed = kg.get_node(spec["llm_id"])
+            drift_p1, note_p1 = kg_sync.detect_drift(
+                requested_p1, refreshed["p1"], field="p1",
+            )
+            drift_p2, note_p2 = kg_sync.detect_drift(
+                requested_p2, refreshed["p2"], field="p2",
+            )
+            if drift_p1 or drift_p2:
+                drifts.append({
+                    "llm_id": spec["llm_id"],
+                    "note": note_p1 or note_p2,
+                })
+
+    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)

@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
-from ._helpers import bulk_summary, stamp_llm_id
+from ._helpers import bulk_setter_summary, bulk_summary, stamp_llm_id
 
 
 # ----- Internal helpers --------------------------------------------------
@@ -1186,3 +1186,362 @@ def delete(
         "deleted_at_turn": kg.turn,
         "revit_deleted": True,
     }
+
+
+# ----- Bulk setters (V0 session 2026-05-12 b — dette setters_many) ----------
+
+
+def _validate_sill_or_head_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int, field: str,
+) -> Dict[str, Any]:
+    """Preflight one item from `openings_set_sill_height_many` /
+    `_head_height_many`. `field` is `"sill_height_m"` or `"head_height_m"`."""
+    if not isinstance(item, dict):
+        raise ValueError(
+            "items[{}] must be a dict, got {}".format(index, type(item).__name__)
+        )
+    llm_id = item.get("llm_id")
+    value = item.get(field)
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") not in ("Door", "Window"):
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Door or Window".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is soft-deleted".format(index, llm_id)
+        )
+    if not isinstance(value, (int, float)):
+        raise ValueError(
+            "items[{}]: {} must be numeric".format(index, field)
+        )
+    return {"llm_id": llm_id, field: float(value)}
+
+
+@tool(name="openings_set_sill_height_many", tier=1)
+def set_sill_height_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Règle l'allège (`INSTANCE_SILL_HEIGHT_PARAM`) de N ouvertures en
+    **une seule** Tx Revit + une seule Tx KG.
+
+    Couplage sill ↔ head identique au tool solo : la hauteur d'ouverture
+    est fixée par le TYPE (FamilySymbol), donc setter le sill décale le
+    head. Pour découpler, switcher de type via `openings_set_type_many`
+    (ou créer une variante avec `openings_create_type_variant`).
+
+    Concepts: allège, sill, bulk, batch, plusieurs, masse
+    Phrases: "passe toutes ces allèges à 0.80 m", "uniformise les sill",
+             "bulk set sill heights"
+    Similar: openings_set_sill_height, openings_set_head_height_many,
+             openings_set_type_many
+
+    Args:
+        items: liste de specs `{llm_id: str, sill_height_m: float}`. Au
+            moins un item, chaque `llm_id` pointe sur une Door ou Window
+            vivante.
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`). Drifts pointent
+        les ouvertures où sill final ≠ sill demandé (contrainte
+        `opening_height` du type incompatible).
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [
+        _validate_sill_or_head_item(kg, it, i, "sill_height_m")
+        for i, it in enumerate(items)
+    ]
+
+    if doc is None:
+        for spec in specs:
+            kg.modify_node(spec["llm_id"], {"sill_height": spec["sill_height_m"]})
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    drifts: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "openings.set_sill_height_many"):
+        for spec in specs:
+            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            element = doc.GetElement(eid)
+            param = element.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+            if param is None or param.IsReadOnly:
+                raise ValueError(
+                    "{} doesn't expose writable INSTANCE_SILL_HEIGHT_PARAM "
+                    "(read-only or not on this family).".format(spec["llm_id"])
+                )
+            ok = bool(param.Set(rp.meters_to_internal(spec["sill_height_m"])))
+            if not ok:
+                raise ValueError(
+                    "Revit refused to set sill on {} — check family constraints.".format(
+                        spec["llm_id"],
+                    )
+                )
+            reread = _read_sill_head_m(element)
+            kg_updates: Dict[str, Any] = {}
+            if reread["sill_height_m"] is not None:
+                kg_updates["sill_height"] = float(reread["sill_height_m"])
+            if reread["head_height_m"] is not None:
+                kg_updates["head_height"] = float(reread["head_height_m"])
+            if kg_updates:
+                kg.modify_node(spec["llm_id"], kg_updates)
+            note = _drift_note(
+                "sill_height", spec["sill_height_m"],
+                reread["sill_height_m"], reread["head_height_m"],
+            )
+            if note is not None:
+                drifts.append({"llm_id": spec["llm_id"], "note": note})
+
+    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+
+
+@tool(name="openings_set_head_height_many", tier=1)
+def set_head_height_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Règle le linteau (`INSTANCE_HEAD_HEIGHT_PARAM`) de N ouvertures en
+    **une seule** Tx Revit + une seule Tx KG.
+
+    Symétrique de `openings_set_sill_height_many`. Couplage sill ↔ head
+    identique : changer le head décale le sill via la hauteur
+    d'ouverture du type.
+
+    Concepts: linteau, head, lintel, bulk, batch, plusieurs, masse
+    Phrases: "passe tous ces linteaux à 2.10 m", "uniformise les head",
+             "bulk set head heights"
+    Similar: openings_set_head_height, openings_set_sill_height_many,
+             openings_set_type_many
+
+    Args:
+        items: liste de specs `{llm_id: str, head_height_m: float}`.
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`).
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [
+        _validate_sill_or_head_item(kg, it, i, "head_height_m")
+        for i, it in enumerate(items)
+    ]
+
+    if doc is None:
+        for spec in specs:
+            kg.modify_node(spec["llm_id"], {"head_height": spec["head_height_m"]})
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    drifts: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "openings.set_head_height_many"):
+        for spec in specs:
+            eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            element = doc.GetElement(eid)
+            param = element.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+            if param is None or param.IsReadOnly:
+                raise ValueError(
+                    "{} doesn't expose writable INSTANCE_HEAD_HEIGHT_PARAM "
+                    "(read-only or not on this family).".format(spec["llm_id"])
+                )
+            ok = bool(param.Set(rp.meters_to_internal(spec["head_height_m"])))
+            if not ok:
+                raise ValueError(
+                    "Revit refused to set head on {} — check family constraints.".format(
+                        spec["llm_id"],
+                    )
+                )
+            reread = _read_sill_head_m(element)
+            kg_updates: Dict[str, Any] = {}
+            if reread["sill_height_m"] is not None:
+                kg_updates["sill_height"] = float(reread["sill_height_m"])
+            if reread["head_height_m"] is not None:
+                kg_updates["head_height"] = float(reread["head_height_m"])
+            if kg_updates:
+                kg.modify_node(spec["llm_id"], kg_updates)
+            note = _drift_note(
+                "head_height", spec["head_height_m"],
+                reread["sill_height_m"], reread["head_height_m"],
+            )
+            if note is not None:
+                drifts.append({"llm_id": spec["llm_id"], "note": note})
+
+    return bulk_setter_summary(drifts, count=len(specs), revit_modified=True)
+
+
+def _validate_set_type_item(
+    kg: ProjectKG, item: Dict[str, Any], index: int,
+) -> Dict[str, Any]:
+    """Preflight one item from `openings_set_type_many` :
+    `{llm_id, new_family_type_ref}`. Vérifie la catégorie (Door reste
+    Door, Window reste Window) — pas de mélange par accident."""
+    if not isinstance(item, dict):
+        raise ValueError(
+            "items[{}] must be a dict, got {}".format(index, type(item).__name__)
+        )
+    llm_id = item.get("llm_id")
+    new_type_ref = item.get("new_family_type_ref")
+    if not isinstance(llm_id, str) or not kg.has_node(llm_id):
+        raise ValueError("items[{}]: unknown llm_id {!r}".format(index, llm_id))
+    node = kg.get_node(llm_id)
+    if node.get("_type") not in ("Door", "Window"):
+        raise ValueError(
+            "items[{}]: {} is a {}, not a Door or Window".format(
+                index, llm_id, node.get("_type"),
+            )
+        )
+    if node.get("deleted_at_turn") is not None:
+        raise ValueError(
+            "items[{}]: {} is soft-deleted".format(index, llm_id)
+        )
+    if not isinstance(new_type_ref, str) or not kg.has_node(new_type_ref):
+        raise ValueError(
+            "items[{}]: unknown new_family_type_ref {!r}".format(index, new_type_ref)
+        )
+    new_type = kg.get_node(new_type_ref)
+    if new_type.get("_type") != "FamilyType":
+        raise ValueError(
+            "items[{}]: new_family_type_ref {} is a {}, not a FamilyType".format(
+                index, new_type_ref, new_type.get("_type"),
+            )
+        )
+    expected_category = "Doors" if node.get("_type") == "Door" else "Windows"
+    if new_type.get("category") != expected_category:
+        raise ValueError(
+            "items[{}]: new_family_type_ref {} has category={}, expected {}".format(
+                index, new_type_ref, new_type.get("category"), expected_category,
+            )
+        )
+    return {
+        "llm_id": llm_id,
+        "new_family_type_ref": new_type_ref,
+        "old_type_ref": node.get("type_ref"),
+    }
+
+
+@tool(name="openings_set_type_many", tier=1)
+def set_type_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Change le FamilySymbol de N ouvertures en une seule Tx Revit + KG.
+
+    Cas d'usage central du scénario soir 2026-05-11 session 5 : on a 20
+    fenêtres à passer sur une nouvelle variante de type pour découpler
+    sill / head ; en solo c'est 20 round-trips, en bulk c'est un seul
+    appel. Chaque item peut viser un type cible différent (utile pour
+    re-typer un mix de portes intérieures / extérieures en un seul
+    coup). Transactionnel : un item invalide → aucune mutation.
+
+    Concepts: type, swap, FamilySymbol, bulk, batch, masse
+    Phrases: "change le type de toutes ces fenêtres", "re-type ces portes",
+             "bulk swap types", "swap window family type for all"
+    Similar: openings_set_type, openings_set_sill_height_many,
+             openings_create_type_variant
+
+    Args:
+        items: liste de specs `{llm_id: str, new_family_type_ref: str}`.
+            La catégorie du nouveau type doit matcher celle de
+            l'ouverture (Door ↔ Doors, Window ↔ Windows).
+
+    Returns:
+        Réponse compacte (`_helpers.bulk_setter_summary`). Drift n'est
+        PAS le concept ici (le swap est binaire : il a lieu ou il
+        échoue) — `drifts` reste à `[]` sur cette implémentation. Une
+        future itération pourrait flagger les ouvertures dont les
+        sill/head ont décalé post-swap, mais c'est attendu et déjà
+        signalé par les `_set_sill/head_height_*` suivants.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    specs = [_validate_set_type_item(kg, it, i) for i, it in enumerate(items)]
+
+    if doc is None:
+        for spec in specs:
+            kg.remove_edge(spec["llm_id"], spec["old_type_ref"], "is_type")
+            kg.modify_node(spec["llm_id"], {
+                "type_ref": spec["new_family_type_ref"],
+            })
+            kg.add_edge(spec["llm_id"], spec["new_family_type_ref"], "is_type")
+        return bulk_setter_summary([], count=len(specs), revit_modified=False)
+
+    for i, spec in enumerate(specs):
+        if kg.get_revit_id(spec["llm_id"]) is None:
+            raise ValueError(
+                "items[{}]: {} has no Revit binding — run Refresh KG.".format(
+                    i, spec["llm_id"],
+                )
+            )
+        if kg.get_revit_id(spec["new_family_type_ref"]) is None:
+            raise ValueError(
+                "items[{}]: FamilyType {} has no Revit binding.".format(
+                    i, spec["new_family_type_ref"],
+                )
+            )
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, ElementId
+
+    # Group items by new_family_type_ref so we can activate each symbol
+    # at most once per batch (Activate + Regenerate is expensive).
+    activated: set = set()
+    with rp.transaction(doc, "openings.set_type_many"):
+        for spec in specs:
+            inst_eid = ElementId(kg.get_revit_id(spec["llm_id"]))
+            new_type_eid = ElementId(kg.get_revit_id(spec["new_family_type_ref"]))
+            instance = doc.GetElement(inst_eid)
+            new_symbol = doc.GetElement(new_type_eid)
+            if spec["new_family_type_ref"] not in activated:
+                if not new_symbol.IsActive:
+                    new_symbol.Activate()
+                    doc.Regenerate()
+                activated.add(spec["new_family_type_ref"])
+            instance.Symbol = new_symbol
+            # Read sill/head post-swap so KG mirrors the new defaults.
+            sill_param = instance.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+            head_param = instance.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+            kg_updates: Dict[str, Any] = {
+                "type_ref": spec["new_family_type_ref"],
+            }
+            if sill_param is not None:
+                try:
+                    kg_updates["sill_height"] = rp.internal_to_meters(sill_param.AsDouble())
+                except Exception:  # noqa: BLE001
+                    pass
+            if head_param is not None:
+                try:
+                    kg_updates["head_height"] = rp.internal_to_meters(head_param.AsDouble())
+                except Exception:  # noqa: BLE001
+                    pass
+            kg.remove_edge(spec["llm_id"], spec["old_type_ref"], "is_type")
+            kg.modify_node(spec["llm_id"], kg_updates)
+            kg.add_edge(spec["llm_id"], spec["new_family_type_ref"], "is_type")
+
+    return bulk_setter_summary([], count=len(specs), revit_modified=True)

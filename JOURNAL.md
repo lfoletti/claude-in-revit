@@ -14,6 +14,210 @@
 
 ---
 
+## 2026-05-12 (session b) — Setters multi-objets (dette 4 session 5)
+
+### Contexte & objectif
+
+Dette héritée session 5 (2026-05-11, point 4 du « Reste à faire ») :
+le scénario soir « passe toutes les fenêtres à sill=0.80, head=2.20 »
+consommait ~44 tool_use blocks pour 20 fenêtres × types mixtes. Cible
+mesurée : ~2 tool calls si on dispose de `*_many` setters côté KG +
+Revit. Avec la surface mutante complète depuis la session a (rooms +
+levels écriture), c'est le moment de la livrer.
+
+Discussion utilisateur en cours de session sur la **stratégie de coût
+minimum du drift check** — réponse consignée ici pour mémoire (cf.
+§« Stratégie drift » plus bas).
+
+### Décisions
+
+1. **Items-based plutôt que filter-based.** Filter-based (« passe
+   toutes les windows du N01 à sill=X » résolu côté KG) reporté à
+   `tools/bulk.py` (§9 V0 Sem.4-5). Raisons :
+   - Items-based est explicite : le LLM construit la liste depuis
+     `catalog_list_*` (déjà cachée typiquement), pas d'ambiguïté sur
+     le périmètre filtré.
+   - Filter-based a des coins subtils (inclure/exclure soft-deleted,
+     ordre des filtres, intersection multi-fields). Vaut mieux le
+     traiter une fois pour toutes dans un module dédié plutôt qu'en
+     surcouche par paire de tools.
+   - Bénéfice tokens : items-based réclame une liste avec llm_id ×
+     N (≈10 tokens/item × 20 = 200 tokens). Filter ferait ~30 tokens.
+     Différence acceptable face au gain de clarté.
+
+2. **Réponse compacte `bulk_setter_summary`** distincte de
+   `bulk_summary` (qui sert pour `*_create_many`). Shape :
+   `{ok, count, drifted_count, drifts: [{llm_id, note}, …],
+     revit_modified}`. Les items committés clean *n'apparaissent pas*
+   dans `drifts` — token cost en `O(K)` avec K = drifts (typiquement
+   0), pas `O(N)`. Helper centralisé dans `_helpers.py`.
+
+3. **Validation upfront atomique.** `[_validate_*_item(kg, it, i) for
+   i, it in enumerate(items)]` avant *toute* mutation. Si un seul item
+   est invalide → `ValueError` remontée → dispatcher rollback la
+   snapshot KG. Pas de demi-batch.
+
+4. **Symétrie sill ↔ head préservée dans les bulks.** `set_sill_height_many`
+   relit sill ET head après chaque `param.Set` (idem session 5). Le
+   `drift_note` pointe vers `openings_set_type_many` /
+   `openings_create_type_variant` quand la contrainte familiale impose
+   un recompute.
+
+5. **`set_type_many` groupe l'activation par symbole.** Si N items
+   visent le même `new_family_type_ref`, on `Activate() + Regenerate()`
+   une seule fois (set `activated: set`). Le coût Revit du
+   `Regenerate` n'est pas négligeable sur de gros bulks.
+
+6. **`rooms_set_name_many` SANS pré-check de collision.** Revit
+   autorise plusieurs rooms homonymes (c'est `Number` qui est unique,
+   pas `Name`). Comportement délibéré, testé. Contraste avec
+   `levels_set_name_many` qui n'existe pas — si on le livrait il
+   devrait faire un pré-check global (Levels exigent name unique).
+
+7. **`levels_*_many` non livrés.** Cas d'usage extrêmement rare —
+   personne ne bulk-modifie des Levels en pratique. Documenté comme
+   omission consciente, pas un oubli. Si une session future en a
+   besoin, c'est 30 minutes de plus.
+
+### Phase 1 — `bulk_setter_summary` dans `_helpers.py`
+
+Helper symétrique à `bulk_summary` (10 lignes). Reçoit la liste des
+drifts + le count total + le flag `revit_modified`. Le caller construit
+les drifts au fur et à mesure de sa boucle, sans avoir à connaître la
+shape de réponse — le contrat est centralisé.
+
+### Phase 2 — `walls.py` : `_set_height_many`, `_move_many`
+
+Validators dédiés (`_validate_set_height_item`, `_validate_move_item`)
+qui poppent un `ValueError` riche en contexte (`"items[3]: ..."`).
+Pattern uniforme :
+1. Validation upfront atomique (tous les items ou rien).
+2. Bindings pré-check avant tout import Revit.
+3. Une seule `rp.transaction(doc, "<name>")` enveloppe la boucle.
+4. Read-back per-item via `refresh_node_from_revit`, drift collecté.
+
+`walls_move_many` calcule `requested_p1/p2` *avant* `MoveElement` (en
+ajoutant dx/dy à `p1/p2` courants du KG), parce qu'après
+`refresh_node_from_revit` le KG est déjà à jour avec la valeur
+Revit-committée — on perdrait le "what we asked" sinon.
+
+### Phase 3 — `openings.py` : `_set_sill_height_many`, `_set_head_height_many`, `_set_type_many`
+
+- `_set_sill_height_many` et `_set_head_height_many` : pattern uniforme
+  via `_validate_sill_or_head_item(field=...)` paramétré sur le champ
+  visé. Relit `(sill, head)` après chaque Set (réutilise `_read_sill_head_m`
+  et `_drift_note`, sans duplication).
+- `_set_type_many` : `_validate_set_type_item` impose la match catégorie
+  (Door ↔ Doors, Window ↔ Windows) — pas de cross-category swap par
+  accident. Active chaque nouveau FamilySymbol une seule fois par
+  batch. `drifts=[]` toujours retourné : le swap est binaire (il a lieu
+  ou il échoue), pas un drift au sens « sill/head decalé » — ces
+  derniers apparaîtraient au prochain `_set_sill_height_many` chained.
+
+### Phase 4 — `rooms.py` : `_set_name_many`
+
+Pas de pré-check collision (cf. décision 6). Le test
+`test_rooms_set_name_many_allows_duplicate_names` documente le
+comportement attendu.
+
+### Phase 5 — Tests + registry expected set
+
+- `test_canonical_registry_has_expected_tier1_tools` étendu de 6
+  nouvelles entrées.
+- 16 nouveaux tests fonctionnels :
+  - 2 tests `bulk_setter_summary` (shape vide, shape avec drifts).
+  - 4 tests walls (`set_height_many` succès, atomique, refus empty,
+    refus non-Wall ; `move_many` succès, atomique).
+  - 5 tests openings (`set_sill_height_many` succès, refus non-opening ;
+    `set_head_height_many` succès ; `set_type_many` succès,
+    refus category mismatch).
+  - 4 tests rooms (`set_name_many` succès, accepte doublons, atomique).
+
+Tous KG-only — pas de stub Revit nécessaire. La branche `doc is None`
+est exercée pour la mécanique d'agrégation et la validation. Le chemin
+Revit (transactions imbriquées, drift réel) sera couvert au test live
+de la prochaine session.
+
+### Stratégie drift — réponse à la question utilisateur
+
+Question : peut-on imaginer un mécanisme hash-based (style SHA) pour
+court-circuiter la détection de drift en `O(1)` ?
+
+Décision : non, et le coût actuel est déjà le minimum sous contrainte
+de correctness. Argumentaire en 4 leviers :
+
+1. **Early exit tolérance** : `detect_drift` retourne `(False, None)`
+   immédiatement si `|requested − committed| ≤ 5e-4 m`. Aucune
+   allocation, aucun formatage. ~3 ops CPU par item.
+2. **Token zéro pour clean** : seuls les items ayant drifté entrent
+   dans `drifts`. Common path → ~50 tokens quel que soit N. Cost en
+   `O(K)` (drifted), pas `O(N)`.
+3. **Read-back unitaire mais bon marché** : `GetElement(eid) +
+   AsDouble()` → O(1) sur la table Revit. Inévitable pour la
+   correctness (cf. session 5), mais ne domine pas le profil.
+4. **Pas de re-echo des valeurs** : la réponse ne contient pas la
+   liste `[{llm_id, requested, committed}, ...]` pour les N items —
+   le LLM requery via `catalog_list_*` si besoin (rare). Économie
+   tokens majeure sur les bulks larges.
+
+Pourquoi le hash n'aiderait pas :
+- L'état par item est minuscule (1-2 floats ou une string) — hasher
+  coûte plus que comparer directement.
+- Un hash global collapse N drifts en 1 booléen, mais on *veut*
+  savoir lesquels (pour le `drift_note`). Re-enumeration derrière.
+- Pas de comparaison répétée à amortir.
+
+Optimisations différées si profilage le réclame :
+- **Agrégation drift_note motifs identiques** (12 windows même
+  conflit → 1 note groupée). Bénéfice tokens, pas latence.
+- **Cache famille-rigide-connue** : court-circuiter le read-back
+  sur familles toujours-driftantes. Brittle, à éviter sauf evidence.
+
+### Validation
+
+- `pytest -q` : **261 verts en 8.79s** (245 → +16).
+- Aucune régression.
+- Pas de validation runtime Revit ce tour : tools KG-only-testable,
+  plomberie Revit isolée et déjà éprouvée par les setters solo (session
+  5). Test live à coupler au prochain run, idéalement le scénario
+  20-fenêtres pour confirmer le gain ~44 → ~2 tool calls.
+
+### État final & reste à faire
+
+**Acquis session b** :
+- `bulk_setter_summary` helper (shape compact `O(K)` tokens) ✓
+- `walls_set_height_many`, `walls_move_many` ✓
+- `openings_set_sill_height_many`, `_head_height_many`, `_set_type_many` ✓
+- `rooms_set_name_many` ✓
+- Validation atomique upfront, single Tx Revit + KG par batch ✓
+- Discipline read-back + drift signaling préservée ✓
+- 16 tests, baseline **261 verts** ✓
+- Dette 4 session 5 **réglée** (items-based) — gain estimé ~44 → ~2
+  tool calls sur le scénario 20 fenêtres soir 2026-05-11.
+
+**Dettes / TODO ouverts** :
+
+1. **Filter-based bulks** (reporté à `tools/bulk.py` Sem.4-5). Cas
+   d'usage : « passe toutes les fenêtres du N01 à sill=0.80 » résolu
+   côté KG sans que le LLM ait à enumerer les llm_ids. Token saving
+   marginal vs items-based (~150 tokens), bénéfice principal =
+   ergonomie. À traiter avec UC7 (modifications en masse).
+2. **`levels_*_many` non livrés** (cf. décision 7). Rejoindre si
+   besoin se manifeste.
+3. **Drift utilisateur hors pipeline** (trou architectural connu) —
+   utilisateur édite un mur dans l'UI Revit, KG ne sait pas. Aujourd'hui
+   bouton `refresh_kg` manuel uniquement. Solution propre : abonner
+   aux events `DocumentChanged` de Revit. Reporté.
+4. **Test live 20-fenêtres** pour confirmer le gain mesuré. À couvrir
+   à la prochaine session Revit.
+
+**Suite immédiate (§9 V0 Sem.4-5)** :
+- `dwg_reader.py` + `dwg_classifier.py` (ezdxf) → UC1.
+- `tools/bulk.py` (`apply_to_filter`, `change_param_bulk`) → UC7 +
+  couvre la dette 1 ci-dessus.
+
+---
+
 ## 2026-05-12 — Rooms + Levels (écriture) — clôture V0 Sem.2-3
 
 ### Contexte & objectif
