@@ -381,3 +381,46 @@ def test_sanitize_drops_partial_tool_result_coverage():
     cleaned, dropped = llm_api.sanitize_history(h)
     assert dropped == 3
     assert cleaned == []
+
+
+def test_sanitize_drops_orphan_user_tool_result_at_head():
+    """Cas observé en runtime 2026-05-12 : trim a viré l'assistant
+    tool_use, le user tool_result reste orphelin en tête → Anthropic 400
+    `unexpected tool_use_id`. Le sanitize doit le détecter et tout drop."""
+    h = [
+        {"role": "user", "content": [_tool_result_block("toolu_orphan")]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+    cleaned, dropped = llm_api.sanitize_history(h)
+    assert cleaned == []
+    assert dropped == 2
+
+
+def test_sanitize_drops_orphan_user_tool_result_mid_history():
+    """User tool_result orphelin au milieu — coupe à partir de l'orphelin."""
+    h = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        # Orphan : pas d'assistant tool_use juste avant ce user.
+        {"role": "user", "content": [_tool_result_block("toolu_orphan")]},
+    ]
+    cleaned, dropped = llm_api.sanitize_history(h)
+    # Les 2 premiers messages sont sains, l'orphelin est dropped.
+    assert len(cleaned) == 2
+    assert dropped == 1
+
+
+def test_trim_then_sanitize_drops_orphan_when_assistant_dropped():
+    """Si le trim coupe entre assistant tool_use et user tool_result,
+    le sanitize en fin de trim doit cleaner. Validation end-to-end."""
+    h = [
+        {"role": "user", "content": "x" * 5000},  # gros, sera trim
+        {"role": "assistant", "content": [_tool_use_block("toolu_1")]},
+        {"role": "user", "content": [_tool_result_block("toolu_1")]},
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    ]
+    trimmed, _ = llm_api.trim_history_to_max_chars(h, max_chars=1000)
+    # Pas d'orphan user tool_result en tête après trim+sanitize.
+    if trimmed and trimmed[0].get("role") == "user":
+        tr_ids = llm_api._tool_result_ids(trimmed[0].get("content"))
+        assert not tr_ids, "Orphan user tool_result at head of trimmed history"

@@ -364,6 +364,17 @@ def sanitize_history(
                 i += 2
                 safe_len = i
                 continue
+        if turn["role"] == "user":
+            # Si un user message contient des tool_result blocks, il doit
+            # **immédiatement** suivre un assistant turn avec les tool_use
+            # correspondants — sinon Anthropic 400. Le cas paire (i-1,i)
+            # est attrapé par la branche assistant ci-dessus ; ici on
+            # gère le user tool_result **orphelin** (en tête de l'historique
+            # OU laissé derrière par un trim qui a coupé l'assistant
+            # tool_use précédent). Cas observé en runtime 2026-05-12 :
+            # trim mid-paire → user tool_result orphelin → API 400.
+            if _tool_result_ids(turn.get("content")):
+                break
         # Either non-assistant role, or assistant without tool_use → solo.
         i += 1
         safe_len = i

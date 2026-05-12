@@ -14,6 +14,149 @@
 
 ---
 
+## 2026-05-12 — Note d'intention : UC1 Phase 4 — intégration des coupes DXF
+
+Conversation exploratoire (session i, post-validation runtime).
+**Pas de code livré**. Capture la demande utilisateur de combiner
+plan + coupes du même DXF pour reconstituer le modèle 3D avec les
+bonnes hauteurs (allèges, linteaux, niveaux).
+
+### Demande utilisateur
+
+> « Le DXF est fourni avec deux coupes, idéalement le modèle devrait
+> être construit en tenant compte des coupes également, par exemple
+> pour placer des fenêtres. »
+
+### Analyse
+
+Un DXF d'archi typique contient plusieurs *vues* sur le même fichier :
+- **Plan(s) d'étage** — projection 2D du dessus. Donne les positions
+  XY des murs, l'épaisseur des murs (paires de lignes), les ouvertures
+  (interruptions, blocs INSERT).
+- **Coupes** — sections verticales du bâtiment. Donnent les
+  élévations des niveaux, les hauteurs des ouvertures (allèges,
+  linteaux), les hauteurs de plafond, les épaisseurs de dalles.
+
+Notre tool UC1 Phase 1-3 (sessions f + i) ne traite que le plan. Les
+coupes sont des entités dans le DXF qu'on ignore actuellement.
+
+### Stratégie d'extraction
+
+3 étapes :
+
+**1. Segmenter le DXF en zones (plan vs coupes vs cartouches).**
+
+Heuristique géographique : grouper les entités par cluster spatial
+(DBSCAN sur les coords ou bounding-box overlap). Chaque cluster =
+une vue. Identifier le type via :
+- Le ratio aspect (plan ≈ ratio bâtiment, coupes plus allongées).
+- La présence de symboles caractéristiques (lignes de niveau pour
+  coupe, échelle graphique, cartouche).
+- Le nom du layer dominant.
+
+Alternative : convention de cartouche → titre de chaque vue lu via
+OCR sur les MTEXT (« PLAN N0 », « COUPE A-A », etc.).
+
+**2. Extraire les hauteurs des coupes.**
+
+Sur chaque cluster identifié comme coupe :
+- **Niveaux** : lignes horizontales longues + texte adjacent
+  (`+3.00`, `Niveau 1`, etc.). Extraction des élévations absolues.
+- **Ouvertures** : rectangles fermés ou paires de lignes horizontales
+  sur les layers `A-GLAZ` / `A-DOOR`. Bottom = sill_height, top =
+  head_height par rapport au niveau de référence.
+- **Hauteurs de plafond** : différence entre niveaux successifs.
+
+**3. Géo-référencement plan ↔ coupes.**
+
+Chaque coupe est prise selon une **ligne de coupe** dans le plan
+(une polyligne avec flèche, sur un layer typique `A-SECT` ou via un
+symbole de référence type `1/A2.1`). Identifier la ligne dans le
+plan → mapper l'abscisse X de la coupe à une position dans le plan.
+Ensuite : pour chaque ouverture dans la coupe, retrouver son
+homologue dans le plan via projection X → enrichir avec
+sill/head extraits de la coupe.
+
+### Architecture proposée
+
+```
+lib_floorplan/  (ou claude-in-revit.extension/lib/)
+├── dwg_view_segmentation.py  # cluster spatial → vues séparées
+├── dwg_section_reader.py     # extraction hauteurs depuis coupe
+├── dwg_geo_referencing.py    # mapping plan ↔ coupes
+└── dwg_ocr.py                # OCR MTEXT pour annotations
+                               # (cf. note UC6 plan-d'après-image —
+                               # même stack pytesseract possible)
+```
+
+Wrapper tier-2 :
+- `dwg_inspect_views(file_path)` : retourne la liste des vues
+  identifiées avec leur type + bbox.
+- `dwg_extract_levels_from_section(file_path, view_index)` : niveaux
+  + élévations depuis une coupe.
+- `dwg_import_full(file_path, level_ref, ...)` : pipeline complet
+  plan + coupes → murs + ouvertures avec hauteurs correctes.
+
+### Difficultés majeures
+
+1. **Identification automatique des coupes** sans annotations
+   explicites est non-triviale. Heuristiques fragiles. Solution
+   robuste : demander à l'utilisateur de pointer chaque vue
+   (« la coupe A-A est dans la zone X=[50,100] Y=[-30,10] ») via
+   un mini-dialog ou une convention layer.
+
+2. **OCR sur MTEXT du DXF** pour lire les annotations
+   (« +3.00 », « Niveau 1 », « EI60 »). Tesseract n'est pas
+   nécessaire ici — le texte est déjà en clair dans le DXF, juste
+   à parser. Plus simple que pour UC6 raster.
+
+3. **Identification ligne de coupe dans le plan** :
+   convention layer + symbole. Souvent fragile car les bureaux
+   utilisent des standards variés.
+
+### Phases d'exécution (estimation)
+
+| Phase | Livre | Effort |
+|---|---|---|
+| 0 — segmentation vues | Cluster spatial + classification heuristique | ~1-2 j |
+| 1 — extraction niveaux | Lignes horizontales + texte adjacent → Level KG | ~1 j |
+| 2 — extraction hauteurs ouvertures | Rectangles dans coupes → sill/head | ~2 j |
+| 3 — géo-ref plan ↔ coupe | Ligne de coupe + mapping X | ~2 j |
+| 4 — orchestrateur full | `dwg_import_full` qui combine tout | ~1 j |
+
+Phase complète : ~7-9 j homme. Hors scope V0.
+
+### Déclencheur de reprise
+
+- Cas client explicite (« j'ai un projet à modéliser depuis DXF
+  archi complet »).
+- OU après livraison V1 compliance / vision (UC6 raster) qui
+  partagent des briques OCR et géo-ref.
+
+### Préreqs identifiés
+
+- `connects_at` peuplé au rescan (déjà dette ouverte) — utile pour
+  reconnaître la topologie des murs aux jonctions de coupes.
+- `Room.boundary_walls` calculé (déjà dette ouverte) — pour mapper
+  pièces aux coupes.
+- `catalog_list_views` côté Revit (déjà dette ouverte) — pour
+  exporter les vues 2D des coupes que Revit générera automatiquement
+  à partir du modèle 3D, comparable au DXF source.
+
+### Quick win possible avant la full phase 4
+
+Même sans extraire les hauteurs des coupes, on peut déjà :
+- Détecter les **lignes horizontales longues annotées** dans un
+  DXF (qu'il soit plan ou coupe) → identifier les **niveaux** et
+  les créer automatiquement via `levels_create_many` (à
+  développer aussi en passant : pour l'instant on a `levels_create`
+  solo).
+
+C'est une fraction de la phase 1 qui apporte une valeur immédiate.
+Effort ~½ j.
+
+---
+
 ## 2026-05-12 (session i) — Validation runtime UC1 DWG : routing tier-2, centerline fallback, delete_many
 
 ### Contexte & objectif
