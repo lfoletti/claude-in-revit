@@ -14,6 +14,193 @@
 
 ---
 
+## 2026-05-12 — Note d'intention : plan d'après image (UC6 vision)
+
+Conversation exploratoire utilisateur, **pas de code livré**. UC6 du
+design (CLAUDE.md §Vision) explicitement reporté à V1. Cette note
+capture l'architecture proposée et le pipeline de calibration
+multi-indices pour ne pas refaire l'analyse à la reprise.
+
+**Cas d'usage initial** : utilisateur fournit un plan poché raster
+(ex : `plan_apartement_exemple.png`), demande « dessine les murs ».
+Approche directe (LLM vision) → résultats mitigés. Diagnostic
+partagé : un préprocesseur déterministe sur un plan poché (murs noirs
+solides, géométrie orthogonale) est plus fiable qu'une interprétation
+LLM. Pattern identique à UC1 (DWG ingest) et à UC8 compliance
+(primitives déterministes + fallback LLM signalé).
+
+### Pipeline cible (5 étapes, 4 déterministes)
+
+1. **Threshold binaire** — Otsu auto ou seuil fixé (~25%).
+2. **Nettoyage** — morphological opening pour rejeter bruit / fines
+   hachures.
+3. **Extraction contours** — `cv2.findContours` ou skimage.
+4. **Approximation polygones orthogonaux** — `approxPolyDP` + axis-snap.
+5. **Conversion pixel → mètres** — **vrai bloqueur**, voir calibration
+   ci-dessous.
+
+### Calibration multi-indices
+
+Approche par **triangulation statistique** plutôt que référence unique.
+Chaque détecteur émet un vote `ScaleEvidence(scale_m_per_px,
+confidence, source, measurement_px, expected_m)`. Agrégation par
+MAD outlier rejection + médiane pondérée par confidence.
+
+**7 sub-détecteurs** par ordre de fiabilité native :
+
+| Détecteur | Référence | Conf. native |
+|---|---|---|
+| Échelle graphique | motif `0—1—2—3 m` + OCR | 0.95 |
+| Marches d'escalier | pas régulier 0.27-0.29 m, autocorrelation sur lignes parallèles fines | 0.85 |
+| Cote dessinée | OCR tesseract sur nombres + mur adjacent | 0.85 |
+| **Surface des pièces** | **OCR pattern `\d+([,.]\d+)?\s*m[²2]?` dans chaque cellule fermée → `scale = sqrt(area_m2 / area_px)`. Vote multi-pièces agrégé (N pièces → N votes croisés)** | **0.80** |
+| Porte d'entrée | arc 90° rayon 0.90 m, `HoughCircles` | 0.75 |
+| Portes internes | arc 90° rayon 0.80 m, vote agrégé sur N portes | 0.70 |
+| Mobilier sanitaire / cuisine | WC 0.40 m, lavabo 0.55 m, plan travail 0.60 m | 0.55 |
+| Épaisseur cloisons | 0.10-0.15 m, check de cohérence post-walls (pas primary) | 0.40 |
+
+**Notes spécifiques au détecteur surface des pièces** :
+
+- **Quasi-ubiquitaire** sur les plans d'habitation (architectes annotent
+  presque toujours les m² par pièce) → ce détecteur a souvent N votes
+  par plan, alors que cote dessinée n'en a typiquement que 1-2.
+- **Dépendance 2e passe** : nécessite l'extraction des murs ET la
+  reconstruction des cellules fermées (room detection topologique sur
+  les segments murs) avant de pouvoir mesurer `area_px` par cellule.
+  → s'exécute *après* `detectors/walls.py`, pas en parallèle.
+- **Formulation `scale = sqrt(area_m² / area_px)`** plutôt qu'une
+  longueur directe : la surface est un carré, donc l'erreur sur le
+  scale est l'écart-type de la mesure / 2 (propagation). Avantage :
+  l'aire est robuste aux distorsions locales (un mur légèrement
+  imprécis ne décale pas la surface entière).
+- **Aire = polygone réel, pas bbox** : pièces en L ou en T fréquentes
+  en habitation → `cv2.contourArea` sur le contour de la cellule, pas
+  `width × height` du bbox.
+- **OCR caveat français** : `m²` est parfois exporté `m2` par tesseract
+  (selon version + lang pack), virgule décimale standard FR (`12,5`).
+  Regex tolérante : `r"(\d+)[,.]?(\d+)?\s*m\s*[²2]?"`.
+- **Filtrage du bruit** : seuls les textes situés *à l'intérieur* d'une
+  cellule fermée sont considérés (rejet des légendes, annotations
+  hors-pièce). Robuste contre les "12 m²" qui apparaissent dans un
+  bloc de texte général en marge.
+- **Effet secondaire utile** : ce détecteur sert aussi de
+  *post-validation* — une fois le scale calibré (par tout autre
+  détecteur), recalculer les surfaces de toutes les pièces avec ce
+  scale et comparer aux OCR. Match → confidence boost ; divergence
+  systématique → l'estimation est probablement off-by-X%.
+
+**Agrégation** :
+1. Outlier rejection MAD (rejeter `|scale_i − median| > 3 × MAD`).
+2. Médiane pondérée par confidence sur les votes restants.
+3. Score de confiance global = `f(n_kept / n_total, spread,
+   max_confidence_present)`. Présence d'un détecteur fort (échelle
+   graphique / cote / escalier) → score plafond ≥ 0.8.
+4. **User input traité comme prior fort, pas dur** : si l'utilisateur
+   fournit une échelle (`confidence=1.0`) mais les détecteurs
+   divergent fortement, le tool *signale* (« j'ai estimé 1:75 mais
+   tu as donné 1:50 — vérifie ? ») plutôt que de subir muettement.
+5. Demande à l'utilisateur si confidence < seuil (0.6 par défaut) avec
+   un résumé des évidences pour qu'il puisse arbitrer en connaissance.
+
+### Découplage pure-Python — décision
+
+**Validé** : tout le pipeline est de l'analyse d'image, zéro
+dépendance Revit. Donc développable / testable dans la `.venv/`
+locale (CPython 3.13), pas besoin de pyRevit pour itérer.
+
+Arborescence cible :
+
+```
+lib_floorplan/                 # standalone, zéro import Revit
+├── preprocess.py              # threshold, denoise, morphology
+├── detectors/
+│   ├── walls.py               # contour → segments orthogonaux
+│   ├── doors.py               # arcs HoughCircles
+│   ├── stairs.py              # autocorrelation lignes parallèles
+│   ├── scale_bar.py           # template + OCR
+│   ├── dimension_text.py      # tesseract
+│   ├── furniture.py           # template matching kitchen / sanitary
+│   └── partition_thickness.py # check cohérence post-walls
+├── scale_estimation.py        # MAD + weighted median + confidence
+└── pipeline.py                # orchestrateur
+
+claude-in-revit.extension/lib/tools/image_input.py   # ~50 lignes,
+                                                      # wrapper tier-2
+tests/
+└── fixtures/
+    ├── plan_apartement_exemple.png   # plan réel
+    ├── plan_synthetic_50.png         # synthèse 1:50 ground truth
+    └── plan_synthetic_100.png        # synthèse 1:100 ground truth
+```
+
+Bénéfices :
+- Itération sans pyRevit (cycle dev rapide).
+- Dataset fixture + ground truth → suite de tests qui valide la
+  précision d'estimation. Régression auto à chaque tweak détecteur.
+- Lib réutilisable hors projet (un script qui veut estimer une
+  surface depuis un plan ne tire pas pyRevit).
+- Dépendances lourdes (`opencv-python`, `scipy`, `tesseract`) isolées
+  hors du runtime Revit qui reste maigre.
+
+### Tool surface (Revit-side, après lib_floorplan livrée)
+
+```python
+@tool(name="image_extract_walls", tier=2)
+def extract_walls(kg, doc, image_path, user_scale_hint=None):
+    """Préprocesseur déterministe + calibration multi-indices.
+    Renvoie segments, échelle estimée, score de confiance, évidences."""
+
+@tool(name="image_draw_walls", tier=2)
+def draw_walls(kg, doc, image_path, level_ref, wall_type_ref,
+               user_scale_hint=None):
+    """Orchestre extract_walls + walls_create_many."""
+```
+
+`tier=2` (chargé via `ROUTING_RULES` sur `image` / `plan` / `dessine
+d'après`) — évite de polluer le catalogue par défaut.
+
+### Limitations V1 phase 1 (assumées)
+
+- Plans poché **orthogonaux** seulement (axis-aligned).
+- Type unique (pas de distinction porteur / cloison à la création).
+- Pas de détection automatique des ouvertures (portes / fenêtres
+  ajoutées manuellement après création des murs, via les tools
+  openings_create_* existants).
+- Calibration multi-indices mais demande utilisateur en cas
+  d'ambiguïté.
+
+### Phases d'exécution (estimation)
+
+| Phase | Livre | Effort |
+|---|---|---|
+| 0 — prérequis | UC1 DWG ingest (Sem.4-5 V0) — partage la mécanique préprocesseur → wall segments → walls_create_many | dans roadmap |
+| 1a — lib_floorplan / walls | threshold + contours + segments orthogonaux + fixtures synthétiques | ~1 j |
+| 1b — calibration multi-indices | 6 détecteurs + agrégateur MAD + confidence | ~2-3 j |
+| 1c — wrapper Revit | image_extract_walls + image_draw_walls | ~½ j |
+| 2 — détection ouvertures | arcs portes, double-trait fenêtres, retouche murs | ~2 j |
+| 3 — porteurs vs cloisons | double seuil, distinction par épaisseur | ~2 j |
+| 4 — non-orthogonal | post-processing Hough multi-angles | ~3-5 j |
+
+Phase 1 (a+b+c) = ~4 j homme. Couvre 80% des cas typiques
+(immeubles d'habitation, plans poché orthogonaux).
+
+### Déclencheur de reprise
+
+- UC1 DWG livré (Sem.4-5 V0) — la mécanique préprocesseur déterministe
+  est éprouvée, on peut l'appliquer au raster.
+- OU : cas client explicite (« je veux importer ce plan papier
+  scanné »).
+
+### Préreqs identifiés
+
+- Aucun côté KG (Wall existe).
+- Installation `opencv-python` ou `scikit-image` + `numpy` dans le
+  CPython embarqué pyRevit (procédure CLAUDE.md déjà documentée).
+- Optionnellement : `pytesseract` + binaires Tesseract pour OCR
+  (cote dessinée + échelle graphique). Reportable à phase 1b.
+
+---
+
 ## 2026-05-12 — Note d'intention : auto-cotation + slash commands
 
 Conversation exploratoire utilisateur, **pas de code livré**. Consigne ici
