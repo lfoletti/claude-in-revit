@@ -460,23 +460,49 @@ def _merge_collinear_segments(
     return merged
 
 
-def _segment_in_shadow_of_pair(
+def _subtract_pair_shadows(
     candidate: Segment,
     pair_walls: List[WallCandidate],
     *,
     angle_tol_rad: float = math.radians(2.0),
     exclusion_distance_m: float = 0.30,
-    overlap_threshold: float = 0.80,
-) -> bool:
-    """True si `candidate` se trouve dans l'« ombre » d'un wall détecté
-    en paire : quasi-parallèle, perp distance courte, overlap projeté
-    significatif. Évite que le fallback centerline ne re-crée des
-    doublons des murs extérieurs déjà identifiés."""
+) -> List[Segment]:
+    """Soustrait les zones du `candidate` couvertes par des pair-walls
+    quasi-parallèles + proches latéralement. Renvoie la liste de
+    sous-segments **non couverts** (résidus).
+
+    Approche : projection 1D sur la droite portante du candidate.
+    Pour chaque pair qui passe les filtres (angle + perp_distance),
+    on projette ses endpoints sur la candidate, obtient un intervalle
+    `[a, b]`, et on soustrait cet intervalle de l'intervalle initial
+    du candidate `[0, L]`. Résultat : liste d'intervalles résiduels →
+    sous-segments du candidate.
+
+    Cas typique observé en runtime (DXF Projet4) : une cloison interne
+    est représentée par une face haute en paire et une face basse en
+    simple-trait. Le centerline candidate (face basse + extension)
+    chevauche partiellement le pair (face haute) — sans cette
+    soustraction, on créerait 2 walls en doublon sur la zone d'overlap.
+    Avec soustraction : on garde uniquement le résidu bas (la partie
+    qui n'est PAS déjà couverte par le pair).
+    """
     cand_angle = _segment_angle_normalized(candidate)
     cand_midpoint = (
         (candidate.p1[0] + candidate.p2[0]) / 2.0,
         (candidate.p1[1] + candidate.p2[1]) / 2.0,
     )
+    L = _segment_length(candidate)
+    if L < 1e-9:
+        return []
+    # Pour CHAQUE pair quasi-parallèle proche en perp, on collecte 2
+    # intervalles :
+    # - L'**ombre clampée** dans [0, L] (pour la soustraction effective).
+    # - L'**extent non-clampé** sur la droite portante de la candidate
+    #   (pour calculer l'enveloppe totale des pairs proches — utilisé
+    #   pour détecter les résidus dans des « trous de fenêtre »).
+    shadows: List[Tuple[float, float]] = []
+    pair_t_min = None  # min t (non clampé) de tous les pairs proches.
+    pair_t_max = None  # max t.
     for w in pair_walls:
         pair_seg = Segment(p1=w.p1, p2=w.p2, layer=w.layer)
         pair_angle = _segment_angle_normalized(pair_seg)
@@ -485,10 +511,83 @@ def _segment_in_shadow_of_pair(
         d_mid = _perp_distance(pair_seg, cand_midpoint)
         if d_mid > exclusion_distance_m:
             continue
-        _, ratio = _overlap_along_reference(pair_seg, candidate)
-        if ratio >= overlap_threshold:
-            return True
-    return False
+        # Projection non clampée pour l'enveloppe.
+        t1 = _project_to_line(w.p1, candidate)
+        t2 = _project_to_line(w.p2, candidate)
+        t_lo, t_hi = (t1, t2) if t1 <= t2 else (t2, t1)
+        if pair_t_min is None or t_lo < pair_t_min:
+            pair_t_min = t_lo
+        if pair_t_max is None or t_hi > pair_t_max:
+            pair_t_max = t_hi
+        # Ombre clampée à [0, L] pour la soustraction.
+        lo = max(0.0, t_lo)
+        hi = min(L, t_hi)
+        if hi > lo:
+            shadows.append((lo, hi))
+
+    # Si aucun pair n'est proche en perp, pas de soustraction.
+    if pair_t_min is None:
+        return [candidate]
+
+    pair_extent_lo = pair_t_min
+    pair_extent_hi = pair_t_max
+
+    # Merge des intervalles d'ombre chevauchants (sur les shadows
+    # clampés). Si shadows vide (pairs tous hors de la zone candidate),
+    # la candidate entière forme un résidu, qui sera ensuite filtré
+    # par l'enveloppe non-clampée.
+    residuals: List[Tuple[float, float]] = []
+    if shadows:
+        shadows.sort()
+        merged: List[Tuple[float, float]] = [shadows[0]]
+        for lo, hi in shadows[1:]:
+            last_lo, last_hi = merged[-1]
+            if lo <= last_hi:
+                merged[-1] = (last_lo, max(last_hi, hi))
+            else:
+                merged.append((lo, hi))
+
+        # Soustraction : complément de la candidate dans [0, L].
+        cursor = 0.0
+        for lo, hi in merged:
+            if lo > cursor:
+                residuals.append((cursor, lo))
+            cursor = max(cursor, hi)
+        if cursor < L:
+            residuals.append((cursor, L))
+    else:
+        residuals = [(0.0, L)]
+
+    # Filtre des résidus tombant entièrement dans l'enveloppe des
+    # pairs : ils correspondent à des « trous » entre paires
+    # adjacentes (fenêtres typiquement). Tolérance epsilon pour
+    # absorber le bruit numérique.
+    eps = 1e-3
+    filtered_residuals: List[Tuple[float, float]] = []
+    for r_lo, r_hi in residuals:
+        if r_lo >= pair_extent_lo - eps and r_hi <= pair_extent_hi + eps:
+            # Entièrement dans l'enveloppe → trou de fenêtre, skip.
+            continue
+        filtered_residuals.append((r_lo, r_hi))
+
+    # Reconstruction des sous-segments depuis les intervalles résiduels.
+    # On interpole p1/p2 le long de la candidate au paramètre t.
+    dx = candidate.p2[0] - candidate.p1[0]
+    dy = candidate.p2[1] - candidate.p1[1]
+    out: List[Segment] = []
+    for lo, hi in filtered_residuals:
+        u_lo = lo / L
+        u_hi = hi / L
+        p_lo = (
+            candidate.p1[0] + dx * u_lo,
+            candidate.p1[1] + dy * u_lo,
+        )
+        p_hi = (
+            candidate.p1[0] + dx * u_hi,
+            candidate.p1[1] + dy * u_hi,
+        )
+        out.append(Segment(p1=p_lo, p2=p_hi, layer=candidate.layer))
+    return out
 
 
 def detect_centerline_walls(
@@ -526,38 +625,39 @@ def detect_centerline_walls(
     walls: List[WallCandidate] = []
     rejected: List[Dict[str, Any]] = []
     for s in merged:
-        length = _segment_length(s)
-        if length < min_length_m:
-            rejected.append({
-                "layer": s.layer,
-                "p1": list(s.p1),
-                "p2": list(s.p2),
-                "length_m": round(length, 4),
-                "reason": "centerline below min_length_m ({} < {})".format(
-                    round(length, 3), min_length_m,
-                ),
-            })
-            continue
-        if pair_walls is not None and _segment_in_shadow_of_pair(
-            s, pair_walls,
-            angle_tol_rad=angle_tol_rad,
-            exclusion_distance_m=exclusion_distance_m,
-        ):
-            rejected.append({
-                "layer": s.layer,
-                "p1": list(s.p1),
-                "p2": list(s.p2),
-                "length_m": round(length, 4),
-                "reason": "centerline shadowed by existing pair wall",
-            })
-            continue
-        walls.append(WallCandidate(
-            p1=s.p1, p2=s.p2,
-            thickness=thickness_m,
-            layer=s.layer,
-            confidence=0.6,
-            source=(-1, -1),
-        ))
+        # Soustraction des ombres si pair_walls fourni : chaque zone
+        # déjà couverte par un pair-wall quasi-parallèle est retirée
+        # de la candidate. Renvoie 0 ou plusieurs sous-segments
+        # résiduels. Évite les doublons partiels.
+        if pair_walls is not None:
+            sub_segments = _subtract_pair_shadows(
+                s, pair_walls,
+                angle_tol_rad=angle_tol_rad,
+                exclusion_distance_m=exclusion_distance_m,
+            )
+        else:
+            sub_segments = [s]
+
+        for sub in sub_segments:
+            length = _segment_length(sub)
+            if length < min_length_m:
+                rejected.append({
+                    "layer": sub.layer,
+                    "p1": list(sub.p1),
+                    "p2": list(sub.p2),
+                    "length_m": round(length, 4),
+                    "reason": "centerline residual below min_length_m ({} < {})".format(
+                        round(length, 3), min_length_m,
+                    ),
+                })
+                continue
+            walls.append(WallCandidate(
+                p1=sub.p1, p2=sub.p2,
+                thickness=thickness_m,
+                layer=sub.layer,
+                confidence=0.6,
+                source=(-1, -1),
+            ))
     return walls, rejected
 
 
