@@ -35,12 +35,15 @@ from ..project_kg import ProjectKG
 from ._helpers import bulk_setter_summary, bulk_summary, stamp_llm_id
 
 
-# Regex de détection des variants auto-créés par `_maybe_decouple`. Le
-# format est figé par `_variant_name` : `<src> [auto h<NN>cm]`. On match
-# uniquement le suffixe pour rester tolérant aux renommages utilisateur
-# qui auraient *préservé* la partie [auto h<NN>cm] (cas peu probable
-# mais on reste robuste).
-_AUTO_VARIANT_MARKER_RE = re.compile(r"\[auto h\d+cm\]")
+# Regex de détection des variants auto-créés par `_maybe_decouple`. Deux
+# conventions acceptées (rétrocompat) :
+# - `(auto h<NN>cm)` : convention courante depuis 2026-05-12 (parenthèses
+#   sont autorisées dans les noms de FamilySymbol Revit).
+# - `[auto h<NN>cm]` : convention initiale, **invalidée côté Revit**
+#   (caractères `[` et `]` interdits dans les noms de types). Les variants
+#   créés en KG-only path avant le fix peuvent persister avec cette
+#   notation — on les match toujours pour pouvoir les purger.
+_AUTO_VARIANT_MARKER_RE = re.compile(r"\((?:auto h\d+cm)\)|\[(?:auto h\d+cm)\]")
 
 
 # ----- Internal helpers --------------------------------------------------
@@ -638,12 +641,18 @@ def _create_type_variant_internal(
         dims: Dict[str, Any] = {"height_m": float(opening_height_m)}
         if opening_width_m is not None:
             dims["width_m"] = float(opening_width_m)
-        return kg.add_node("FamilyType", {
+        new_id = kg.add_node("FamilyType", {
             "family_name": family_name,
             "type_name": new_name,
             "category": category,
             "dimensions": dims,
         })
+        # Tag provenance API : permet à `openings_purge_unused_variants`
+        # de cibler tous les variants créés via le tool ou l'auto-découple,
+        # pas seulement ceux portant le marqueur `[auto h<NN>cm]` dans
+        # le nom.
+        kg.set_origin(new_id, "api")
+        return new_id
 
     source_eid_raw = kg.get_revit_id(source_type_ref)
     if source_eid_raw is None:
@@ -692,6 +701,8 @@ def _create_type_variant_internal(
         "dimensions": final_dims,
     })
     kg.set_revit_id(new_llm_id, revit_id)
+    # Tag provenance API (cf. branche KG-only ci-dessus).
+    kg.set_origin(new_llm_id, "api")
     stamp_llm_id(new_symbol, new_llm_id)
     return new_llm_id
 
@@ -729,14 +740,19 @@ def _find_compatible_variant(
 
 
 def _variant_name(source_type_name: str, opening_height_m: float) -> str:
-    """Convention de nommage des variants auto-créés : `<src> [auto hNNNcm]`.
+    """Convention de nommage des variants auto-créés : `<src> (auto hNNNcm)`.
 
-    Marqueur `[auto]` lisible dans le browser Revit, hauteur en cm pour
-    la concision (Revit affiche les noms tronqués). Idempotent : pour
-    une même hauteur, le nom est strictement identique → si jamais le
-    KG est rechargé sans le variant, le rescan le matchera par name.
+    Parenthèses (autorisées dans les noms FamilySymbol Revit) plutôt
+    que crochets — Revit refuse `[` et `]` dans `Symbol.Duplicate(name)`
+    (bug runtime 2026-05-12 sur SS01 quand l'auto-découple a tenté de
+    créer un variant pour la 1ère fois côté Revit).
+
+    Marqueur `(auto)` lisible dans le browser Revit, hauteur en cm pour
+    la concision. Idempotent : pour une même hauteur, le nom est
+    strictement identique → si le KG est rechargé sans le variant, un
+    rescan le matche par name.
     """
-    return "{} [auto h{}cm]".format(
+    return "{} (auto h{}cm)".format(
         source_type_name, round(float(opening_height_m) * 100),
     )
 
@@ -890,14 +906,26 @@ def _maybe_decouple(
 
 
 def _is_auto_variant(node: Dict[str, Any]) -> bool:
-    """True si le type_name du FamilyType contient le marqueur `[auto h<NN>cm]`.
+    """True si le FamilyType est un variant créé via API (auto-découple ou
+    `openings_create_type_variant`).
 
-    Conservateur — si l'utilisateur a renommé manuellement le variant en
-    enlevant le marqueur, le tool ne le purgera pas (et c'est tant mieux :
-    le renommage signale une réappropriation du type comme variant normal).
+    Deux critères acceptés (union logique) :
+    1. Le `type_name` contient le marqueur `(auto h<NN>cm)` (ou l'ancien `[...]`, convention de
+       nommage de `_variant_name`).
+    2. L'attribut KG `_origin` vaut `"api"` (posé à la création par
+       `_create_type_variant_internal`).
+
+    Le critère 2 capture les variants créés par le tool
+    `openings_create_type_variant` avec un nom personnalisé (sans marqueur)
+    — sans `_origin` ils auraient été préservés à tort par la purge.
+
+    Conservateur : un type préexistant dans le template Revit (importé par
+    `full_rescan`) n'a NI le marqueur NI `_origin=api` — donc préservé.
     """
     if node.get("_type") != "FamilyType":
         return False
+    if node.get("_origin") == "api":
+        return True
     name = node.get("type_name") or ""
     return bool(_AUTO_VARIANT_MARKER_RE.search(name))
 
@@ -993,7 +1021,7 @@ def set_sill_height(
     head. Le tool détecte en pré-flight l'incompatibilité via
     `FamilyType.dimensions.height_m`, cherche dans le projet un variant
     de type compatible (même famille + bonne `opening_height`), sinon
-    crée silencieusement un variant nommé `<type> [auto h<NN>cm]` et
+    crée silencieusement un variant nommé `<type> (auto h<NN>cm)` et
     swap l'instance dessus. **Le head est préservé**, le sill committé
     est exactement la valeur demandée. Variants réutilisés sur appels
     suivants → pas d'explosion du browser Revit.
@@ -2062,52 +2090,73 @@ def purge_unused_variants(
     kg: ProjectKG,
     doc: Any,
     category: Optional[str] = None,
+    include_unmarked: bool = False,
 ) -> Dict[str, Any]:
-    """Supprime les FamilyType auto-créés (marqueur `[auto h<NN>cm]`) qui
-    ne sont plus référencés par aucune Door / Window vivante.
+    """Supprime les FamilyType auto-créés ou orphelins qui ne sont plus
+    référencés par aucune Door / Window vivante.
 
     Maintenance occasionnelle après plusieurs cycles d'auto-découple (cf.
-    `openings_set_sill_height` / `_set_head_height`). Conservateur :
-    purge UNIQUEMENT les variants reconnaissables par leur marqueur
-    `[auto h<NN>cm]`. Un variant renommé manuellement par l'utilisateur
-    (marqueur enlevé) est traité comme un type normal et préservé.
+    `openings_set_sill_height` / `_set_head_height`).
+
+    **Comportement par défaut (conservateur)** : purge UNIQUEMENT les
+    variants reconnaissables par
+    - leur marqueur `(auto h<NN>cm)` dans le `type_name` (ou l'ancien `[...]`), OU
+    - leur attribut KG `_origin = "api"` (posé à la création par
+      `_create_type_variant_internal` depuis 2026-05-12).
+
+    Un variant créé manuellement dans Revit ou un type du template
+    Revit non utilisé est PRÉSERVÉ par défaut.
+
+    **Mode étendu `include_unmarked=True`** : purge en plus *tout*
+    FamilyType orphelin (peu importe son marqueur ou son origine). À
+    n'utiliser que pour les cas de rétrocompat (variants créés avant
+    le tag `_origin`, renommés manuellement, etc.) — risque de
+    supprimer des types du template Revit que l'utilisateur voudrait
+    conserver pour un usage futur. Demande utilisateur explicite
+    recommandée.
 
     Côté Revit : `doc.Delete(eid)` du FamilySymbol. Si Revit refuse
     (rare — l'usage est déjà vérifié côté KG), l'item reste dans
     `kept` avec la raison.
 
-    Concepts: purge, cleanup, nettoyage, variants, auto, types orphelins
+    Concepts: purge, cleanup, nettoyage, variants, auto, types orphelins,
+              orphan, unused
     Phrases: "nettoie les types orphelins", "purge les variants auto",
-             "remove unused types", "delete orphan family types"
+             "remove unused types", "delete orphan family types",
+             "supprime tous les types inutilisés"
     Similar: openings_create_type_variant, openings_set_type
 
     Args:
         category: optionnel. "Doors" ou "Windows" pour filtrer. None
             (défaut) purge les deux.
+        include_unmarked: défaut False (conservateur). Si True, purge
+            aussi les FamilyType orphelins sans marqueur ni tag
+            `_origin`. Voir le warning ci-dessus.
 
     Returns:
         {"ok": bool, "scanned": int, "purged": int,
          "kept": [{"llm_id", "type_name", "reason"}, …],
-         "revit_deleted": bool}
-        `scanned` = nombre total de variants `[auto]` matchés (avant
+         "revit_deleted": bool, "include_unmarked": bool}
+        `scanned` = nombre total de candidats considérés (avant
         filtrage usage). `purged` = nombre effectivement supprimés.
-        `kept` n'enumère que les variants conservés *pour une raison
-        autre que "non-auto"* (typiquement `in_use`) — token compact.
     """
     if category is not None and category not in ("Doors", "Windows"):
         raise ValueError(
             "category must be 'Doors', 'Windows' or None, got {!r}".format(category)
         )
 
-    # 1. Collecte les FamilyType auto, filtre par catégorie si demandée.
+    # 1. Collecte les candidats. Avec `include_unmarked`, on prend tous
+    # les FamilyType (filtrés par catégorie si demandée). Sinon, seul
+    # ceux qui matchent `_is_auto_variant`.
     candidates: List[str] = []
     for nid in kg.find_by_type("FamilyType"):
         attrs = kg.get_node(nid)
-        if not _is_auto_variant(attrs):
-            continue
         if category is not None and attrs.get("category") != category:
             continue
-        candidates.append(nid)
+        if include_unmarked:
+            candidates.append(nid)
+        elif _is_auto_variant(attrs):
+            candidates.append(nid)
 
     # 2. Sépare unused vs in_use.
     to_purge: List[str] = []
@@ -2132,6 +2181,7 @@ def purge_unused_variants(
             "purged": len(to_purge),
             "kept": kept,
             "revit_deleted": False,
+            "include_unmarked": include_unmarked,
         }
 
     # 3. Branche Revit : doc.Delete chaque FamilySymbol unused.
@@ -2168,4 +2218,5 @@ def purge_unused_variants(
         "purged": len(purged),
         "kept": kept,
         "revit_deleted": True,
+        "include_unmarked": include_unmarked,
     }

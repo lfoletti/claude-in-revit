@@ -101,7 +101,13 @@ def show_selectable_text(
         | AnchorStyles.Right
         | AnchorStyles.Bottom
     )
-    textbox.Text = body or ""
+    # WinForms `TextBox.Text` n'interprète QUE les CRLF comme sauts de
+    # ligne — les LF seuls (`\n`, convention Python) sont ignorés au
+    # rendu et tout le texte colle. Normalisation explicite : on
+    # canonicalise vers `\n` d'abord (pour absorber `\r\n` et `\r`
+    # legacy), puis on convertit en CRLF.
+    normalized = (body or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    textbox.Text = normalized
     form.Controls.Add(textbox)
 
     copy_btn = Button()
@@ -122,16 +128,16 @@ def show_selectable_text(
     form.AcceptButton = close_btn   # Enter → Close (déjà focus textbox).
 
     def _copy_now():
-        """Pousse `body` au clipboard et feedback visuel sur le bouton.
+        """Pousse le texte normalisé (CRLF) au clipboard et feedback
+        visuel sur le bouton.
 
         `Clipboard.SetText` jette `ArgumentNullException` sur string vide ;
-        on protège. Le timer-based feedback est trivialisé : on flip le
-        text du bouton, l'utilisateur le voit jusqu'au prochain focus
-        change ou close.
+        on protège. On copie `normalized` (et pas `body`) pour que ce
+        que voit l'utilisateur dans la TextBox = ce qu'il colle ailleurs.
         """
         try:
-            if body:
-                Clipboard.SetText(body)
+            if normalized:
+                Clipboard.SetText(normalized)
                 copy_btn.Text = "Copié ✓"
             else:
                 copy_btn.Text = "(vide)"

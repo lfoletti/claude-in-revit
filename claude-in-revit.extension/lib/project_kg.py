@@ -113,7 +113,15 @@ DELETED_AT = "deleted_at_turn"    # int or None
 # `add_node`/`modify_node` (bypasses schema validation).
 REVIT_ID = "_revit_id"            # int (long) or absent
 
-_RESERVED_ATTRS: Set[str] = {"_type", CREATED_AT, MODIFIED_AT, DELETED_AT, REVIT_ID}
+# Provenance des FamilyType (et plus généralement des nodes qui peuvent être
+# créés via plusieurs voies). Posé par `_create_type_variant_internal` (et
+# similaires) pour marquer un node comme « créé via API » par opposition à
+# « importé d'un rescan Revit ». Utilisé par `openings_purge_unused_variants`
+# pour distinguer les variants éligibles à la purge des types du template
+# Revit que l'utilisateur ne veut pas voir disparaître.
+ORIGIN = "_origin"                # str ("api") or absent
+
+_RESERVED_ATTRS: Set[str] = {"_type", CREATED_AT, MODIFIED_AT, DELETED_AT, REVIT_ID, ORIGIN}
 
 
 class ProjectKG:
@@ -282,6 +290,24 @@ class ProjectKG:
         if llm_id not in self._g:
             raise KeyError(llm_id)
         return self._g.nodes[llm_id].get(REVIT_ID)
+
+    # ----- Origin tagging (provenance) ----------------------------------
+
+    def set_origin(self, llm_id: str, origin: str) -> None:
+        """Tag a node's provenance (e.g. `"api"` for variants created
+        via `openings_create_type_variant` or auto-découple). Bypasses
+        node-type schema validation — `_origin` is framework-managed,
+        reserved like `_revit_id`.
+        """
+        if llm_id not in self._g:
+            raise KeyError(llm_id)
+        self._g.nodes[llm_id][ORIGIN] = str(origin)
+
+    def get_origin(self, llm_id: str) -> Optional[str]:
+        """Return the node's `_origin` tag, or `None` if untagged."""
+        if llm_id not in self._g:
+            raise KeyError(llm_id)
+        return self._g.nodes[llm_id].get(ORIGIN)
 
     def find_by_revit_id(self, revit_id: int) -> Optional[str]:
         """Reverse lookup: return the llm_id bound to a Revit ElementId.Value."""

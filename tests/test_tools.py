@@ -2636,7 +2636,7 @@ def test_set_head_height_auto_decouples_creates_variant(
     new_type = kg.get_node(payload["new_type_ref"])
     assert new_type["family_name"] == "Fenêtre fixe"
     assert new_type["dimensions"]["height_m"] == 1.0
-    assert "[auto h100cm]" in new_type["type_name"]
+    assert "(auto h100cm)" in new_type["type_name"]
     # Sill préservé à 1.0, head committé à 2.0, type swap-é.
     assert kg.get_node(w1)["sill_height"] == 1.0
     assert kg.get_node(w1)["head_height"] == 2.0

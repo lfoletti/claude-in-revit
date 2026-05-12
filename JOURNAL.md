@@ -14,6 +14,126 @@
 
 ---
 
+## 2026-05-12 (session h) — Validation runtime suite : purge, bulk filter, fix nommage variants
+
+### Contexte & objectif
+
+Suite directe de session g (validation runtime). Tests 4 (purge) et 5
+(bulk filter) cumulés sur le même projet Revit. 3 issues remontées,
+toutes adressées.
+
+### Issue 1 : purge ne capture pas les variants créés via API à noms personnalisés
+
+Bug rapport utilisateur : `openings_purge_unused_variants` détectait
+uniquement les variants avec marqueur de nom `[auto h<NN>cm]`. Or
+le LLM peut aussi créer des variants via le tool explicite
+`openings_create_type_variant` avec un nom personnalisé (sans
+marqueur). Ces variants restaient « préservés » par la purge même
+orphelins.
+
+**Fix** :
+- Nouveau reserved attr KG `_origin` (`project_kg.ORIGIN`). Posé à
+  `"api"` par `_create_type_variant_internal` lors de la création
+  d'un variant (via auto-découple OU via tool explicite).
+- `_is_auto_variant` étendu : matche le marqueur de nom **OU**
+  `_origin == "api"`. Union logique conservatrice : un type importé
+  par `full_rescan` n'a ni l'un ni l'autre → préservé.
+- Méthodes `kg.set_origin(llm_id, origin)` et `kg.get_origin(llm_id)`
+  symétriques à `set_revit_id` / `get_revit_id`.
+
+### Issue 2 : variants orphelins legacy sans tag `_origin`
+
+Cas rétrocompat : variants créés AVANT le tag `_origin` (sessions
+c–g), portant des noms personnalisés sans marqueur. Le tool ne peut
+pas les distinguer des types du template Revit que l'utilisateur
+veut garder.
+
+**Fix** :
+- Flag `include_unmarked: bool = False` (défaut conservateur) sur
+  `openings_purge_unused_variants`. Quand `True`, la purge cible
+  *tout* FamilyType orphelin de la catégorie (avec ou sans
+  marqueur / tag). Documentation explicite du risque (purge aussi
+  les types template non utilisés).
+- L'utilisateur peut le déclencher en demandant explicitement « purge
+  TOUS les types orphelins, même ceux sans marqueur auto ».
+- Validation runtime : 4 orphelins legacy purgés, 1 utilisé préservé
+  (`scanned=5, purged=4, kept=1`). 1 seul tool call.
+
+### Issue 3 : Revit refuse les caractères `[` et `]` dans les noms de FamilySymbol
+
+**Bug critique** caché depuis session c. La convention de nommage
+`<src> [auto h<NN>cm]` viole les règles de nommage Revit : `[` et
+`]` sont des caractères réservés pour les paramètres d'instance dans
+les noms de types. `Symbol.Duplicate(name)` avec un nom contenant
+ces caractères échoue silencieusement (retourne None ou un symbol
+invalide), d'où la confusion sur les tests précédents.
+
+**Pourquoi caché jusqu'ici** :
+- Session c : tests unitaires KG-only (pas de Revit) → bug non vu.
+- Session g test 3b : a réutilisé un variant `[auto h100cm]` créé
+  lors d'une tentative *antérieure* en KG-only (où Revit n'est pas
+  appelé). Le variant existait côté KG mais probablement pas côté
+  Revit. Le swap a marché parce que `instance.Symbol = old_symbol`
+  (rien n'a vraiment bougé Revit-side). On a interprété le succès
+  comme une preuve d'idempotence — c'était en fait un coup de
+  chance lié à un état pollué.
+- Session h test 5 : tentative de création d'un *nouveau* variant
+  `[auto h150cm]` côté Revit → échec. LLM a contourné en réutilisant
+  un variant manuel pré-créé. Bravo à lui, mais le code doit
+  fournir un chemin propre.
+
+**Fix** :
+- `_variant_name` : retour de `<src> (auto h<NN>cm)` (parenthèses
+  autorisées par Revit) au lieu de `<src> [auto h<NN>cm]`.
+- `_AUTO_VARIANT_MARKER_RE` étendu pour matcher **les deux**
+  conventions (`\(auto h\d+cm\)|\[auto h\d+cm\]`) → rétrocompat
+  avec variants existants nommés à l'ancienne.
+- Le tag `_origin = "api"` (Issue 1) rend ce détail nominal moins
+  critique fonctionnellement, mais propre côté browser Revit.
+
+### Bonus : UX dialog CRLF
+
+`lib/ui_dialogs.py` rendait tout le texte sur une seule ligne car
+WinForms `TextBox.Text` n'interprète que les CRLF (`\r\n`) comme
+sauts de ligne, pas les LF seuls (`\n`, convention Python). Fix :
+normalisation `\r\n` / `\r` → `\n` puis `\n` → `\r\n` avant
+assignment au `TextBox`. Le clipboard reçoit la même version
+normalisée pour cohérence affichage-collage.
+
+### Validation
+
+- Test 4 (purge runtime) : ✓ 4 orphelins purgés, 1 utilisé préservé,
+  1 tool call.
+- Test 5 (bulk filter — partiel) : LLM a choisi la route items-based
+  (`openings_set_sill_height_many`) parce que l'autoscan KG lui
+  pré-fournissait la liste. Rationnel. **`bulk_apply_to_filter`
+  reste non testé en runtime** — sera utile pour les cas où l'autoscan
+  ne pre-fetche pas (filtres composés type+level_ref+type_ref). À
+  reprendre.
+- Test 6 (DWG ingest) : non démarré, prochaine session.
+- `pytest -q` : 332 verts. Aucune régression.
+
+### État final & reste à faire
+
+**Acquis session h** :
+- Tag `_origin` (reserved attr) ✓
+- Flag `include_unmarked` ✓
+- Convention de nommage variants parenthèses ✓ + rétrocompat
+- UX CRLF dialog ✓
+- 332 verts ✓
+
+**Dettes ouvertes** :
+- `bulk_apply_to_filter` non testé runtime — prochaine session si
+  on déclenche un cas où l'autoscan ne pre-fetche pas.
+- Test 6 (DWG ingest) à venir.
+- Migrations futures : tag `_origin` perdu au rescan (le
+  `full_rescan` n'inspecte pas le browser Revit pour distinguer
+  variants auto vs manuels). Acceptable car au rescan le KG est
+  reconstruit depuis Revit, et les variants nommés `(auto h<NN>cm)`
+  sont reconnus via le marqueur de nom même sans tag.
+
+---
+
 ## 2026-05-12 (session g) — Validation runtime cumulée : 6 bugs Revit-side + UX + system prompt
 
 ### Contexte & objectif
