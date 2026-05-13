@@ -64,6 +64,21 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
         "required": {"name", "total_thickness"},
         "optional": {"layers_summary"},
     },
+    # DxfImportContext — singleton-ish (1 par projet KG max) qui matérialise
+    # l'état de l'import DXF en cours (Phase 1 de UC1 §JOURNAL 2026-05-13).
+    # Persisté pour que la session conversationnelle puisse reprendre les
+    # décisions du tour précédent (section_lines pointées par l'user,
+    # niveaux reconciliés, liens CAD posés, etc.) sans tout recommencer.
+    "DxfImportContext": {
+        "required": {"directory"},
+        "optional": {
+            "source",                 # str — "revit_aia", "archicad", ...
+            "files",                  # list of {path, kind: plan|section, source_layer_set}
+            "section_lines",          # list of {plan_p1, plan_p2, view_dir, coupe_path, name, confirmed_by_user, scale_verified, drift_pct}
+            "level_reconciliation",   # dict {coupe_levels, project_levels, matches, missing, extra, mismatches}
+            "linked_views",           # list of {file_path, link_revit_id, view_revit_id}
+        },
+    },
     # Architectural OR structural column (distinguished by `kind`).
     # `position` is `[x, y]` in metres in the level plane; vertical
     # placement is handled by the base level + a top offset = `height`.
