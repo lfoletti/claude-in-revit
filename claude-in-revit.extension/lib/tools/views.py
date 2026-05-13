@@ -257,16 +257,12 @@ def link_cad(
     options.OrientToView = True
 
     link_revit_id: Optional[int] = None
+    aligned_to_view_origin = False
     with rp.transaction(doc, "views.link_cad"):
         # PythonNet 3.x convention pour les `out` params .NET :
         # appeler la méthode sans pré-créer le placeholder, et
-        # recevoir un tuple (bool, out_value). Bug initial 2026-05-13 :
-        # j'utilisais `clr.Reference[ElementId]()` qui n'existe plus
-        # dans PythonNet 3.x (qui ship avec pyRevit Master).
+        # recevoir un tuple (bool, out_value).
         result = doc.Link(str(path), options, view)
-        # `result` peut être :
-        #   - tuple (bool, ElementId)         — modern PythonNet 3.x
-        #   - bool seul si l'overload signature diffère
         if isinstance(result, tuple):
             ok, out_id = result[0], result[1] if len(result) > 1 else None
         else:
@@ -281,8 +277,45 @@ def link_cad(
             try:
                 link_revit_id = int(out_id.Value)
             except AttributeError:
-                # Si out_id n'est pas un ElementId mais déjà un int.
                 link_revit_id = int(out_id)
+
+        # **Fix runtime 2026-05-13 (3D screenshot)** : avec
+        # `ImportPlacement.Origin`, Revit ancre le DXF à world (0,0,0).
+        # Pour une vue Section où l'Origin est ailleurs (cut plane à
+        # world X=5.25 par ex.), le DXF se retrouve décalé. On le
+        # translate par view.Origin pour qu'il aligne sur le cut plane
+        # exactement. NB : seulement pour les ViewSection — pour un
+        # plan d'étage, world (0,0,0) est déjà le bon endroit.
+        from Autodesk.Revit.DB import (
+            ElementId as _EID,
+            ElementTransformUtils,
+            View,
+            ViewSection,
+        )
+        if (
+            placement == "origin"
+            and isinstance(view, ViewSection)
+            and out_id is not None
+        ):
+            origin = view.Origin
+            if (
+                abs(origin.X) > 1e-9
+                or abs(origin.Y) > 1e-9
+                or abs(origin.Z) > 1e-9
+            ):
+                try:
+                    # out_id peut être ElementId ou un objet plus
+                    # complexe — on extrait l'ElementId proprement.
+                    target_eid = out_id if hasattr(out_id, "IntegerValue") or hasattr(out_id, "Value") else _EID(int(out_id))
+                    if not isinstance(target_eid, _EID):
+                        target_eid = _EID(int(link_revit_id))
+                    ElementTransformUtils.MoveElement(doc, target_eid, origin)
+                    aligned_to_view_origin = True
+                except Exception as e:  # noqa: BLE001
+                    # Si le move échoue, on garde le DXF tel qu'il est.
+                    # Le link existe, c'est juste son alignement qui
+                    # peut être à corriger manuellement.
+                    aligned_to_view_origin = False
 
     return {
         "ok": True,
@@ -291,6 +324,7 @@ def link_cad(
         "link_revit_id": link_revit_id,
         "placement": placement,
         "color_mode": color_mode,
+        "aligned_to_view_origin": aligned_to_view_origin,
         "note": (
             "Lien CAD posé. `link_revit_id` peut être None si la version "
             "PythonNet ne supporte pas le tuple-return — le lien existe "
