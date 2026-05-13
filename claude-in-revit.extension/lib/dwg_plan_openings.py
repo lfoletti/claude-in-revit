@@ -29,13 +29,23 @@ plan-only ne couvre pas :
    correspondante. À utiliser pour set `height` correct par mur
    (au lieu d'un `height_m` global).
 
-Brique commune V1 : `validate_via_elevation(walls, elevation_entities,
-elevation_direction, level_elevations)` qui :
-- Projette chaque mur en élévation (mapping coordonnées plan → DXF
-  élévation selon `direction` ∈ {Est, Nord, Sud, Ouest}).
-- Cherche des lignes A-WALL horizontales/verticales dans la zone projetée.
-- Retourne pour chaque mur : `is_valid: bool`, `height_m: float`,
-  `openings_confirmed: List[bool]`.
+**Architecture V1 : approche par vote multi-sources** (user 2026-05-13).
+Chaque source DXF (plan, coupe, élévation) produit un `Vote(answer,
+confidence)` sur les hypothèses :
+- « Ce candidat est un vrai mur » (plan : paire parallèle + thickness ;
+  coupe : présence verticale ; élévation : présence verticale).
+- « Ce mur est continu » (plan : INSERT A-GLAZ + width match gap ;
+  coupe : block_id + sill/head ; élévation : linteau/allège visibles).
+- « Cette opening est porte vs fenêtre » (plan : width parsable ; coupe :
+  sill+height extraits ; élévation : linteau seul vs +allège).
+Décision finale par majorité (ou poids selon fiabilité). Le V0
+plan-only est un cas particulier (1 voix sur 3) — extension naturelle
+de `check_planset_integrity` qui agrège déjà des checks votant leur
+`severity`.
+
+Brique commune : `validate_via_elevation(walls, elevation_entities,
+direction, level_elevations)` projette chaque mur en élévation puis
+cherche les patterns A-WALL horizontaux/verticaux dans la zone projetée.
 
 
 
