@@ -278,16 +278,12 @@ def vote_wall_visible_in_elevation(
         "profile_view": profile_view,
     }
 
-    # V3.6 critère unifié (face + profil), extension thickness en profil
-    # déjà appliquée plus haut. **Tentative V3.7 d'exiger v_lines >= 2
-    # en face rejected** : régression massive sur P7 (6/10 N0 + 5/9 N1
-    # supprimés à tort — les vrais murs sans linteau ont souvent v=1
-    # depuis l'élévation arrière du bâtiment). Le critère simple
-    # `overlap_h ou overlap_v ≥ min_overlap_m` est plus prudent et
-    # discriminera 2/3 FP automatiquement (no_count >= 1 sur wall_161
-    # via Est/Ouest profile + wall_162 via Nord/Sud profile).
-    # wall_166-like reste un edge case à supprimer manuellement via
-    # llm_id visible Revit.
+    # V3.8 final : critère unifié simple. Tentatives V3.7/V3.9 (critère
+    # face strict `v>=2 OR oh>=min`) régressent sur P7 (11/19 vrais
+    # murs supprimés à tort). Les vrais murs intérieurs ou extérieurs
+    # vus de l'arrière ont souvent juste 1 verticale isolée → critère
+    # strict les exclut indûment. Garde le critère permissif (overlap
+    # quelconque >= seuil) ; le filter auto reste désactivé côté tool.
     if overlap_h >= min_overlap_m or overlap_v >= min_overlap_m:
         # Confidence proportional to combined overlap, capped at 1.0.
         wall_length = math.sqrt(

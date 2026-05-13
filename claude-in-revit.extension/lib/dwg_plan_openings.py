@@ -842,13 +842,14 @@ def filter_walls_via_elevation_vote(
             )
             votes.append(v)
 
-        # Critère V3.5 (calibré runtime P7 session t après diag llm_ids
-        # 161/162/166) : **au moins 1 vote no parmi les 4 élévations →
-        # faux positif probable**. Validé sur P7 : élimine 161 + 162
-        # (2 no chacun), garde tous les vrais murs (0 no). 166 reste un
-        # angle mort (4 yes faibles indistinguables d'un vrai mur
-        # extérieur sans fenêtre) — à supprimer manuellement via llm_id
-        # visible Revit.
+        # Critère V3.9 : `no_count >= 1` parmi les 4 élévations →
+        # faux positif. **Exemption** : les murs fusionnés via vote
+        # élévation (= `source_indices` ≥ 2) sont immunes au filter —
+        # ils ont déjà été validés par vote pour la fusion, ce serait
+        # incohérent de les supprimer ensuite.
+        if hasattr(w, "source_indices") and len(getattr(w, "source_indices", [])) > 1:
+            kept.append(w)
+            continue
         no_count = sum(1 for v in votes if v.answer is False)
         if no_count >= 1:
             removed.append({
