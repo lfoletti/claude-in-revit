@@ -388,7 +388,8 @@ def _opening_to_dict(o: dwg_section_reader.SectionOpening) -> Dict[str, Any]:
 @tool(name="dwg_inspect_sections", tier=2)
 def inspect_sections(
     kg: ProjectKG,
-    file_paths: List[str],
+    file_paths: Optional[List[str]] = None,
+    directory: Optional[str] = None,
     scale_override: Optional[float] = None,
     opening_preview_limit: int = 30,
 ) -> Dict[str, Any]:
@@ -397,14 +398,14 @@ def inspect_sections(
     Pipeline du chapitre coupes (UC1 Phase 4, voir JOURNAL 2026-05-12 note
     d'intention + entrée 2026-05-13 inventaire Projet4) :
 
-    1. Parse chaque fichier.
+    1. Parse chaque fichier (ou tous les `.dxf` du dossier `directory`).
     2. `classify_dxf` → `plan` | `section` | `unknown`.
     3. Pour les sections : extrait niveaux (layer `A-FLOR-LEVL`) +
        ouvertures (INSERTs sur `A-GLAZ`).
     4. Pour le plan : extrait les ouvertures (INSERTs sur `A-GLAZ`).
     5. Pour chaque section, calcule le matching ouvertures coupe↔plan
        via `block_id` partagé (l'ID Revit inscrit dans le nom de bloc,
-       partagé entre `... -255828-Niveau 0` et `... -255828-Coupe 1`).
+       partagé entre `... -258141-Niveau 0` et `... -258141-Coupe 1`).
 
     Le caller (LLM ou user) utilise ensuite ce rapport pour décider :
     - lesquelles des coupes utiliser pour quel pan du plan (géo-ref via
@@ -415,15 +416,22 @@ def inspect_sections(
     Aucun écrit Revit ou KG ici. Le tool est sûr à appeler plusieurs fois.
 
     Concepts: dwg, dxf, coupe, section, niveau, level, elevation,
-              fenêtre, opening, glazing, plan, géo-ref, inspect, audit
-    Phrases: "inspecte les coupes", "qu'y a-t-il dans ces coupes",
+              fenêtre, opening, glazing, plan, géo-ref, inspect, audit,
+              projet, dossier, import projet
+    Phrases: "importe ce projet", "inspecte les coupes",
+             "qu'y a-t-il dans ce dossier projet",
              "extrait les niveaux", "match les fenêtres entre plan et coupe",
              "préview des coupes du projet", "analyse plan + coupes DXF"
     Similar: dwg_inspect, dwg_classify, levels_create_many
 
     Args:
-        file_paths: liste de chemins de fichiers .dxf (plan + coupes).
-            Au moins 1 plan + 1 coupe recommandés pour le matching.
+        file_paths: liste explicite de chemins .dxf. Optionnel si
+            `directory` est fourni.
+        directory: chemin d'un dossier contenant les `.dxf` du projet
+            (plan + coupes). Le tool glob `*.dxf` et trie par nom.
+            Use case canonique : « importe ce projet » + chemin dossier.
+            Optionnel si `file_paths` est fourni. Exactement l'un des
+            deux doit être renseigné.
         scale_override: voir `dwg_inspect`. Appliqué à tous les fichiers.
         opening_preview_limit: nombre max d'ouvertures listées par
             fichier dans le preview (défaut 30). Au-delà, agrégation
@@ -435,8 +443,27 @@ def inspect_sections(
                                        unmatched_section_count,
                                        distinct_block_ids: [...]}, ...]}
     """
-    if not file_paths:
-        raise ValueError("file_paths must contain at least one DXF path.")
+    # Résolution des entrées : exactement l'une des deux options.
+    if directory is not None and file_paths:
+        raise ValueError(
+            "Provide either `directory` or `file_paths`, not both."
+        )
+    if directory is not None:
+        dir_path = Path(directory)
+        if not dir_path.exists() or not dir_path.is_dir():
+            raise FileNotFoundError(
+                "Directory not found: {}".format(dir_path)
+            )
+        dxf_files = sorted(dir_path.glob("*.dxf"))
+        if not dxf_files:
+            raise ValueError(
+                "No .dxf files in directory {}".format(dir_path)
+            )
+        file_paths = [str(p) for p in dxf_files]
+    elif not file_paths:
+        raise ValueError(
+            "Provide either `directory` or `file_paths` (non-empty list)."
+        )
 
     parsed: List[Dict[str, Any]] = []
     plan_index: Optional[int] = None

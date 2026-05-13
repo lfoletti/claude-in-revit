@@ -164,11 +164,18 @@ def autoscan_payload(prompt: str, kg: Any) -> str:
 # tier-2 dont les tools doivent devenir visibles ce tour-ci.
 
 _TIER2_KEYWORDS = (
-    # UC1 DWG ingest — tools/dwg_import.py
+    # UC1 DWG ingest — tools/dwg_import.py (sessions h/i/j/k)
     r"\bdxf\b|\bdwg\b|"
-    r"importer?\s+(?:depuis|le\s+)?(?:plan|cao|cad)|"
-    r"(?:ingest|import)\s+(?:plan|cad|dwg|dxf)|"
-    r"plan\s+(?:d['’]archi|cad|cao)"
+    r"importer?\s+(?:depuis|le\s+|ce\s+)?(?:plan|cao|cad|projet|dossier)|"
+    r"(?:ingest|import)\s+(?:this\s+|the\s+)?(?:plan|cad|dwg|dxf|project|folder|directory)|"
+    r"plan\s+(?:d['’]archi|cad|cao)|"
+    # UC1 Phase 4 coupes (session l) — dwg_inspect_sections etc. Le
+    # mot « coupe » est suffisamment spécifique dans un contexte archi
+    # pour ne pas générer de faux positifs (« coupe budgétaire » improbable
+    # ici). « section » seul est trop ambigu en FR — on exige
+    # contextualisation par dxf/dwg ou par le verbe « inspecter ».
+    r"\bcoupes?\b|"
+    r"inspect(?:er|e|es|ent|é)?\s+(?:les\s+|la\s+|une\s+|mes\s+|le\s+|ce\s+)?(?:section|coupe|fichier|plan|projet|dossier)"
 )
 
 _TIER2_RE = re.compile(_TIER2_KEYWORDS, re.IGNORECASE)

@@ -96,7 +96,14 @@ def classify_dxf(layers_meta: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]
 #   décimal au lieu de point pour éviter le conflit avec le séparateur
 #   de path Windows).
 
-_BLOCK_ID_RE = re.compile(r"-(\d{4,})-(?:Niveau|Coupe|Plan|Elevation)\b", re.IGNORECASE)
+# L'ID Revit peut être numérique (`258141`) ou alphanumérique
+# (`V1`, `V2` pour des variants) — observé sur Projet4 re-exporté
+# 2026-05-13 (Coupe 2 contient un bloc `-V1-Coupe 2`). On accepte
+# `[A-Za-z0-9_]+` mais on borne fermement par `-` + le suffixe vue
+# pour éviter de capturer des fragments arbitraires du nom.
+_BLOCK_ID_RE = re.compile(
+    r"-([A-Za-z0-9_]+)-(?:Niveau|Coupe|Plan|Elevation)\b", re.IGNORECASE,
+)
 _BLOCK_DIM_RE = re.compile(r"(\d+)_(\d+)\s*m\s*x\s*(\d+)_(\d+)\s*m", re.IGNORECASE)
 
 

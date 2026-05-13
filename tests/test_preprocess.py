@@ -223,8 +223,24 @@ def test_autoscan_payload_handles_multi_collection(kg_with_two_windows):
     ("ingest ce DWG", 2),
     ("importer depuis ce plan CAD", 2),
     ("import the DXF file", 2),
+    # Coupes (UC1 Phase 4 — session l).
+    ("inspecte mes coupes", 2),
+    ("regarde la coupe 1", 2),
+    ("extrait les niveaux de cette coupe", 2),
+    ("inspecte la section", 2),
+    ("inspecte le fichier", 2),
+    # « Importe ce projet » + dossier — use case canonique user.
+    ("importe ce projet C:/Users/x/projet1", 2),
+    ("importer ce projet", 2),
+    ("importe ce dossier de DXF", 2),
+    ("inspecte ce dossier", 2),
+    ("inspecte ce projet", 2),
+    ("import this project folder", 2),
     # No match — mots isolés sans contexte.
     ("crée une nouvelle vue plan", 1),
+    # `section` seul est trop ambigu en FR → reste tier-1 si pas
+    # contextualisé par « inspecter » ou couplé à dxf/dwg.
+    ("crée une nouvelle section dans le bâtiment", 1),
 ])
 def test_infer_tier_max(prompt, expected):
     assert preprocess.infer_tier_max(prompt) == expected
