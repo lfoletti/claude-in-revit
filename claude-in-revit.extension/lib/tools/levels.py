@@ -289,6 +289,84 @@ def reconcile_with_dxf(
         and not rec.elev_only_matches
     )
 
+    # Build a human-readable summary for a grouped user dialog. Les
+    # niveaux sont l'un des seuls cas où validation user reste exigée
+    # même quand l'inférence est sûre (cascade sur les hôtes — décision
+    # 2026-05-13 user).
+    summary_lines: List[str] = []
+    if rec.matches:
+        summary_lines.append(
+            "✓ {} niveau(x) déjà alignés (rien à faire) :".format(len(rec.matches))
+        )
+        for m in rec.matches:
+            summary_lines.append(
+                "    • {} @ {:.2f} m".format(m["name"], m["elevation_m"])
+            )
+    if rec.missing_in_project:
+        summary_lines.append(
+            "+ {} niveau(x) à CRÉER :".format(len(rec.missing_in_project))
+        )
+        for m in rec.missing_in_project:
+            summary_lines.append(
+                "    • {} @ {:.2f} m".format(m["name"], m["elevation_m"])
+            )
+    if rec.name_only_matches:
+        summary_lines.append(
+            "≠ {} niveau(x) à RÉ-ÉLEVER (même nom, élévation différente) :".format(
+                len(rec.name_only_matches),
+            )
+        )
+        for n in rec.name_only_matches:
+            summary_lines.append(
+                "    • {} : {:.2f} → {:.2f} m (Δ={:.3f})".format(
+                    n["name"], n["project_elevation_m"],
+                    n["coupe_elevation_m"], n["delta_m"],
+                )
+            )
+    if rec.elev_only_matches:
+        summary_lines.append(
+            "≠ {} niveau(x) à NOM différent (à user de choisir) :".format(
+                len(rec.elev_only_matches),
+            )
+        )
+        for e in rec.elev_only_matches:
+            summary_lines.append(
+                "    • '{}' ↔ '{}' @ {:.2f} m".format(
+                    e["project_name"], e["coupe_name"], e["elevation_m"],
+                )
+            )
+    if rec.extra_in_project:
+        summary_lines.append(
+            "= {} niveau(x) projet sans match DXF (gardés) :".format(
+                len(rec.extra_in_project),
+            )
+        )
+        for x in rec.extra_in_project:
+            summary_lines.append(
+                "    • {} @ {:.2f} m".format(x["name"], x["elevation_m"])
+            )
+    summary_for_dialog = "\n".join(summary_lines)
+
+    if alignment_complete:
+        note = (
+            "Niveaux DXF parfaitement alignés avec le projet — aucune "
+            "modification nécessaire. Ouvrir tout de même un dialog "
+            "léger `ui_confirm_yes_no` (titre 'Niveaux validés ?', "
+            "message du `summary_for_dialog`) pour validation user "
+            "groupée — c'est le seul cas où on demande même sans doute "
+            "car les niveaux ont des cascades sur les hôtes."
+        )
+    else:
+        note = (
+            "Reconciliation incomplète. **Présenter le `summary_for_dialog` "
+            "à l'utilisateur via UN SEUL dialog GROUPÉ** "
+            "(`ui_confirm_choices` avec options 'Appliquer tout', "
+            "'Annuler') — pas un dialog par action. Si l'user confirme, "
+            "appliquer les `suggested_actions` via `levels_create_many` "
+            "(pour create_level) + `levels_set_elevation`/`levels_set_name` "
+            "(pour modify/rename) en respectant l'ordre."
+        )
+
     return {
         "ok": True,
         "coupe_path": str(path),
@@ -301,6 +379,8 @@ def reconcile_with_dxf(
         "extra_in_project": list(rec.extra_in_project),
         "suggested_actions": list(rec.suggested_actions),
         "alignment_complete": alignment_complete,
+        "summary_for_dialog": summary_for_dialog,
+        "note": note,
     }
 
 

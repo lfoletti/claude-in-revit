@@ -229,10 +229,14 @@ def link_cad(
         "origin": ImportPlacement.Origin,
         "center": ImportPlacement.Centered,
     }
+    # ImportColorMode enum (Revit 2025) : Preserved, BlackAndWhite.
+    # `PreserveColorMode` n'existe pas — bug initial reporté runtime
+    # 2026-05-13. `by_layer` est synonymé sur Preserved (mapping
+    # source layer color → output layer color = preserve).
     color_map = {
         "preserved": ImportColorMode.Preserved,
         "black_and_white": ImportColorMode.BlackAndWhite,
-        "by_layer": ImportColorMode.PreserveColorMode,
+        "by_layer": ImportColorMode.Preserved,
     }
 
     # Resolve target view.

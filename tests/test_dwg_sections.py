@@ -699,6 +699,37 @@ def test_reconcile_via_tool_aligned_when_match(kg_factory_via_lambda=None):
     assert payload["alignment_complete"] is True
     assert len(payload["matches"]) == 3
     assert not payload["suggested_actions"]
+    # Even aligned, summary_for_dialog should list the 3 matches.
+    assert "Niveau 0" in payload["summary_for_dialog"]
+    assert "Niveau 1" in payload["summary_for_dialog"]
+    assert "déjà alignés" in payload["summary_for_dialog"].lower()
+
+
+def test_reconcile_summary_lists_creates_and_modifies():
+    """Quand il y a des actions, summary_for_dialog les liste pour
+    un dialog grouped 'Appliquer tout' / 'Annuler'."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    if not PROJET4_COUPE1.exists():
+        pytest.skip("Projet4 absent")
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    # 1 niveau pre-existant à Niveau 1 mais à 2.7m (devrait suggérer modify_elevation)
+    kg.add_node("Level", {"name": "Niveau 1", "elevation": 2.7})
+    result = llm_protocol.dispatch_tool_use(
+        "levels_reconcile_with_dxf",
+        {"coupe_path": str(PROJET4_COUPE1)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["alignment_complete"] is False
+    summary = payload["summary_for_dialog"]
+    # Should mention creates AND elevation modification.
+    assert "créer" in summary.lower() or "creer" in summary.lower()
+    assert "ré-élever" in summary.lower() or "elev" in summary.lower()
 
 
 # ----- identify_source --------------------------------------------------
@@ -1054,6 +1085,28 @@ def test_dwg_verify_section_scale_projet4():
     assert 10 < payload["coupe_a_wall_extent_m"] < 50
     # Drift > 25% → warning attendu.
     assert payload["warning"] is not None
+
+
+@projet4_available
+def test_projet4_all_inferred_confidently_flag():
+    """Projet4 = 2 traits avec rotations claires → all_inferred_confidently=True
+    et needs_user_for_view_dir=[]. La note doit dire 'PROCÉDER DIRECTEMENT'."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_find_section_markers",
+        {"file_path": str(PROJET4_PLAN)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["all_inferred_confidently"] is True
+    assert payload["needs_user_for_view_dir"] == []
+    assert "procéder directement" in payload["note"].lower()
 
 
 @projet4_available

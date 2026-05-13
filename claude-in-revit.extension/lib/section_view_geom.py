@@ -122,13 +122,17 @@ def compute_section_view_bounds(
     if section_length < 1e-6:
         raise ValueError("Section line has zero length (p1 == p2)")
 
-    # Origin = midpoint, lifted to bottom_elev so the view's "down" axis
-    # corresponds to the floor. Actually, Revit's BasisY=world up means
-    # we place Y=0 at the bottom of the view. So origin Z = bottom_elev.
+    # Origin = CENTER de la vue dans le monde, pas le coin bas. La
+    # convention Revit (Building Coder, RevitAPI docs) veut un BBox
+    # symétrique autour d'Origin, donc Origin est au centre horizontal
+    # ET vertical du futur cadrage. Le Z origin = milieu de la plage
+    # d'élévation (bottom_elev → top_elev + buffer).
+    half_height = (top_elev_m - bottom_elev_m + height_buffer_m) / 2.0
+    center_z = bottom_elev_m + half_height  # = (bottom + top + buffer) / 2
     origin = (
         (p1[0] + p2[0]) / 2.0,
         (p1[1] + p2[1]) / 2.0,
-        bottom_elev_m,
+        center_z,
     )
 
     # Look vector (toward where viewer is looking).
@@ -141,15 +145,15 @@ def compute_section_view_bounds(
     basis_x = _cross(basis_y, basis_z)
     basis_x = _normalize(basis_x)
 
-    # BBox in local frame.
-    # X: ±half-section-length (the section line extent along its length).
+    # BBox en repère LOCAL, symétrique autour d'Origin :
+    # X: ±half-section-length (le long de la section line).
+    # Y: ±half_height (vertical, centré sur center_z = milieu élévation).
+    # Z: de -far_clip à 0 (Max.Z = 0 = plan de coupe ; négatif = profondeur
+    #    dans le sens du regard ; +near_clip permis pour inclure la surface
+    #    juste derrière le plan de coupe).
     half_len = section_length / 2.0
-    # Y: from 0 (= bottom_elev in world) to (top_elev - bottom_elev + buffer).
-    height = top_elev_m - bottom_elev_m + height_buffer_m
-    # Z: -far_clip to +near_clip (BasisZ points toward viewer, so
-    # negative Z is behind the cut plane in the look direction).
-    bbox_min = (-half_len, 0.0, -far_clip_m)
-    bbox_max = (half_len, height, near_clip_m)
+    bbox_min = (-half_len, -half_height, -far_clip_m)
+    bbox_max = (half_len, half_height, near_clip_m)
 
     return SectionViewBounds(
         origin_m=origin,

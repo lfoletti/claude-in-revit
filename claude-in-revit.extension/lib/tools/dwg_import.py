@@ -682,25 +682,60 @@ def find_section_markers(
     section_count = sum(1 for m in markers if m.kind == "section")
     elevation_count = sum(1 for m in markers if m.kind == "elevation")
 
+    # Aggrégation : pour chaque trait de coupe (section), est-ce que
+    # son `inferred_view_dir` est non-None ? Si oui, l'agent peut
+    # procéder directement avec cette direction. Si non, demander à
+    # l'user pour le marker concerné uniquement.
+    section_markers_idx = [
+        i for i, m in enumerate(markers_dict) if m["kind"] == "section"
+    ]
+    needs_user_for_view_dir = [
+        i for i in section_markers_idx
+        if markers_dict[i]["inferred_view_dir"] is None
+    ]
+    all_inferred_confidently = (
+        section_count > 0 and not needs_user_for_view_dir
+    )
+
+    if section_count == 0:
+        note = (
+            "Aucun trait de coupe détecté. Vérifier que le DXF a été "
+            "exporté avec les annotations Coupes visibles (Revit : VG → "
+            "Annotations → Coupes coché + configuration export DXF "
+            "mapping correct)."
+        )
+    elif all_inferred_confidently:
+        note = (
+            "Toutes les directions de regard ont été inférées avec "
+            "confiance depuis la rotation des marqueurs (signal clair "
+            "dans le DXF). **PROCÉDER DIRECTEMENT** avec "
+            "`dxf_context_register_section_line` sans demander "
+            "confirmation user — les directions du dessin sont "
+            "suffisantes. Ne demander à l'user que si une action "
+            "ultérieure est destructrice ou ambiguë."
+        )
+    else:
+        note = (
+            "Inférence partielle : {n_amb}/{n_tot} traits ont "
+            "`inferred_view_dir=None` (rotation oblique, marqueur "
+            "manquant, ou conflit). Demander à l'user UNIQUEMENT pour "
+            "les indices {idxs} via `ui_confirm_choices` ; pour les "
+            "autres, procéder direct avec `inferred_view_dir`."
+        ).format(
+            n_amb=len(needs_user_for_view_dir),
+            n_tot=section_count,
+            idxs=needs_user_for_view_dir,
+        )
+
     return {
         "ok": True,
         "file": str(path),
         "section_count": section_count,
         "elevation_count": elevation_count,
+        "all_inferred_confidently": all_inferred_confidently,
+        "needs_user_for_view_dir": needs_user_for_view_dir,
         "markers": markers_dict,
-        "note": (
-            "Chaque trait `kind='section'` expose `inferred_view_dir` "
-            "(déduit de la rotation du bloc marqueur). L'agent peut "
-            "l'utiliser directement, en demandant 1 confirmation user "
-            "globale plutôt que la direction trait par trait. "
-            "`view_dir_candidates` reste disponible si l'user veut "
-            "renverser. Puis appeler `dxf_context_register_section_line`."
-            if section_count > 0 else
-            "Aucun trait de coupe détecté. Vérifier que le DXF a été "
-            "exporté avec les annotations Coupes visibles (Revit : VG → "
-            "Annotations → Coupes coché + configuration export DXF "
-            "mapping correct)."
-        ),
+        "note": note,
     }
 
 
