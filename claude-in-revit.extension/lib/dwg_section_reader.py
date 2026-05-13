@@ -487,10 +487,15 @@ class SectionMarker:
     facilite l'inférence de la direction de vue (perpendiculaire au
     trait).
 
-    `view_dir_candidates` : 2 options possibles (l'orientation de vue
-    n'est pas unique avec un trait + un marqueur unique : Revit peut
-    regarder à gauche OU à droite du trait). L'agent doit confirmer
-    avec l'utilisateur.
+    `inferred_view_dir` : direction de regard inférée depuis la rotation
+    du bloc marqueur (None si pas inférable). Convention : block
+    `Coupe - Marque/Extrémité` Revit a une orientation par défaut
+    "up" (+Y) ; la rotation de l'INSERT (CCW depuis +Y) donne la
+    direction du regard. L'agent peut utiliser cette inférence
+    directement, en gate-confirmant 1 fois avec l'user pour fiabilité.
+
+    `view_dir_candidates` : 2 options possibles (fallback si l'inférence
+    rate ou si l'user veut renverser).
 
     `associated_blocks` : INSERTs qui ont déclenché la classification —
     utile pour debug et pour que l'agent puisse expliquer son choix.
@@ -504,6 +509,7 @@ class SectionMarker:
     view_dir_candidates: List[str]
     associated_blocks: List[Dict[str, Any]]
     source_layer: str
+    inferred_view_dir: Optional[str] = None
 
 
 def _line_is_horizontal(p1: Tuple[float, float], p2: Tuple[float, float], tol: float = 0.01) -> bool:
@@ -512,6 +518,49 @@ def _line_is_horizontal(p1: Tuple[float, float], p2: Tuple[float, float], tol: f
 
 def _line_is_vertical(p1: Tuple[float, float], p2: Tuple[float, float], tol: float = 0.01) -> bool:
     return abs(p2[0] - p1[0]) < tol
+
+
+# Convention observée Projet4 (Revit AIA) : les blocs `Coupe - Marque ...`
+# et `Coupe - Extrémité ...` sont définis avec une géométrie pointant
+# vers +Y (« up ») dans leur repère local. La rotation de l'INSERT
+# (en degrés, CCW depuis +Y) donne donc la direction du regard.
+#
+# Si une autre source d'export utilise une orientation par défaut
+# différente, modifier `_MARKER_BLOCK_DEFAULT_DIR_DEG` ou paramétrer.
+_MARKER_BLOCK_DEFAULT_DIR_DEG = 90.0  # +Y = 90° en convention math (0° = +X)
+
+
+def _infer_view_dir_from_marker_rotation(rotation_deg: float) -> Optional[str]:
+    """Convertit la rotation d'un INSERT marqueur de coupe en direction
+    de regard cardinale.
+
+    Le bloc Revit `Coupe - Marque ...` a une orientation par défaut
+    pointant vers `+Y` (« up » en convention plan). La rotation CCW de
+    l'INSERT, appliquée à cette orientation, donne la direction réelle
+    du regard. On snap au cardinal le plus proche (left / right / up /
+    down). Retourne None si le snap est ambigu (rotation à 45° ± tol).
+
+    Args:
+        rotation_deg: rotation de l'INSERT en degrés (CCW, comme dans le
+            DXF).
+
+    Returns:
+        `"left" | "right" | "up" | "down"` ou None.
+    """
+    import math
+    # Default direction = +Y. CCW rotation by rotation_deg :
+    rad = math.radians(float(rotation_deg))
+    dx = -math.sin(rad)
+    dy = math.cos(rad)
+    # Snap to nearest cardinal — exiger qu'une composante domine claire-
+    # ment l'autre pour éviter les ambiguïtés à 45° (rare en pratique
+    # pour des coupes orthogonales).
+    abs_dx, abs_dy = abs(dx), abs(dy)
+    if abs(abs_dx - abs_dy) < 0.1:
+        return None  # rotation oblique, pas de cardinal clair
+    if abs_dx > abs_dy:
+        return "right" if dx > 0 else "left"
+    return "up" if dy > 0 else "down"
 
 
 def _block_name_matches(name: str, keywords: Tuple[str, ...]) -> bool:
@@ -630,6 +679,18 @@ def find_section_markers(
         else:
             candidates = ["left", "right", "up", "down"]  # oblique — ambigu
 
+        # Inférer la direction de regard depuis la rotation du PREMIER
+        # marqueur de type "section" (pas elevation). Si aucun match
+        # parmi les candidates, retomber à None.
+        inferred: Optional[str] = None
+        for b in associated:
+            if b.get("kind_detected") != "section":
+                continue
+            cand = _infer_view_dir_from_marker_rotation(b["rotation_deg"])
+            if cand is not None and cand in candidates:
+                inferred = cand
+                break
+
         source_layer = line.layer
 
         markers.append(SectionMarker(
@@ -642,6 +703,7 @@ def find_section_markers(
             view_dir_candidates=candidates,
             associated_blocks=associated,
             source_layer=source_layer,
+            inferred_view_dir=inferred,
         ))
 
     # Sort by length desc (longest = most likely real section).

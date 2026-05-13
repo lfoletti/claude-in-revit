@@ -621,6 +621,7 @@ def _section_marker_to_dict(m: dwg_section_reader.SectionMarker) -> Dict[str, An
         "length_m": round(m.length_m, 4),
         "is_vertical": m.is_vertical,
         "is_horizontal": m.is_horizontal,
+        "inferred_view_dir": m.inferred_view_dir,
         "view_dir_candidates": list(m.view_dir_candidates),
         "associated_blocks": list(m.associated_blocks),
         "source_layer": m.source_layer,
@@ -688,11 +689,12 @@ def find_section_markers(
         "elevation_count": elevation_count,
         "markers": markers_dict,
         "note": (
-            "Pour chaque trait de coupe (kind='section'), demander à "
-            "l'utilisateur de confirmer (a) le mapping vers quel DXF "
-            "de coupe et (b) la direction de vue parmi `view_dir_candidates`. "
-            "Puis appeler `dxf_context_register_section_line` avec ces "
-            "infos."
+            "Chaque trait `kind='section'` expose `inferred_view_dir` "
+            "(déduit de la rotation du bloc marqueur). L'agent peut "
+            "l'utiliser directement, en demandant 1 confirmation user "
+            "globale plutôt que la direction trait par trait. "
+            "`view_dir_candidates` reste disponible si l'user veut "
+            "renverser. Puis appeler `dxf_context_register_section_line`."
             if section_count > 0 else
             "Aucun trait de coupe détecté. Vérifier que le DXF a été "
             "exporté avec les annotations Coupes visibles (Revit : VG → "

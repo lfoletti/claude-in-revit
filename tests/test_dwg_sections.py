@@ -471,6 +471,92 @@ def test_find_section_markers_returns_empty_when_no_g_anno_layer(tmp_path):
     assert markers == []
 
 
+# ----- inferred_view_dir from marker rotation -------------------------
+
+
+def _make_plan_with_marker_rotation(tmp_path: Path, *, line_orient: str, marker_rot: float) -> Path:
+    """DXF plan synthétique avec 1 trait + 1 INSERT 'Coupe' à rotation
+    contrôlée. line_orient ∈ {'vertical', 'horizontal'}."""
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("A-WALL")
+    doc.layers.add("A-AREA-IDEN")
+    doc.layers.add("G-ANNO-SYMB")
+    msp = doc.modelspace()
+    msp.add_mtext("Pièce", dxfattribs={
+        "layer": "A-AREA-IDEN", "insert": (0, 0), "char_height": 200,
+    })
+    msp.add_line((0, 0), (1000, 0), dxfattribs={"layer": "A-WALL"})
+
+    # Block défini avec orientation +Y par défaut (rectangle vertical).
+    block_name = "Coupe - Marque - Verticale-1-Niveau 0"
+    blk = doc.blocks.new(name=block_name)
+    blk.add_line((0, 0), (0, 100), dxfattribs={"layer": "G-ANNO-SYMB"})
+
+    if line_orient == "vertical":
+        p1, p2 = (5000.0, -10000.0), (5000.0, 10000.0)
+    else:
+        p1, p2 = (-10000.0, 5000.0), (10000.0, 5000.0)
+    msp.add_line(p1, p2, dxfattribs={"layer": "G-ANNO-SYMB"})
+    msp.add_blockref(block_name, p1, dxfattribs={
+        "layer": "G-ANNO-SYMB", "rotation": marker_rot,
+    })
+    msp.add_blockref(block_name, p2, dxfattribs={
+        "layer": "G-ANNO-SYMB", "rotation": marker_rot,
+    })
+
+    path = tmp_path / "marker_rot_{}.dxf".format(int(marker_rot))
+    doc.saveas(str(path))
+    return path
+
+
+@pytest.mark.parametrize("orient,rot,expected", [
+    # Vertical line : view_dir candidates left/right.
+    ("vertical", 270.0, "right"),  # +Y rotated 270° CCW = +X = right
+    ("vertical", 90.0, "left"),    # +Y rotated 90° CCW = -X = left
+    # Horizontal line : view_dir candidates up/down.
+    ("horizontal", 0.0, "up"),     # +Y unchanged = up
+    ("horizontal", 180.0, "down"), # +Y inverted = down
+])
+def test_inferred_view_dir_from_marker_rotation(tmp_path, orient, rot, expected):
+    path = _make_plan_with_marker_rotation(tmp_path, line_orient=orient, marker_rot=rot)
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    assert len(sections) == 1
+    assert sections[0].inferred_view_dir == expected
+
+
+def test_inferred_view_dir_oblique_returns_none(tmp_path):
+    """Rotation 45° → ambigu → inferred=None, view_dir_candidates utilisable."""
+    path = _make_plan_with_marker_rotation(tmp_path, line_orient="vertical", marker_rot=45.0)
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    # Some markers might still be valid. The inferred should be None
+    # because 45° is ambiguous.
+    if sections:
+        assert sections[0].inferred_view_dir is None
+
+
+@projet4_available
+def test_projet4_inferred_view_dirs():
+    """Projet4 : vertical line → 'right', horizontal line → 'up'."""
+    entities, _ = dwg_reader.parse(PROJET4_PLAN)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    by_orient = {
+        "vertical": [m for m in sections if m.is_vertical],
+        "horizontal": [m for m in sections if m.is_horizontal],
+    }
+    assert len(by_orient["vertical"]) >= 1
+    assert len(by_orient["horizontal"]) >= 1
+    # Vertical line in Projet4 has marker rot=270° → 'right' (regard est).
+    assert by_orient["vertical"][0].inferred_view_dir == "right"
+    # Horizontal line has marker rot=0° → 'up' (regard nord).
+    assert by_orient["horizontal"][0].inferred_view_dir == "up"
+
+
 # ----- reconcile_levels -------------------------------------------------
 
 
