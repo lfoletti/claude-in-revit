@@ -288,30 +288,56 @@ def link_cad(
             except AttributeError:
                 link_revit_id = int(out_id)
 
-        # **Fix runtime 2026-05-13 (3D screenshots itérés)** : avec
+        # **Fix runtime 2026-05-13 (P7 asymmetric project)** : avec
         # `ImportPlacement.Origin`, Revit ancre le DXF à world (0,0,0).
-        # Pour une ViewSection où l'Origin est ailleurs (cut plane à
-        # world X=5.25 par ex.), le DXF se retrouve décalé. On le
-        # translate par view.Origin pour qu'il aligne sur le cut plane
-        # exactement.
+        # Pour une ViewSection où l'Origin est ailleurs, le DXF est
+        # décalé.
+        #
+        # **Convention DXF (0,0) Revit section export** (dérivée empi-
+        # riquement de P7 : A-WALL bbox DXF X = plan A-WALL Y/X
+        # exactement, mêmes coordonnées) :
+        #   - Coupe verticale (cut along world Y) : DXF X = world Y
+        #     → DXF (0,0) → world (X_cut, 0, 0)
+        #   - Coupe horizontale (cut along world X) : DXF X = world X
+        #     → DXF (0,0) → world (0, Y_cut, 0)
+        # Donc translation = (X_cut, 0, 0) ou (0, Y_cut, 0), NON pas
+        # `view.Origin` (= midpoint du trait, qui inclut un offset
+        # incorrect le long de la section direction).
+        #
+        # X_cut = view.Origin.X pour vertical, 0 sinon.
+        # Y_cut = view.Origin.Y pour horizontal, 0 sinon.
+        # On détecte vertical/horizontal via BasisX.X (= 0 pour
+        # vertical section line, ≠ 0 pour horizontal).
         #
         # **Avec `OrientToView=True`**, Revit auto-épingle le link
-        # (`Pinned=True`). Il faut le dépingler avant le move, sinon
-        # `MoveElement` lève « impossible de déplacer l'élément
-        # verrouillé ». On le laisse dépinglé après — le user peut
-        # re-pingler manuel si besoin (ou ajouter `restore_pinned`
-        # plus tard).
+        # (`Pinned=True`). Il faut le dépingler avant le move.
         from Autodesk.Revit.DB import (
             ElementId as _EID,
             ElementTransformUtils,
             ViewSection,
+            XYZ,
         )
         if (
             placement == "origin"
             and isinstance(view, ViewSection)
             and out_id is not None
         ):
-            origin = view.Origin
+            view_origin = view.Origin
+            basis_x = view.RightDirection
+            # Détermine l'axis de la section :
+            # - vertical section line in plan : BasisX horizontal,
+            #   along world Y direction (BasisX.X ≈ 0, BasisX.Y ≠ 0)
+            #   → keep view_origin.X, zero out Y
+            # - horizontal section line : BasisX along world X
+            #   (BasisX.X ≠ 0) → keep view_origin.Y, zero out X
+            if abs(basis_x.X) > 0.5:
+                # Horizontal section : trait along X, DXF (0,0) at
+                # world (0, Y_cut, 0).
+                origin = XYZ(0.0, view_origin.Y, 0.0)
+            else:
+                # Vertical section : trait along Y, DXF (0,0) at
+                # world (X_cut, 0, 0).
+                origin = XYZ(view_origin.X, 0.0, 0.0)
             if (
                 abs(origin.X) > 1e-9
                 or abs(origin.Y) > 1e-9
