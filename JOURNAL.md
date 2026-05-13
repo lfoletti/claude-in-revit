@@ -74,7 +74,7 @@ critique car la création des murs ne modifie pas les types existants.
 
 ### Tests
 
-**Nouveau `tests/test_dwg_phase2.py`** — 12 tests. Couverture :
+**Nouveau `tests/test_dwg_phase2.py`** — 17 tests. Couverture :
 
 - `dwg_extract_wall_thicknesses` (2) : 3 buckets, bucket_cm=5 merge.
 - `walls_get_or_create_dxf_type` (4) : KG create, idempotence,
@@ -82,10 +82,25 @@ critique car la création des murs ne modifie pas les types existants.
 - `walls_get_or_create_dxf_type_many` (2) : dédup, reuse.
 - `dwg_import_walls_typed` (4) : roundtrip 3 épaisseurs, idempotence
   re-import, level_ref inconnu rejeté, refuse DXF section.
+- `dwg_extract_wall_thicknesses_many` (2) : agrégation globale
+  multi-plans, reject empty list.
+- `dwg_import_walls_typed_many` (3) : dédup types globale entre 2
+  plans (20cm partagé → 1 seul type créé), reject level inconnu,
+  reject empty items.
+
+### Bulks ajoutés (réaction user « ces functions sont-elles bulkables »)
+
+Cohérent avec la coding policy `feedback-bulk-tool-variant-policy` :
+- `dwg_extract_wall_thicknesses_many(file_paths)` — extraction multi-plans
+  avec `global_distribution` dédupliquée pour faciliter l'enchaînement.
+- `dwg_import_walls_typed_many(items)` — import bulk avec **dédup
+  global des buckets** entre plans : un mur de 20cm dans N0 et N1 →
+  1 seul `DXF_WALL_20cm` partagé. Gain : 2 Tx Revit au lieu de 2N,
+  1 round-trip API au lieu de N.
 
 ### Validation
 
-**559 tests verts** (547 → 559, +12). Pas de régression.
+**564 tests verts** (547 → 564, +17). Pas de régression.
 
 ### Flow d'import end-to-end (à valider runtime sur P7)
 
@@ -94,11 +109,17 @@ critique car la création des murs ne modifie pas les types existants.
 2. dwg_inspect_sections + find_section_markers + ...  ← Phase 1
 3. levels_reconcile_with_dxf → levels_create_many (si besoin)
 4. views_create_section_many + views_link_cad_many
-5. (NEW) dwg_extract_wall_thicknesses(plan)    ← preview Phase 2
+5. (NEW) dwg_extract_wall_thicknesses_many(file_paths=[N0, N1])  ← preview
 6. (NEW) ui_confirm_choices                    ← user valide distribution
-7. (NEW) dwg_import_walls_typed(plan, level)   ← création murs typés
+7. (NEW) dwg_import_walls_typed_many(items=[                   ← création
+       {file_path: N0, level_ref: niveau_0, height_m: 3},
+       {file_path: N1, level_ref: niveau_1, height_m: 3},
+   ])
 8. views_open_3d                               ← validation visuelle
 ```
+
+Pour P7 (2 plans) : 1 appel `_many` au lieu de 2 appels lockstep =
+1 round-trip API + 2 Tx Revit (au lieu de 4) + types factorisés.
 
 ### Reste à faire Phase 2
 

@@ -285,6 +285,122 @@ def test_import_walls_typed_unknown_level_rejects(tmp_path, kg_fresh):
     assert "level_ref" in r["content"].lower()
 
 
+def _make_second_plan(tmp_path: Path) -> Path:
+    """2e plan avec 2 épaisseurs : 20cm (commune avec le 1er) + 25cm (nouvelle)."""
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 6
+    doc.layers.add("A-WALL")
+    msp = doc.modelspace()
+    # 20cm à x=3.
+    msp.add_line((3.0 - 0.10, 0.0), (3.0 - 0.10, 5.0),
+                 dxfattribs={"layer": "A-WALL"})
+    msp.add_line((3.0 + 0.10, 0.0), (3.0 + 0.10, 5.0),
+                 dxfattribs={"layer": "A-WALL"})
+    # 25cm à x=7.
+    msp.add_line((7.0 - 0.125, 0.0), (7.0 - 0.125, 5.0),
+                 dxfattribs={"layer": "A-WALL"})
+    msp.add_line((7.0 + 0.125, 0.0), (7.0 + 0.125, 5.0),
+                 dxfattribs={"layer": "A-WALL"})
+    p = tmp_path / "plan_n1.dxf"
+    doc.saveas(str(p))
+    return p
+
+
+# ----- dwg_extract_wall_thicknesses_many ---------------------------
+
+
+def test_extract_thicknesses_many_aggregates_global(tmp_path, kg_fresh):
+    plan1 = _make_multi_thickness_plan(tmp_path)  # 15, 20, 30
+    plan2 = _make_second_plan(tmp_path)           # 20, 25
+    r = llm_protocol.dispatch_tool_use(
+        "dwg_extract_wall_thicknesses_many",
+        {"file_paths": [str(plan1), str(plan2)]},
+        "t1", kg_fresh,
+    )
+    assert not r.get("is_error"), r.get("content")
+    p = json.loads(r["content"])
+    assert len(p["per_file"]) == 2
+    # Global distribution : 4 buckets distincts (15, 20, 25, 30).
+    cms = p["distinct_buckets_cm"]
+    assert cms == [15, 20, 25, 30]
+    # Le bucket 20cm apparaît dans les 2 fichiers.
+    bucket_20 = next(b for b in p["global_distribution"] if b["cm"] == 20)
+    assert bucket_20["files_count"] == 2
+    assert bucket_20["total_count"] == 2  # 1 mur 20cm par plan
+
+
+def test_extract_thicknesses_many_rejects_empty_list(kg_fresh):
+    r = llm_protocol.dispatch_tool_use(
+        "dwg_extract_wall_thicknesses_many",
+        {"file_paths": []},
+        "t1", kg_fresh,
+    )
+    assert r.get("is_error") is True
+
+
+# ----- dwg_import_walls_typed_many --------------------------------
+
+
+def test_import_walls_typed_many_dedups_types_globally(tmp_path, kg_fresh):
+    """2 plans avec un bucket 20cm commun → 1 seul type DXF_WALL_20cm créé."""
+    n0 = kg_fresh.add_node("Level", {"name": "N0", "elevation": 0.0})
+    n1 = kg_fresh.add_node("Level", {"name": "N1", "elevation": 3.0})
+    plan1 = _make_multi_thickness_plan(tmp_path)  # 15, 20, 30
+    plan2 = _make_second_plan(tmp_path)           # 20, 25
+
+    r = llm_protocol.dispatch_tool_use(
+        "dwg_import_walls_typed_many",
+        {
+            "items": [
+                {"file_path": str(plan1), "level_ref": n0, "height_m": 3.0},
+                {"file_path": str(plan2), "level_ref": n1, "height_m": 3.0},
+            ],
+        },
+        "t1", kg_fresh,
+    )
+    assert not r.get("is_error"), r.get("content")
+    p = json.loads(r["content"])
+    assert p["files_count"] == 2
+    # 3 murs plan1 + 2 murs plan2 = 5 murs au total.
+    assert p["walls_imported_total"] == 5
+    # 4 types uniques créés (dédup global) : 15, 20, 25, 30.
+    assert p["types_created"] == 4
+    assert p["types_reused"] == 0
+    # Distribution globale.
+    dist = p["thickness_distribution_global"]
+    assert dist == {"15cm": 1, "20cm": 2, "25cm": 1, "30cm": 1}
+    # walls_per_file détaillé.
+    assert p["walls_per_file"][str(plan1)] == 3
+    assert p["walls_per_file"][str(plan2)] == 2
+    # 4 types en KG, 5 walls en KG.
+    type_names = {
+        kg_fresh.get_node(nid).get("name")
+        for nid in kg_fresh.find_by_type("WallType")
+    }
+    assert {"DXF_WALL_15cm", "DXF_WALL_20cm", "DXF_WALL_25cm", "DXF_WALL_30cm"} <= type_names
+    assert len(list(kg_fresh.find_by_type("Wall"))) == 5
+
+
+def test_import_walls_typed_many_rejects_unknown_level(tmp_path, kg_fresh):
+    plan1 = _make_multi_thickness_plan(tmp_path)
+    r = llm_protocol.dispatch_tool_use(
+        "dwg_import_walls_typed_many",
+        {"items": [{"file_path": str(plan1), "level_ref": "bogus"}]},
+        "t1", kg_fresh,
+    )
+    assert r.get("is_error") is True
+    assert "level_ref" in r["content"].lower()
+
+
+def test_import_walls_typed_many_rejects_empty_items(kg_fresh):
+    r = llm_protocol.dispatch_tool_use(
+        "dwg_import_walls_typed_many",
+        {"items": []},
+        "t1", kg_fresh,
+    )
+    assert r.get("is_error") is True
+
+
 def test_import_walls_typed_refuses_section_dxf(tmp_path, kg_fresh):
     """Le tool doit refuser un DXF de coupe (pas un plan)."""
     level_id = kg_fresh.add_node("Level", {"name": "N0", "elevation": 0.0})

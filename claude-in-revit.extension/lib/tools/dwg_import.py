@@ -1900,6 +1900,121 @@ def extract_wall_thicknesses(
     }
 
 
+def _extract_wall_thicknesses_one(
+    file_path: str,
+    layer_mapping: Dict[str, str],
+    scale_override: Optional[float],
+    bucket_cm: int,
+    min_thickness_m: float,
+    max_thickness_m: float,
+    include_centerline: bool,
+) -> Dict[str, Any]:
+    """Helper privé — extraction pour 1 plan. Réutilisé par le tool
+    unitaire et le bulk.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError("File not found: {}".format(path))
+    entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    classified = dwg_classifier.classify(
+        entities, layer_mapping,
+        min_thickness_m=min_thickness_m,
+        max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+    )
+    by_bucket: Dict[int, Dict[str, Any]] = {}
+    for i, w in enumerate(classified.walls):
+        cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+        bucket = by_bucket.setdefault(cm, {
+            "cm": cm,
+            "count": 0,
+            "type_name": "DXF_WALL_{}cm".format(cm),
+            "wall_indices": [],
+        })
+        bucket["count"] += 1
+        bucket["wall_indices"].append(i)
+    return {
+        "file_path": str(path),
+        "walls_count": len(classified.walls),
+        "thickness_buckets": sorted(by_bucket.values(), key=lambda b: b["cm"]),
+        "rejected_count": len(classified.rejected),
+    }
+
+
+@tool(name="dwg_extract_wall_thicknesses_many", tier=2)
+def extract_wall_thicknesses_many(
+    kg: ProjectKG,
+    file_paths: List[str],
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    bucket_cm: int = 1,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+) -> Dict[str, Any]:
+    """Extract épaisseurs pour N plans en **un seul** appel.
+
+    Pattern bulk : pour un projet multi-étages (P7 a 2 plans), l'agent
+    appelle ce tool 1× au lieu de N. Économie : 1 round-trip API au
+    lieu de N. Le résultat inclut une **distribution globale dédupliquée**
+    pour faciliter `dwg_import_walls_typed_many` derrière.
+
+    Concepts: dxf, dwg, plans, épaisseurs, distribution, bulk, batch,
+              multi-étages, preview, phase 2
+    Phrases: "preview les épaisseurs de tous les plans",
+             "extract thicknesses many"
+    Similar: dwg_extract_wall_thicknesses, dwg_import_walls_typed_many
+
+    Args:
+        file_paths: liste de chemins DXF plan (≥ 1).
+        layer_mapping / scale_override / bucket_cm / min_thickness_m /
+            max_thickness_m / include_centerline: cf.
+            `dwg_extract_wall_thicknesses`. Appliqués uniformément à
+            tous les plans.
+
+    Returns:
+        {"ok": bool, "per_file": [{file_path, walls_count,
+            thickness_buckets, rejected_count}, ...],
+         "global_distribution": [{cm, total_count, files_count,
+            type_name}, ...],
+         "distinct_buckets_cm": [cm, cm, ...]}
+    """
+    if not isinstance(file_paths, list) or not file_paths:
+        raise ValueError("file_paths must be a non-empty list")
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+    if bucket_cm < 1:
+        raise ValueError("bucket_cm must be >= 1")
+
+    per_file: List[Dict[str, Any]] = []
+    global_buckets: Dict[int, Dict[str, Any]] = {}
+    for fp in file_paths:
+        rec = _extract_wall_thicknesses_one(
+            fp, layer_mapping, scale_override, bucket_cm,
+            min_thickness_m, max_thickness_m, include_centerline,
+        )
+        per_file.append(rec)
+        for b in rec["thickness_buckets"]:
+            cm = b["cm"]
+            gb = global_buckets.setdefault(cm, {
+                "cm": cm,
+                "total_count": 0,
+                "files_count": 0,
+                "type_name": "DXF_WALL_{}cm".format(cm),
+            })
+            gb["total_count"] += b["count"]
+            gb["files_count"] += 1
+
+    global_dist = sorted(global_buckets.values(), key=lambda b: b["cm"])
+    return {
+        "ok": True,
+        "per_file": per_file,
+        "global_distribution": global_dist,
+        "distinct_buckets_cm": [b["cm"] for b in global_dist],
+        "bucket_cm": bucket_cm,
+    }
+
+
 @tool(name="dwg_import_walls_typed", tier=2)
 def import_walls_typed(
     kg: ProjectKG,
@@ -2054,6 +2169,190 @@ def import_walls_typed(
         "types_reused": types_result["reused_count"],
         "thickness_distribution": {
             "{}cm".format(cm): count for cm, count in sorted(thickness_dist.items())
+        },
+        "types": types_result["types"],
+        "inner_walls": inner,
+    }
+
+
+@tool(name="dwg_import_walls_typed_many", tier=2)
+def import_walls_typed_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+    bucket_cm: int = 1,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+    base_type_ref: Optional[str] = None,
+    max_walls_per_file: int = 500,
+) -> Dict[str, Any]:
+    """Import typed pour N plans en bulk (Phase 2.4 bulk).
+
+    Pour un projet multi-étages, l'agent passe `items=[{file_path,
+    level_ref, height_m?, dx_m?, dy_m?}, ...]` et le tool :
+
+    1. Classifie chaque plan → WallCandidates per file.
+    2. **Dédup global** des buckets d'épaisseur entre tous les plans
+       (un mur de 20cm dans N0 et N1 → 1 seul WallType `DXF_WALL_20cm`
+       partagé).
+    3. Crée tous les types manquants en **1 seule** Tx Revit
+       (`walls_get_or_create_dxf_type_many`).
+    4. Crée tous les murs (tous plans confondus) en **1 seule** Tx Revit
+       (`walls_create_many`).
+
+    Gain vs N appels `dwg_import_walls_typed` : 2 Tx Revit au lieu de
+    2N, 1 round-trip API au lieu de N, et factorisation des types
+    entre niveaux.
+
+    Concepts: dxf, dwg, import, bulk, batch, mur, walltype, custom,
+              typed, phase 2, multi-étages, plusieurs plans
+    Phrases: "importe les murs de tous les plans avec types DXF",
+             "import walls typed many", "phase 2 bulk import"
+    Similar: dwg_import_walls_typed, dwg_extract_wall_thicknesses_many,
+             walls_get_or_create_dxf_type_many, walls_create_many
+
+    Args:
+        items: liste de dicts `{file_path, level_ref, height_m?,
+            dx_m?, dy_m?}`. Au moins un item.
+        bucket_cm / layer_mapping / scale_override / min_thickness_m /
+            max_thickness_m / include_centerline / base_type_ref:
+            appliqués uniformément à tous les plans.
+        max_walls_per_file: garde-fou par fichier (défaut 500).
+
+    Returns:
+        {"ok": bool, "files_count": int,
+         "walls_imported_total": int, "walls_per_file": {path: count},
+         "types_created": int, "types_reused": int,
+         "thickness_distribution_global": {cm: count, ...},
+         "types": [...], "inner_walls": <walls_create_many response>}
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+
+    # --- 1. Pre-validate items + parse + classify each plan -------------
+    parsed_per_file: List[Tuple[Dict[str, Any], List[Any]]] = []
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            raise ValueError("items[{}] must be a dict".format(i))
+        fp = it.get("file_path")
+        level_ref = it.get("level_ref")
+        if not isinstance(fp, str) or not fp.strip():
+            raise ValueError("items[{}]: file_path required".format(i))
+        if not isinstance(level_ref, str) or not kg.has_node(level_ref):
+            raise ValueError(
+                "items[{}]: unknown level_ref {!r}".format(i, level_ref)
+            )
+        path = Path(fp)
+        if not path.exists():
+            raise FileNotFoundError(
+                "items[{}]: file not found: {}".format(i, path)
+            )
+        _refuse_if_section(path)
+
+        entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+        classified = dwg_classifier.classify(
+            entities, layer_mapping,
+            min_thickness_m=min_thickness_m,
+            max_thickness_m=max_thickness_m,
+            include_centerline=include_centerline,
+        )
+        if len(classified.walls) > max_walls_per_file:
+            raise ValueError(
+                "items[{}] ({}): {} walls > max_walls_per_file={}".format(
+                    i, path.name, len(classified.walls), max_walls_per_file,
+                )
+            )
+        parsed_per_file.append((it, classified.walls))
+
+    # --- 2. Dédup global des buckets ------------------------------------
+    seen_buckets: Set[int] = set()
+    unique_thicknesses_m: List[float] = []
+    for _it, walls in parsed_per_file:
+        for w in walls:
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+            if cm not in seen_buckets:
+                seen_buckets.add(cm)
+                unique_thicknesses_m.append(cm / 100.0)
+
+    if not unique_thicknesses_m:
+        return {
+            "ok": True,
+            "files_count": len(items),
+            "walls_imported_total": 0,
+            "walls_per_file": {it["file_path"]: 0 for it, _ in parsed_per_file},
+            "types_created": 0,
+            "types_reused": 0,
+            "thickness_distribution_global": {},
+            "types": [],
+            "inner_walls": None,
+            "note": "No wall candidates detected in any plan.",
+        }
+
+    # --- 3. get_or_create_dxf_type_many (1 Tx Revit) --------------------
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    type_entry = registry.get("walls_get_or_create_dxf_type_many")
+    types_result = type_entry.fn(
+        kg=kg, doc=doc,
+        thicknesses_m=unique_thicknesses_m,
+        bucket_cm=bucket_cm,
+        base_type_ref=base_type_ref,
+    )
+    type_ref_by_cm: Dict[int, str] = {}
+    for entry in types_result["types"]:
+        cm = int(round(entry["thickness_m"] * 100))
+        type_ref_by_cm[cm] = entry["llm_id"]
+
+    # --- 4. Build items pour walls_create_many global -------------------
+    all_wall_items: List[Dict[str, Any]] = []
+    walls_per_file: Dict[str, int] = {}
+    thickness_dist_global: Dict[int, int] = {}
+    for plan_item, walls in parsed_per_file:
+        fp = plan_item["file_path"]
+        level_ref = plan_item["level_ref"]
+        dx_m = float(plan_item.get("dx_m", 0.0))
+        dy_m = float(plan_item.get("dy_m", 0.0))
+        height_m = plan_item.get("height_m")
+        per_file_count = 0
+        for w in walls:
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+            wall_type_ref = type_ref_by_cm.get(cm)
+            if wall_type_ref is None:
+                raise RuntimeError(
+                    "Bucket {}cm not in type_ref_by_cm — get_or_create bug?".format(cm)
+                )
+            wall_item: Dict[str, Any] = {
+                "level_ref": level_ref,
+                "wall_type_ref": wall_type_ref,
+                "p1": [w.p1[0] + dx_m, w.p1[1] + dy_m],
+                "p2": [w.p2[0] + dx_m, w.p2[1] + dy_m],
+            }
+            if height_m is not None:
+                wall_item["height"] = float(height_m)
+            all_wall_items.append(wall_item)
+            per_file_count += 1
+            thickness_dist_global[cm] = thickness_dist_global.get(cm, 0) + 1
+        walls_per_file[fp] = per_file_count
+
+    # --- 5. walls_create_many global (1 Tx Revit) -----------------------
+    walls_entry = registry.get("walls_create_many")
+    inner = walls_entry.fn(kg=kg, doc=doc, items=all_wall_items)
+
+    return {
+        "ok": True,
+        "files_count": len(items),
+        "walls_imported_total": len(all_wall_items),
+        "walls_per_file": walls_per_file,
+        "types_created": types_result["created_count"],
+        "types_reused": types_result["reused_count"],
+        "thickness_distribution_global": {
+            "{}cm".format(cm): count
+            for cm, count in sorted(thickness_dist_global.items())
         },
         "types": types_result["types"],
         "inner_walls": inner,
