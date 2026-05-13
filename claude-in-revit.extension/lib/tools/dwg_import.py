@@ -2376,6 +2376,231 @@ def import_walls_typed_many(
     }
 
 
+@tool(name="dwg_add_openings_to_walls_many", tier=2)
+def add_openings_to_walls_many(
+    kg: ProjectKG,
+    doc: Any,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    door_family_type_ref: Optional[str] = None,
+    window_family_type_ref: Optional[str] = None,
+    perp_tol_m: float = 0.30,
+) -> Dict[str, Any]:
+    """Phase 2b — Ajoute fenêtres/portes sur murs existants du KG via
+    vote orientation par élévation.
+
+    Use case : Phase 2a a créé les murs continus (sans openings). Ce
+    tool ajoute les openings en utilisant les coupes (source primaire,
+    block_id + sill/height) ET les élévations (vote orientation pour
+    désambiguïser mur traversé vs arrière-plan).
+
+    Pour chaque opening de coupe :
+    1. Projette en world plan (convention DXF anchor).
+    2. Vote orientation via les 4 élévations : EW (Nord/Sud confirment)
+       ou NS (Est/Ouest confirment).
+    3. Trouve le mur hôte parmi les Wall vivants du KG dont :
+       - orientation matche le vote (EW/NS),
+       - position projetée tombe sur le mur (perp_tol),
+       - level matche le level_elevation de l'opening.
+    4. Classify door (sill ≤ 0.15, height ≥ 1.9) ou window.
+    5. Crée via `openings_create_many`.
+
+    Args:
+        scale_override: cf. dwg_inspect.
+        section_lines: optionnel ; sinon lu du DxfImportContext.
+        door_family_type_ref / window_family_type_ref: optionnels ;
+            sinon auto-détectés.
+        perp_tol_m: tolérance perpendiculaire pour matcher opening sur mur.
+
+    Returns:
+        {ok, openings_doors_created, openings_windows_created,
+         openings_orphan, openings_unmatched, inner_openings, note}
+    """
+    if doc is not None:
+        try:
+            from .. import revit_primitives as rp
+            rp.ensure_shared_param_binding(doc)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 1. Build section_lines.
+    if section_lines is None:
+        section_lines = []
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is not None:
+            ctx = kg.get_node(nid)
+            seen = set()
+            for sl in ctx.get("section_lines", []):
+                key = (sl.get("coupe_path"), tuple(sl.get("plan_p1", [])),
+                       tuple(sl.get("plan_p2", [])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                section_lines.append(sl)
+    if not section_lines:
+        raise ValueError(
+            "Pas de section_lines. Lance Phase 1 d'abord ou passe "
+            "explicitement `section_lines`."
+        )
+
+    # 2. Charge élévations.
+    elevations = _load_elevations_from_kg(kg, scale_override=scale_override)
+
+    # 3. Build level_elev_by_revit_id (level_ref → elevation) depuis le KG.
+    level_elev_by_id: Dict[str, float] = {}
+    for nid in kg.find_by_type("Level"):
+        node = kg.get_node(nid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        level_elev_by_id[nid] = float(node.get("elevation", 0.0))
+
+    # 4. Lis les openings des coupes.
+    coupe_openings = _collect_coupe_openings_world(
+        kg, section_lines, scale_override, level_elev_by_id,
+    )
+
+    # 5. Récupère les murs vivants du KG par level.
+    walls_by_level: Dict[float, List[Tuple[str, Dict[str, Any]]]] = {}
+    for nid in kg.find_by_type("Wall"):
+        node = kg.get_node(nid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        lvl_ref = node.get("level_ref")
+        if lvl_ref is None or lvl_ref not in level_elev_by_id:
+            continue
+        elev = level_elev_by_id[lvl_ref]
+        walls_by_level.setdefault(elev, []).append((nid, node))
+
+    # 6. FamilyType auto-detection.
+    if door_family_type_ref is None:
+        door_family_type_ref = _find_default_family_type(kg, "Doors")
+    if window_family_type_ref is None:
+        window_family_type_ref = _find_default_family_type(kg, "Windows")
+
+    # 7. Pour chaque opening, vote orientation + trouve host wall.
+    door_items: List[Dict[str, Any]] = []
+    window_items: List[Dict[str, Any]] = []
+    orphan_count = 0
+    unmatched_count = 0
+    orientation_stats = {"EW": 0, "NS": 0, "unknown": 0}
+    for co in coupe_openings:
+        opening_xy = (co["x_world"], co["y_world"])
+        sill_m = co.get("sill_m")
+        height_m = co.get("height_m")
+        width_m = co.get("width_m") or 0.8
+        if sill_m is None or height_m is None:
+            unmatched_count += 1
+            continue
+
+        # Vote orientation.
+        orientation, _ev = dwg_plan_openings.vote_opening_orientation_via_elevations(
+            opening_xy, sill_m, height_m, width_m, elevations,
+        )
+        if orientation is None:
+            orientation_stats["unknown"] += 1
+        else:
+            orientation_stats[orientation] += 1
+
+        # Find host wall.
+        candidate_walls = walls_by_level.get(co["level_elevation_m"], [])
+        best_host = None
+        best_perp = float("inf")
+        for nid, wnode in candidate_walls:
+            p1 = wnode.get("p1")
+            p2 = wnode.get("p2")
+            if not p1 or not p2:
+                continue
+            wp1 = (float(p1[0]), float(p1[1]))
+            wp2 = (float(p2[0]), float(p2[1]))
+            dx, dy = wp2[0] - wp1[0], wp2[1] - wp1[1]
+            wall_is_ew = abs(dx) > abs(dy)
+            wall_orient = "EW" if wall_is_ew else "NS"
+            # Restrict par orientation si déterminée.
+            if orientation is not None and wall_orient != orientation:
+                continue
+            thick = float(wnode.get("thickness", 0.20))
+            perp = dwg_plan_openings._perp_distance_point_to_line(
+                opening_xy, wp1, wp2,
+            )
+            tol = perp_tol_m + thick / 2.0
+            if perp > tol:
+                continue
+            t = dwg_plan_openings._project_param(opening_xy, wp1, wp2)
+            if t < -0.05 or t > 1.05:
+                continue
+            if perp < best_perp:
+                best_perp = perp
+                best_host = (nid, wp1, wp2, thick)
+
+        if best_host is None:
+            orphan_count += 1
+            continue
+
+        host_ref, hp1, hp2, hthick = best_host
+        kind = dwg_plan_openings.classify_opening_kind(sill_m, height_m)
+        if kind == "unknown":
+            unmatched_count += 1
+            continue
+
+        # Project position sur centerline du mur hôte.
+        proj_pos = dwg_plan_openings.project_pos_onto_wall_centerline(
+            opening_xy, hp1, hp2,
+        )
+        family_ref = (
+            door_family_type_ref if kind == "door"
+            else window_family_type_ref
+        )
+        if family_ref is None:
+            unmatched_count += 1
+            continue
+
+        item = {
+            "kind": kind,
+            "host_wall_ref": host_ref,
+            "family_type_ref": family_ref,
+            "position": [proj_pos[0], proj_pos[1]],
+            "sill_height": sill_m,
+        }
+        if kind == "door":
+            door_items.append(item)
+        else:
+            window_items.append(item)
+
+    # 8. Crée openings.
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    openings_entry = registry.get("openings_create_many")
+    all_items = door_items + window_items
+    if all_items and openings_entry is not None:
+        inner = openings_entry.fn(kg=kg, doc=doc, items=all_items)
+    else:
+        inner = None
+
+    note = (
+        "Phase 2b : {} portes + {} fenêtres hostées via vote orientation. "
+        "{} orphelins (pas de mur hôte trouvé), {} non matchés "
+        "(sill/height/family manquant). Orientations : EW={}, NS={}, "
+        "unknown={}".format(
+            len(door_items), len(window_items), orphan_count, unmatched_count,
+            orientation_stats["EW"], orientation_stats["NS"],
+            orientation_stats["unknown"],
+        )
+    )
+
+    return {
+        "ok": True,
+        "coupe_openings_detected": len(coupe_openings),
+        "openings_doors_created": len(door_items),
+        "openings_windows_created": len(window_items),
+        "openings_orphan": orphan_count,
+        "openings_unmatched": unmatched_count,
+        "orientation_stats": orientation_stats,
+        "inner_openings": inner,
+        "note": note,
+    }
+
+
 # ----- 11. Phase 2.5 : walls fusionnés + openings hosted ---------------
 
 
@@ -3226,29 +3451,10 @@ def create_continuous_walls_many(
         total_fusion_events += len(events)
         fusion_events_detail.extend(events)
 
-    # --- 3bis. Filter V3.12 : zero_lines + multi-niveaux + skip fusions
-    # User : « 1 seul trait = pas un mur », « un mur a un début et une
-    # fin ». Critère : filter si UNE élévation a `zero_lines` (= 0
-    # lignes A-WALL dans la zone projetée) ET pas d'équivalent à un
-    # autre niveau (sauvegarde les vrais murs intérieurs cachés en
-    # élévation mais cohérents N0↔N1). Skip fusions immunes.
+    # --- 3bis. Filter auto DÉSACTIVÉ (user : pause après 13 itérations).
+    # Suspects flagués via score 3D plus bas pour suppression manuelle.
     total_walls_filtered = 0
     filtered_walls_detail: List[Dict[str, Any]] = []
-    for pr in plan_records:
-        level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
-        height_m = float(pr["item"].get("height_m") or 3.0)
-        # Collecte les walls des autres niveaux pour check multi-niveaux.
-        other_walls = [
-            w for other in plan_records if other is not pr
-            for w in other["walls"]
-        ]
-        kept, removed = dwg_plan_openings.filter_walls_via_elevation_vote(
-            pr["walls"], elevations, level_elev, height_m,
-            walls_at_other_levels=other_walls,
-        )
-        pr["walls"] = kept
-        total_walls_filtered += len(removed)
-        filtered_walls_detail.extend(removed)
 
     # --- 4. Dédup thicknesses + get_or_create types ---------------------
     seen_buckets: Set[int] = set()

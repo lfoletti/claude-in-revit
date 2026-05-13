@@ -782,6 +782,89 @@ def merge_fragments_via_elevation_vote(
     return current, events
 
 
+# ----- Phase 2b — Vote orientation d'un opening via élévations -------
+
+
+def vote_opening_orientation_via_elevations(
+    opening_world: Tuple[float, float],
+    sill_m: float,
+    height_m: float,
+    width_m: float,
+    elevations: Dict[str, Any],
+    *,
+    bandwidth_m: float = 0.20,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Détermine l'orientation du mur hôte d'un opening via vote
+    élévation : EW ou NS.
+
+    User Phase 2b : sur coupe horizontale, un opening peut être dans
+    un mur traversé (perpendiculaire au trait, NS pour trait horizontal)
+    OU dans un mur en arrière-plan (parallèle au trait, EW pour trait
+    horizontal). L'INSERT A-GLAZ en coupe ne distingue pas.
+
+    Vote :
+    - Élévation Nord/Sud voit l'opening à `x_elev=±X_world` → mur EW.
+    - Élévation Est/Ouest voit l'opening à `x_elev=±Y_world` → mur NS.
+    - L'élévation qui voit un linteau (head_y) et/ou allège (sill_y)
+      dans la zone projetée vote pour son axe.
+
+    Args:
+        opening_world: position de l'opening en world plan.
+        sill_m / height_m / width_m: dims de l'opening (de la coupe).
+        elevations: dict {direction: ElevationView}.
+        bandwidth_m: largeur de la bande de recherche autour du x_elev.
+
+    Returns:
+        `("EW" | "NS" | None, evidence)`. None si signal indécis ou
+        absent.
+    """
+    from .dwg_elevation_reader import (
+        project_world_to_elevation, vote_opening_visible_in_elevation,
+    )
+    # Vote chaque élévation séparément pour cet opening.
+    votes_by_axis = {"EW": [], "NS": []}
+    evidence_by_dir: Dict[str, Any] = {}
+    for direction, ev in elevations.items():
+        v = vote_opening_visible_in_elevation(
+            opening_world, 0.0, sill_m, height_m, width_m, ev,
+            x_tol_m=bandwidth_m, y_tol_m=0.40,
+        )
+        evidence_by_dir[direction] = {
+            "answer": v.answer, "confidence": v.confidence,
+        }
+        if direction in ("Nord", "Sud"):
+            votes_by_axis["EW"].append(v)
+        else:
+            votes_by_axis["NS"].append(v)
+
+    # Score : somme des confidences yes par axe.
+    ew_score = sum(
+        v.confidence for v in votes_by_axis["EW"] if v.answer is True
+    )
+    ns_score = sum(
+        v.confidence for v in votes_by_axis["NS"] if v.answer is True
+    )
+
+    evidence = {
+        "ew_score": round(ew_score, 3),
+        "ns_score": round(ns_score, 3),
+        "votes_by_direction": evidence_by_dir,
+    }
+
+    if ew_score < 0.1 and ns_score < 0.1:
+        return (None, evidence)
+    if ew_score > ns_score * 1.5:
+        return ("EW", evidence)
+    if ns_score > ew_score * 1.5:
+        return ("NS", evidence)
+    # Égalité approximative → choisit le max strictement.
+    if ew_score > ns_score:
+        return ("EW", evidence)
+    if ns_score > ew_score:
+        return ("NS", evidence)
+    return (None, evidence)
+
+
 # ----- V3.10 — Cohérence multi-niveaux --------------------------------
 
 
