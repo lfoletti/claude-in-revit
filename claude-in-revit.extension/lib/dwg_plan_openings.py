@@ -637,6 +637,150 @@ def merge_fragments_around_opening(
     return walls, None
 
 
+# ----- V3 — Fusion fragments via vote élévation (continuité) ----------
+
+
+def merge_fragments_via_elevation_vote(
+    walls: List[Any],
+    elevations: Dict[str, Any],
+    level_elevation_m: float,
+    height_m: float,
+    *,
+    max_gap_m: float = 4.0,
+    angle_tol_rad: float = math.radians(3.0),
+    thickness_tol_m: float = 0.03,
+    perp_tol_m: float = 0.05,
+    min_decision_confidence: float = 0.4,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Fusionne les pairs de murs collinéaires séparés par un gap, **si
+    le vote élévation confirme la continuité**.
+
+    Use case : sur P7, le bâtiment montre des fragments mur séparés par
+    2-3m (= fenêtres/portes que les coupes ne traversent pas). Le
+    `merge_collinear_walls` avec max_gap=0.5m ne les fusionne pas. Mais
+    l'élévation correspondante montre une bande A-WALL continue sur le
+    gap → on sait que c'est un mur continu avec opening au milieu.
+
+    Pour chaque pair (i, j) collinéaires avec gap dans [0, max_gap_m] :
+    1. Construit le mur fusionné candidate.
+    2. Vote via les 4 élévations sur la visibilité de ce mur.
+    3. Si majorité yes avec confidence ≥ min_decision_confidence →
+       fusion. Sinon → laisser fragments.
+
+    Args:
+        walls: liste de `WallCandidate` ou `MergedWall`.
+        elevations: dict `{direction: ElevationView}`.
+        level_elevation_m: élévation absolue du niveau (m).
+        height_m: hauteur des murs (m).
+        max_gap_m: gap max pour considérer une fusion (défaut 4m, capte
+            les vraies ouvertures de fenêtres et portes).
+        angle_tol_rad / thickness_tol_m / perp_tol_m: tolérances.
+        min_decision_confidence: confiance min pour accepter la fusion.
+
+    Returns:
+        `(new_walls, fusion_events)`. `fusion_events` détaille chaque
+        fusion appliquée pour le rapport agent.
+    """
+    # Import paresseux pour éviter cycle.
+    from .dwg_elevation_reader import vote_wall_visible_in_elevation
+    from .dwg_voting import aggregate_votes
+
+    current = list(walls)
+    events: List[Dict[str, Any]] = []
+    while True:
+        n = len(current)
+        merged_any = False
+        for i in range(n):
+            if merged_any:
+                break
+            w_i = current[i]
+            angle_i = _angle_mod_pi(w_i.p1, w_i.p2)
+            for j in range(i + 1, n):
+                w_j = current[j]
+                if abs(w_i.thickness - w_j.thickness) > thickness_tol_m:
+                    continue
+                if getattr(w_i, "layer", None) != getattr(w_j, "layer", None):
+                    continue
+                angle_j = _angle_mod_pi(w_j.p1, w_j.p2)
+                if not _angles_close(angle_i, angle_j, angle_tol_rad):
+                    continue
+                if _perp_distance_point_to_line(
+                    w_j.p1, w_i.p1, w_i.p2,
+                ) > perp_tol_m:
+                    continue
+                # Project 4 endpoints, sort, get inner gap.
+                endpoints = [w_i.p1, w_i.p2, w_j.p1, w_j.p2]
+                params = [_project_param(e, w_i.p1, w_i.p2) for e in endpoints]
+                pair = sorted(zip(params, endpoints), key=lambda x: x[0])
+                e_sorted = [p[1] for p in pair]
+                t_sorted = [p[0] for p in pair]
+                wi_len = math.sqrt(
+                    (w_i.p2[0] - w_i.p1[0]) ** 2
+                    + (w_i.p2[1] - w_i.p1[1]) ** 2
+                )
+                gap = max(0.0, t_sorted[2] - t_sorted[1]) * wi_len
+                if gap <= 0.01:
+                    # Already touching — fusion sans vote.
+                    pass
+                elif gap > max_gap_m:
+                    continue
+                # Build candidate fusion endpoints.
+                cand_p1 = e_sorted[0]
+                cand_p2 = e_sorted[-1]
+                # Vote via élévations.
+                votes = []
+                if elevations:
+                    for direction, ev in elevations.items():
+                        v = vote_wall_visible_in_elevation(
+                            cand_p1, cand_p2,
+                            level_elevation_m, height_m, ev,
+                        )
+                        votes.append(v)
+                # Si pas d'élévations et gap > 0 : refuse (pas de validation).
+                if not votes and gap > 0.01:
+                    continue
+                if votes:
+                    decision = aggregate_votes(
+                        votes, min_voters=1, threshold=0.5,
+                    )
+                    if decision.answer is not True:
+                        continue
+                    if decision.confidence_score < min_decision_confidence:
+                        continue
+                # Fusion accept.
+                merged_wall = MergedWall(
+                    p1=cand_p1,
+                    p2=cand_p2,
+                    thickness=(w_i.thickness + w_j.thickness) / 2.0,
+                    layer=w_i.layer,
+                    confidence=min(
+                        getattr(w_i, "confidence", 1.0),
+                        getattr(w_j, "confidence", 1.0),
+                    ),
+                    source_indices=(
+                        list(getattr(w_i, "source_indices", []))
+                        + list(getattr(w_j, "source_indices", []))
+                        or [i, j]
+                    ),
+                )
+                new_current = [w for k, w in enumerate(current) if k != i and k != j]
+                new_current.append(merged_wall)
+                current = new_current
+                events.append({
+                    "gap_m": round(gap, 3),
+                    "thickness_m": round(merged_wall.thickness, 3),
+                    "confidence": (
+                        round(decision.confidence_score, 3) if votes else 1.0
+                    ),
+                    "p1": cand_p1, "p2": cand_p2,
+                })
+                merged_any = True
+                break
+        if not merged_any:
+            break
+    return current, events
+
+
 # ----- V2.1 — Fusion collinéaires (post-classify, pré-pipeline) -------
 
 

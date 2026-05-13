@@ -3045,6 +3045,235 @@ def _build_walls_openings_note(
     return " ".join(parts)
 
 
+@tool(name="dwg_create_continuous_walls_many", tier=2)
+def create_continuous_walls_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+    bucket_cm: int = 1,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+    base_type_ref: Optional[str] = None,
+    max_walls_per_file: int = 500,
+    fusion_max_gap_m: float = 4.0,
+) -> Dict[str, Any]:
+    """V3 — Crée uniquement des murs **continus** depuis les plans DXF
+    (sans openings). Étape 1 d'un pipeline décomposé (user 2026-05-13).
+
+    Pipeline focalisé sur la qualité des murs avant d'ajouter les
+    openings. L'agent / user valide visuellement le résultat avant
+    d'enchaîner `dwg_add_openings_to_walls_many` (à venir).
+
+    Pipeline :
+
+    1. Classify walls de chaque plan (paires parallèles + centerlines).
+    2. `merge_collinear_walls(max_gap=0.5m)` : fusion des fragments
+       collés ou séparés par des joints / portes intérieures courtes.
+    3. **`merge_fragments_via_elevation_vote(max_gap=4m)`** : pour les
+       fragments collinéaires séparés par des gaps de 1-4m (typique :
+       fenêtres / portes invisible dans les coupes), check via vote
+       élévation si une bande A-WALL continue chevauche le gap →
+       fusion si majorité yes. Sinon fragments distincts.
+    4. Dédup global thicknesses + `walls_get_or_create_dxf_type_many`.
+    5. `walls_create_many` (1 Tx Revit).
+
+    Pas de création d'openings. La récupération des orphans via vote
+    et la création des fenêtres/portes seront dans le tool suivant.
+
+    Concepts: dxf, dwg, murs, continus, fusion, vote, élévation, phase 2,
+              walls-only, sans openings, étape 1
+    Phrases: "crée les murs continus", "import walls only",
+             "phase 2 étape 1 murs"
+    Similar: dwg_import_walls_typed_many,
+             dwg_import_walls_and_openings_typed_many,
+             dwg_create_continuous_walls_many
+
+    Args:
+        items: liste de dicts `{file_path, level_ref, height_m?,
+            dx_m?, dy_m?}`.
+        bucket_cm / layer_mapping / scale_override / min_thickness_m /
+            max_thickness_m / include_centerline / base_type_ref /
+            max_walls_per_file: cf. `dwg_import_walls_typed_many`.
+        fusion_max_gap_m: gap max pour fusion via élévation (défaut 4m).
+
+    Returns:
+        {"ok": bool, "files_count": int,
+         "walls_imported_total": int, "walls_per_file": {path: count},
+         "fusion_events": int,  # nb de fusions confirmées par vote
+         "types_created": int, "types_reused": int, "types": [...],
+         "elevations_loaded": [direction, ...],
+         "thickness_distribution_global": {cm: count},
+         "inner_walls": ...,
+         "note": str}
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+
+    # --- 1. Pré-validation + classify per plan -------------------------
+    plan_records: List[Dict[str, Any]] = []
+    level_elev_by_ref: Dict[str, float] = {}
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            raise ValueError("items[{}] must be a dict".format(i))
+        fp = it.get("file_path")
+        level_ref = it.get("level_ref")
+        if not isinstance(fp, str) or not fp.strip():
+            raise ValueError("items[{}]: file_path required".format(i))
+        if not isinstance(level_ref, str) or not kg.has_node(level_ref):
+            raise ValueError(
+                "items[{}]: unknown level_ref {!r}".format(i, level_ref)
+            )
+        path = Path(fp)
+        if not path.exists():
+            raise FileNotFoundError(
+                "items[{}]: file not found: {}".format(i, path)
+            )
+        _refuse_if_section(path)
+        lvl_node = kg.get_node(level_ref)
+        level_elev_by_ref[level_ref] = float(lvl_node.get("elevation", 0.0))
+
+        entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+        classified = dwg_classifier.classify(
+            entities, layer_mapping,
+            min_thickness_m=min_thickness_m,
+            max_thickness_m=max_thickness_m,
+            include_centerline=include_centerline,
+        )
+        if len(classified.walls) > max_walls_per_file:
+            raise ValueError(
+                "items[{}] ({}): {} walls > max_walls_per_file={}".format(
+                    i, path.name, len(classified.walls), max_walls_per_file,
+                )
+            )
+        # Première passe : merge collinéaires gap ≤ 0.5m (joints, portes
+        # intérieures courtes).
+        walls_step1 = dwg_plan_openings.merge_collinear_walls(
+            list(classified.walls), max_gap_m=0.50,
+        )
+        plan_records.append({
+            "item": it,
+            "walls": walls_step1,
+        })
+
+    # --- 2. Charger élévations pour vote --------------------------------
+    elevations = _load_elevations_from_kg(kg, scale_override=scale_override)
+
+    # --- 3. Fusion via vote élévation pour gaps moyens ------------------
+    total_fusion_events = 0
+    fusion_events_detail: List[Dict[str, Any]] = []
+    for pr in plan_records:
+        level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
+        height_m = float(pr["item"].get("height_m") or 3.0)
+        merged_walls, events = dwg_plan_openings.merge_fragments_via_elevation_vote(
+            pr["walls"], elevations,
+            level_elev, height_m,
+            max_gap_m=fusion_max_gap_m,
+        )
+        pr["walls"] = merged_walls
+        total_fusion_events += len(events)
+        fusion_events_detail.extend(events)
+
+    # --- 4. Dédup thicknesses + get_or_create types ---------------------
+    seen_buckets: Set[int] = set()
+    unique_thicknesses_m: List[float] = []
+    for pr in plan_records:
+        for w in pr["walls"]:
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+            if cm not in seen_buckets:
+                seen_buckets.add(cm)
+                unique_thicknesses_m.append(cm / 100.0)
+
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    type_entry = registry.get("walls_get_or_create_dxf_type_many")
+    if unique_thicknesses_m:
+        types_result = type_entry.fn(
+            kg=kg, doc=doc,
+            thicknesses_m=unique_thicknesses_m,
+            bucket_cm=bucket_cm,
+            base_type_ref=base_type_ref,
+        )
+    else:
+        types_result = {"types": [], "created_count": 0, "reused_count": 0}
+    type_ref_by_cm: Dict[int, str] = {}
+    for entry in types_result["types"]:
+        cm = int(round(entry["thickness_m"] * 100))
+        type_ref_by_cm[cm] = entry["llm_id"]
+
+    # --- 5. Build wall items + walls_create_many -----------------------
+    all_wall_items: List[Dict[str, Any]] = []
+    walls_per_file: Dict[str, int] = {}
+    thickness_dist: Dict[int, int] = {}
+    for pr in plan_records:
+        plan_item = pr["item"]
+        fp = plan_item["file_path"]
+        level_ref = plan_item["level_ref"]
+        dx_m = float(plan_item.get("dx_m", 0.0))
+        dy_m = float(plan_item.get("dy_m", 0.0))
+        height_m = plan_item.get("height_m")
+        count = 0
+        for w in pr["walls"]:
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+            wall_type_ref = type_ref_by_cm.get(cm)
+            if wall_type_ref is None:
+                raise RuntimeError(
+                    "Bucket {}cm not in type_ref_by_cm — bug?".format(cm)
+                )
+            wall_item: Dict[str, Any] = {
+                "level_ref": level_ref,
+                "wall_type_ref": wall_type_ref,
+                "p1": [w.p1[0] + dx_m, w.p1[1] + dy_m],
+                "p2": [w.p2[0] + dx_m, w.p2[1] + dy_m],
+            }
+            if height_m is not None:
+                wall_item["height"] = float(height_m)
+            all_wall_items.append(wall_item)
+            count += 1
+            thickness_dist[cm] = thickness_dist.get(cm, 0) + 1
+        walls_per_file[fp] = count
+
+    walls_entry = registry.get("walls_create_many")
+    if all_wall_items:
+        inner_walls = walls_entry.fn(kg=kg, doc=doc, items=all_wall_items)
+    else:
+        inner_walls = None
+
+    note = (
+        "**Walls-only V3** : {} murs continus créés (dont {} fusions "
+        "confirmées par vote élévation), {} types DXF custom. Pas "
+        "d'openings — étape 1 du pipeline décomposé. Valider visuellement "
+        "en 3D avant `dwg_add_openings_to_walls_many` (à venir).".format(
+            len(all_wall_items),
+            total_fusion_events,
+            types_result["created_count"] + types_result["reused_count"],
+        )
+    )
+
+    return {
+        "ok": True,
+        "files_count": len(items),
+        "walls_imported_total": len(all_wall_items),
+        "walls_per_file": walls_per_file,
+        "fusion_events": total_fusion_events,
+        "fusion_events_detail": fusion_events_detail[:20],  # truncate
+        "types_created": types_result["created_count"],
+        "types_reused": types_result["reused_count"],
+        "types": types_result["types"],
+        "elevations_loaded": list(elevations.keys()),
+        "thickness_distribution_global": {
+            "{}cm".format(cm): count
+            for cm, count in sorted(thickness_dist.items())
+        },
+        "inner_walls": inner_walls,
+        "note": note,
+    }
+
+
 def _build_planset_integrity_note(
     report: dwg_coherence.PlansetIntegrityReport,
 ) -> str:
