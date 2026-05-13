@@ -117,6 +117,8 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "dxf_context_register_linked_view",
         "views_create_section",
         "views_link_cad",
+        "ui_confirm_choices",
+        "ui_confirm_yes_no",
         "floors_create",
         "floors_create_many",
         "floors_delete",
