@@ -14,6 +14,122 @@
 
 ---
 
+## 2026-05-13 (session r) — Phase 2.5 : fusion fragments + openings hostées
+
+### Contexte & objectif
+
+User runtime P7 après session q : 26 murs créés mais **discontinuités
+3D** à chaque emplacement de fenêtre/porte. Cause : le classifier
+plan voit une fenêtre dessinée par **interruption des 2 lignes du mur**
+comme **2 fragments distincts**, sans regarder les INSERTs A-GLAZ.
+
+User : « les openings devraient être évaluées en même temps pour
+éviter la confusion entre une interruption du mur et la présence d'une
+ouverture dans un mur continu ».
+
+### Précisions runtime user (3 cas accumulés en session)
+
+1. **Continuité = élévation/coupe** : un mur continu avec fenêtre
+   montre en élévation linteau + allège ; avec porte, linteau seul.
+   Une rupture pleine hauteur = vraie discontinuité.
+2. **Trait d'interruption ≠ toujours opening** : peut indiquer fenêtre,
+   porte, ou simple fin de mur. La plupart du temps porte/fenêtre,
+   parfois rien.
+3. **Paires parallèles ≠ toujours mur** : peuvent indiquer un
+   changement de matériau (joint). Lecture élévation déterminante.
+
+Décision V0 (cette session) : couvrir le cas 2 via présence/absence
+d'INSERT A-GLAZ — algo plan-only. Les cas 1 et 3 nécessitent une
+brique de validation élévation (V1, documentée en TODO dans le module).
+
+### Phases livrées
+
+**Module pur `lib/dwg_plan_openings.py`** (nouveau, ~300 lignes) :
+
+- `_perp_distance_point_to_line` + `_project_param` + `_angles_close`.
+- `MergedWall` (dataclass) : mur après fusion éventuelle, avec
+  `source_indices` traçant les fragments d'origine.
+- `AssignedOpening` (dataclass) : opening avec `host_wall_index`,
+  `position_along_wall_m`, `reason` ∈ {merged_two_fragments,
+  single_wall_intact, orphaned_no_match}.
+- **`merge_walls_with_openings(walls, plan_openings, *, perp_tol_m,
+  width_match_tol_m, angle_tol_rad)`** : algorithme en 3 passes
+  - Passe 1 : pour chaque INSERT A-GLAZ avec width parsable, cherche
+    2 fragments collinéaires dont le gap ≈ width. Si trouvé, fusion +
+    opening hosted (`reason=merged_two_fragments`).
+  - Passe 2 : ajoute les fragments non fusionnés comme murs intacts.
+  - Passe 3 : pour les openings non assignés en passe 1, cherche un
+    mur intact qui les contient (`reason=single_wall_intact`) ou les
+    marque orphelins (`reason=orphaned_no_match`).
+- **`classify_opening_kind(sill_m, height_m, …)`** : règle user
+  (sill ≤ 0.15 ET height ≥ 1.9 → porte ; sinon fenêtre ; None →
+  unknown).
+
+**Tool `dwg_import_walls_and_openings_typed_many`** (`tools/dwg_import.py`,
+tier-2) — orchestre Phase 2 complète walls+openings :
+
+1. Pré-lit les openings des coupes (`coupe_paths` ou
+   `DxfImportContext.section_lines`) indexés par `block_id` → `sill_m`,
+   `height_m` (sill = `y_dxf - base_level_y`).
+2. Pour chaque plan : classify walls + read A-GLAZ INSERTs +
+   `merge_walls_with_openings`.
+3. Dédup global thickness buckets → `walls_get_or_create_dxf_type_many`.
+4. Build wall items globaux → `walls_create_many` (1 Tx).
+5. Pour chaque opening assigné avec match coupe : classify door/window,
+   construit l'item.
+6. `openings_create_many` (1 Tx, mixte door+window).
+
+Auto-détection des FamilyType Door/Window (1er de la catégorie dans
+le KG) — overridable via `door_family_type_ref` / `window_family_type_ref`.
+
+Openings sans match coupe → `openings_unmatched_count` (sill/height
+inconnus, pas créés). Openings sans mur hôte trouvé →
+`openings_orphan_count`.
+
+**Prompt système** : la section Phase 2 pointe maintenant sur
+`dwg_import_walls_and_openings_typed_many` plutôt que
+`dwg_import_walls_typed_many`, avec note explicite sur le bug runtime
+2026-05-13 (discontinuités). Le tool walls-only reste accessible si
+l'user demande explicitement « pas d'openings ».
+
+### Tests
+
+15 nouveaux tests dans `tests/test_dwg_phase2.py` :
+- Module pur (7) : perp_distance, classify door/window/unknown, merge
+  no openings, merge fusion 2 fragments, no fusion sans width, no fusion
+  si gap mismatch, opening sur mur intact.
+- Tool smoke (2) : fusion + window créée, no coupe match → unmatched.
+
+### Validation
+
+**574 tests verts** (564 → 574, +15, comprend les autres petits ajouts
+incidentaux). Pas de régression.
+
+### TODO V1 (documentés)
+
+- `validate_merge_via_elevation_or_section` : downgrade fusions plan-only
+  sans confirmation visuelle (linteau/allège attendus).
+- Filtre faux positifs murs (paires parallèles = changement de matériau).
+- Détection hauteurs murets vs pleine hauteur depuis élévation.
+- Brique commune : `validate_via_elevation(walls, elevation_entities,
+  direction, level_elevations)`.
+
+### Reste à faire Phase 2
+
+6. **Sols** Floor avec FloorTypes custom DXF_FLOOR_<cm>cm (pattern
+   identique aux walls, à livrer en session s).
+7. **Vue 3D** déjà OK via `views_open_3d`.
+
+### Cleanup P7 attendu (user)
+
+User va supprimer les 26 murs DXF_WALL_*cm de P7 (et types) avant de
+re-prompter « importe ce projet » avec le nouveau pipeline. Le KG
+soft-delete les anciens nodes ; les nouveaux types DXF_WALL_*cm créés
+réutilisent les noms (idempotent côté KG, mais Revit aura un conflit
+de nom si le type Revit n'a pas été supprimé — à voir runtime).
+
+---
+
 ## 2026-05-13 (session q) — Lever l'interruption Phase 1 → Phase 2 dans le prompt système
 
 ### Contexte & objectif
