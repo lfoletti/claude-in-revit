@@ -117,6 +117,10 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 - **Citations réglementaires** : format `<corpus_id>#<ancre>` (ex : `rcv-2024#hauteur-sous-plafond`, `aeai-2015#dpi-15-15-§3.2`). Toujours inclure `version` du corpus dans le rapport.
 - **Disclaimer audit UC8** : « assistance, pas validation réglementaire » — à inclure en tête de chaque rapport généré.
 
+## Coding policies
+
+- **Bulk tool variant policy** : si un tool est susceptible d'être appelé en boucle dans une orchestration agent (création/modification multiple), créer **dès le départ** sa variante `_many(items: List[Dict])` — pas en réaction à un retour user après mesure de coût tokens. Chaque appel agent ↔ tool coûte ~80-150 tokens de overhead + 1 round-trip API séquentiel ; un bulk économise typiquement 70-90% des tokens et réduit drastiquement la latence. Pattern d'impl : extraire la logique per-item dans un helper privé `_do_one_X(...)` ; le tool unitaire wrap le helper avec sa transaction Revit ; le bulk wrap N appels au helper dans **une seule** transaction (atomicité). Validation pre-loop avant tout commit. Cf. mémoire `feedback-bulk-tool-variant-policy`.
+
 ### pyRevit pushbuttons — gotchas CPython
 
 - **`pyrevit.forms` est IronPython-only** : il lève `PyRevitCPythonNotSupported` sous CPython. Pour afficher un dialog depuis nos scripts (qui sont taggés `#! python3` → CPython 3.12), utiliser **`Autodesk.Revit.UI.TaskDialog`** directement (API Revit, disponible nativement via PythonNet dans pyRevit). Voir JOURNAL.md 2026-05-11 (bootstrap phase) pour le découvert.
