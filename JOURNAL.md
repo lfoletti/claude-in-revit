@@ -14,6 +14,136 @@
 
 ---
 
+## 2026-05-13 (session j) — Runtime UC1 DWG suite : centerline subtraction, 529 retry, dette pair detection
+
+### Contexte & objectif
+
+Suite directe de session i. User a continué le test 6 sur le DXF
+Projet4. 3 issues remontées en runtime, toutes traitées (2 fixes
+livrés, 1 dette identifiée et reportée).
+
+### Issue 1 : centerline doublons par chevauchement partiel
+
+Avec la version session i v1 (filtre anti-shadow tout-ou-rien à
+`overlap_threshold=0.80`), la cloison interne se retrouvait en
+**doublon** : un pair partiel détecté en haut, un centerline complet
+en bas, qui chevauchent à 59% (sous le seuil 0.80 donc pas filtré).
+
+**Fix** : remplacer le filtre tout-ou-rien par une **soustraction
+d'intervalles 1D**.
+
+`_subtract_pair_shadows(candidate, pair_walls, ...)` :
+1. Pour chaque pair quasi-parallèle proche en perp (< 0.30m),
+   projeter ses endpoints sur la droite portante de la candidate.
+2. Collecter les intervalles d'ombre clampés à `[0, L]` (pour la
+   soustraction effective) + les intervalles non-clampés (pour
+   calculer l'enveloppe totale).
+3. Soustraire les ombres mergées du candidate → liste de résidus.
+4. **Filtre enveloppe** : un résidu entièrement dans l'enveloppe
+   `[pair_t_min, pair_t_max]` est probablement dans un « trou de
+   fenêtre » (entre 2 pairs adjacents d'une façade fragmentée)
+   → filtré.
+
+Résultat sur Projet4 :
+- Avant session i v1 : 5 centerlines dont 4 doublons sur façades.
+- Session i v2 (subtraction + enveloppe) : 3 centerlines dont
+  1 vraie cloison résiduelle de 7.49m et 2 chambranles biais
+  faux positifs.
+
+### Issue 2 : faux pair detection (DETTE — non corrigée cette session)
+
+User a remarqué : « la paroi centrale est fragmentée en deux parties
+bout-à-bout décalées de 10cm » côté Revit.
+
+**Diagnostic** (via debug CLI direct sur le DXF) :
+- La cloison interne réelle est dessinée **en simple-trait** à
+  x=3.70 (5 segments fragmentés par 4 ouvertures = portes).
+- Un autre segment isolé existe à x=3.90 (long de 19.80m, probable
+  face d'un mur structurel adjacent — pas la paire de la cloison).
+- **Pair detection greedy** apparie un fragment x=3.70 avec le segment
+  x=3.90 (distance 0.20m, parallèles, overlap suffisant) → faux pair
+  à centerline x=3.80, thickness 0.20m. C'est une **mauvaise
+  interprétation** : ces 2 segments représentent 2 cloisons distinctes.
+- Le résidu de la vraie cloison (fragments non « volés » par la fausse
+  paire) passe en centerline à x=3.70, thickness 0.10m.
+- Côté Revit : 2 walls bout-à-bout décalés de 10cm — visuellement
+  une cloison fragmentée.
+
+**Cause racine** : `detect_wall_segments` est greedy first-match.
+Pour chaque segment i, il prend le premier j qui passe les filtres
+(angle + distance + overlap). N'évalue pas si i pourrait avoir une
+**meilleure** paire (perp distance plus courte, overlap supérieur),
+ni si j est isolé (= la « paire » est en fait coïncidence
+géométrique).
+
+**Fix correct** : refonte de l'algo pair detection pour préférer le
+« meilleur voisin perpendiculaire » plutôt que le premier candidat.
+Heuristique possible : pour chaque segment, parcourir tous les
+candidats matchant les 3 filtres, prendre celui avec perp distance
+minimale ET overlap maximal. Vérifier aussi que le candidat retenu
+n'a pas lui-même un meilleur match ailleurs (symétrie).
+
+**Effort estimé** : ~1 jour. Reporté pour ne pas exploser cette
+session. Documenté comme dette UC1 V0 → V1.
+
+**Workaround user immédiat** : identifier visuellement les faux
+pairs dans Revit + utiliser `walls_delete_many` pour les supprimer.
+
+### Issue 3 : `overloaded_error` 529 sur demande de suppression en masse
+
+User a observé l'erreur Anthropic 529 (« Site is overloaded »)
+pendant une demande de suppression de plusieurs centaines d'éléments.
+Le SDK Anthropic retry par défaut 2 fois avec backoff exponentiel
+2+4 = 6s cumulés — épuisé rapidement sur un pic prolongé.
+
+**Fix en deux couches** :
+
+1. **SDK** : `max_retries=2 → 6` sur le constructeur `anthropic.Anthropic`.
+   Couvre 2+4+8+16+32 = ~62s de backoff cumulé.
+
+2. **Outer retry** dans `_create_with_outer_retry` :
+   - Wrappe `client.messages.create()`.
+   - Catch transient errors (408, 429, 5xx, 529, APIConnectionError,
+     APITimeoutError).
+   - 4 retries × 30s sleep = ~2 min supplémentaires.
+   - Total max absorbable : ~3,5 min de saturation Anthropic.
+
+3. **UX dialog dédié** dans `prompt.pushbutton` :
+   - Catch `status_code == 529 OR error_type == "overloaded_error"`.
+   - Dialog `« Anthropic saturé — réessayer »` avec lien
+     status.anthropic.com, au lieu du traceback brut.
+   - Précise que l'historique n'est PAS modifié (le tour n'a pas eu
+     lieu) → safe de relancer.
+
+### Validation
+
+- `pytest -q` : **351 verts**. Aucune régression.
+- Tests live runtime à la prochaine session si pic Anthropic se
+  reproduit.
+
+### Acquis session j
+
+- Subtraction d'intervalles pour centerline filter ✓
+- Outer retry + UX 529-spécifique ✓
+- SDK `max_retries=6` ✓
+- **Dette pair detection greedy** documentée ✓
+
+### Dettes ouvertes (héritage)
+
+- **Pair detection greedy → faux positifs** sur DXF avec cloisons
+  simple-trait proches de murs parallèles isolés (cette session).
+  Refonte ~1 j. Workaround user : delete_many.
+- **Routing tier-2 propre** (session i) — `preprocess.infer_tier_max`
+  est minimal, à factoriser quand UC8 / UC6 arrivent.
+- **`get_element_or_raise`** non étendu aux walls/columns
+  (session g).
+- **Drift utilisateur hors pipeline** (events `DocumentChanged`).
+- **`boundary_walls`** Rooms reporté V1 compliance.
+- **`connects_at`** peuplé au rescan + `catalog_list_views`
+  (préreqs auto-cotation + UC6).
+
+---
+
 ## 2026-05-12 — Note d'intention : UC1 Phase 4 — intégration des coupes DXF
 
 Conversation exploratoire (session i, post-validation runtime).
