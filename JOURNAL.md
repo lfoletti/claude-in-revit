@@ -14,6 +14,278 @@
 
 ---
 
+## 2026-05-13 (session u) — Cross-validation multi-source openings + Phase 2c sols
+
+### Contexte & objectif
+
+Runtime P7 session t : 7 fenêtres `DXF_WIN_60x95cm` créées sur les 4
+coupes traversées, dimensions toutes identiques bien que P7 a en réalité
+~10-15 fenêtres avec largeurs variables (2.00m / 2.10m). User : « les
+dimensions des fenêtres ne sont pas correctes », puis successivement :
+« la localisation et le nombre des fenêtres est à dériver des plans et
+des élévations », « cross-validation largeur en élévation »,
+« cross-validation allège et linteau via élévations », « nombre et
+position cross-val élévation », « les sols pourraient être ajoutés ».
+
+Objectif : refonte de Phase 2b vers une **source primaire plan**
+(énumération exhaustive + position), avec cross-validation multi-source
+(plan ↔ coupe ↔ élévation) pour chaque dimension. Puis Phase 2c sols.
+
+### Décisions architecturales
+
+**Sources par dimension** (validées par l'user) :
+
+| Dimension | Source primaire | Cross-val | Tolérance |
+|---|---|---|---|
+| Nombre + position 2D | Plan (INSERT A-GLAZ) | Élévation (matching positionnel Phase 2b + comptage Phase 1) | 30cm (position) / 20% (count) |
+| Largeur | Plan (bbox bloc, dim longue) | Élévation (bbox bloc) | 5cm |
+| Hauteur | Élévation (bbox bloc, si plausible ≥ 0.30m) | Coupe (fallback) | — |
+| Allège (sill) | Coupe (y_dxf − level_y) | Élévation (y_min local du bloc) | 5cm |
+| Linteau (head) | Calculé (sill + height) | Élévation (y_max local) | 5cm |
+| Profondeur (info) | Plan (bbox bloc, dim courte) | — | — |
+
+Sur conflit : **on garde la source primaire** et on signale dans le
+retour (`width_disagreement_cm`, `sill_disagreement_cm`, etc.).
+Décision : non-bloquant — la modélisation continue, l'écart est
+remonté au user pour décision.
+
+**Sources pour Phase 2c sols** :
+- Boundary : convex hull des Wall vivants du niveau (V1 simple).
+- Épaisseur : paires de LINEs A-FLOR horizontales en coupe.
+- Pas de toiture (skip dernier niveau par défaut).
+
+### Phase A — Source primaire plan (énumération nombre + position)
+
+`dwg_section_reader.py` :
+- `read_plan_opening_inserts(entities) -> List[PlanOpening]` :
+  analogue de `read_section_openings` mais pour plans. Position 2D
+  directe (pas de `(0, level_y)` à résoudre via bbox).
+- `read_plan_opening_dims_by_block_id(file)` retourne `{bid → {width_m,
+  depth_m}}` (dim longue / dim courte de la bbox bloc).
+- `read_elevation_opening_dims_by_block_id(file)` retourne `{bid →
+  {width_m, height_m, sill_local_m, head_local_m}}`.
+- Factorisé : `_extract_aglaz_bbox_per_block` retourne le 4-uple
+  `(bbox_w, bbox_h, y_min, y_max)` consommé par les deux callers.
+
+`dwg_import.py` (`_collect_plan_openings_world`) :
+
+Nouveau collecteur primaire, remplace `_collect_coupe_openings_world`
+dans `dwg_add_openings_to_walls_many`. Pipeline :
+
+1. `_build_plan_dims_index(kg)` : agrège width+depth par bid sur tous
+   les plans (max si conflit inter-plans).
+2. `_build_elevation_dims_index(kg)` : idem pour élévations.
+3. `_build_sill_index_from_coupes(kg, section_lines)` : `{(bid,
+   level_elev) → {sill_m, height_m}}` depuis les coupes.
+4. `_plan_path_to_level_elev(kg)` : mapping plan_path → level via
+   `linked_views.view_name` ↔ `Level.name` (fallback regex `Niveau N`).
+5. Énumère tous les `read_plan_opening_inserts` de chaque plan, level
+   issu du mapping, enrichit width/depth (plan), height (élév fallback
+   coupe), sill (coupe fallback default 0.9m fenêtre / 0.0m porte).
+
+Couverture P7 : passe de **11 openings** (depuis coupes) à
+**15 openings** (depuis plans : 5 × `255854` au N0, 5 × `255854` au
+N1, 5 × `V1` au N1).
+
+### Phase B — Cross-validation multi-source
+
+`_collect_plan_openings_world` enrichi avec champs traçabilité :
+`width_source`, `height_source`, `sill_source`, `width_disagreement_cm`,
+`sill_disagreement_cm`, `head_disagreement_cm`,
+`elev_seen_in: List[direction]`, `elev_position_disagreement_cm`.
+
+Garde-fou sur bbox dégénérée : si `ed["width_m"] < 0.30m`, on ne fait
+pas de cross-val (bbox sub-geom du bloc trop petite pour être
+exploitable — observé pour `255854` et `V2` qui ont des blocs avec
+~17mm de LINEs A-GLAZ visibles).
+
+**Bug fix accents** : `parse_block_id` regex
+`-([A-Za-z0-9_]+)-(?:Niveau|Coupe|Plan|Elevation)\b` ne matchait
+**pas** `-V1-Élévation Est` (présence de l'accent). Étendu à
+`[ÉE]l[ée]vation|Elevation`. Avant ce fix, `elev_dims` était vide pour
+P7 → 0 match en cross-val.
+
+`add_openings_to_walls_many` :
+- Construit `_build_elevation_inserts_by_direction` (analogue à
+  `_load_elevations_from_kg` mais avec `read_section_openings` +
+  `resolve_section_opening_positions` pour avoir x_elev_abs des
+  inserts A-GLAZ d'élévation).
+- Pour chaque opening, après vote orientation : looks expected
+  directions (EW → Nord/Sud, NS → Est/Ouest), `project_world_to_elevation`,
+  matching INSERT plus proche (tol 30cm). Consume tracking pour
+  identifier les INSERTs élév orphelins (sans plan correspondant).
+- Stats `elevation_match_stats`, `elevation_orphans_per_direction`,
+  `elevation_unmatched_plan_count`, `elevation_position_disagreements`.
+
+### Phase C — Cross-val à Phase 1 audit
+
+User : « je pensais que ce système de cross-validation était déjà
+fonctionnel et actif depuis le check intégrité en phase 1 ». Lacune
+reconnue.
+
+`dwg_coherence.check_openings_plan_vs_elevation(plan_block_ids,
+elevation_block_ids, plan_total, elev_total)` :
+- Check ensembliste : block_id présent en plan absent en élévation
+  (et inverse).
+- Check comptage : écart total < 20% sinon warning.
+- Severity : warnings non bloquant (décision user) — coherent avec
+  `check_openings_matching` existant pour plan↔coupes.
+
+Intégré dans `check_planset_integrity` (Phase 1) à côté des autres
+checks. Sur P7 : flag `bid V2 missing in plan` (fenêtre en
+élévation/coupe pas en plan) + `+73% écart count` (15 plan vs 26 élév
+cumulés).
+
+### Phase D — Garde-fou anti "ne coupent rien"
+
+Runtime P7 session t : 4 erreurs Revit `Des occurrences de DXF_WIN_
+210x99cm ne coupent rien` — `NewFamilyInstance` réussit mais la fenêtre
+ne traverse pas son host wall (déborde du segment).
+
+`add_openings_to_walls_many` : check pre-création
+- `wall_len = hypot(p2-p1)`
+- `pos_on_wall = clamp(t_proj, 0, 1) * wall_len`
+- `if pos_on_wall - width/2 < 5cm or pos_on_wall + width/2 > wall_len -
+  5cm` → skip + comptabiliser dans `openings_oversize_for_wall` +
+  examples (jusqu'à 10).
+
+Évite l'erreur Revit *avant* l'appel `Floor.Create` / `NewFamilyInstance`.
+
+### Phase E — Tool `kg_reset_dxf_imports`
+
+User entre deux itérations : la KG accumulait Wall/Window soft-delete-
+absents (307 walls + 39 windows non-soft-delete sur 14 sessions). Les
+windows reposaient sur des `host_wall_ref` pointant vers d'anciens
+revit_id supprimés manuellement → `NewFamilyInstance(host=stale)` créait
+des instances orphelines invisibles.
+
+Tool `kg_reset_dxf_imports` (tier-2, `dwg_import.py`) :
+- Soft-delete tous les Wall/Window/Door/Floor vivants du KG.
+- Soft-delete les WallType `DXF_WALL_*`, FloorType `DXF_FLOOR_*`,
+  FamilyType `DXF_WIN_*`/`DXF_DOOR_*`.
+- Supprime côté Revit en une seule `rp.transaction`, enveloppée par
+  `kg.transaction()` pour atomicité (rollback symétrique si commit
+  Revit échoue).
+- Mode `dry_run=True` : preview de l'inventaire sans mutation.
+- Préserve : Level, Room, DxfImportContext, View.
+
+### Phase F — Phase 2c sols complète
+
+`dwg_section_reader.read_section_floor_slabs(entities)` :
+- Collecte les LINEs A-FLOR horizontales (`|y2-y1| < 0.005m`).
+- Apparie chaque ligne top avec sa ligne bot la plus proche (épaisseur
+  0.05 - 0.60m) ayant un recouvrement horizontal.
+- Retourne `SectionFloorSlab(top_y_m, bot_y_m, thickness_m, x_min_m,
+  x_max_m)`. Sur P7 : 2 dalles/coupe (Niveau 0 + Niveau 1, 25cm
+  partout, pas de toiture).
+
+`tools/floors.py` :
+- `floors_get_or_create_dxf_type[_many]` (tier-1) : duplique BasicFloor
+  template + `cs.SetLayerWidth(struct_idx, thickness)`. Validation
+  stale binding (analogue P7 session r pour walls). Pattern identique
+  à `walls_get_or_create_dxf_type[_many]`.
+
+`tools/dwg_import.py` :
+- `_convex_hull_2d(points)` : Andrew's monotone chain.
+- `_shoelace_area_2d(points)` : aire signée formule Gauss.
+- `_slab_thicknesses_per_level(kg)` : agrège épaisseurs par niveau
+  (max vote inter-coupes).
+- `dwg_create_floors_many` (tier-2) : énumère niveaux, convex hull des
+  Wall vivants par niveau pour le boundary, épaisseur depuis coupes,
+  délègue à `floors_get_or_create_dxf_type_many` + `floors_create_many`.
+- Option `skip_top_level` (défaut True) : pas de sol au niveau du
+  sommet (= toiture, traitée séparément en phase ultérieure).
+- Option `boundary_inflation_m` : dilatation isotrope du convex hull
+  pour déborder les murs extérieurs (défaut 0).
+
+### Validation
+
+**Smoke tests** (KG.fn(doc=None) sur P7 ancien KG) :
+
+- `_collect_plan_openings_world` : 15 openings énumérés (5 N0, 10 N1),
+  width=2.10m partout (source `plan`).
+- `_build_elevation_dims_index` après fix accents : 3 bids (`255854`,
+  `V1`, `V2`) avec W=2.00m H=0.99m sill=0.76m head=1.75m.
+- Cross-val largeur plan↔élév : 15 désaccords (10cm sur tous —
+  vraisemblablement le plan inclut les débords d'allège, l'élévation
+  ne mesure que le cadre).
+- Cross-val sill : 15 matchs parfaits (coupe et élévation s'accordent
+  à 0.7605m).
+- `check_openings_plan_vs_elevation` Phase 1 : flag `V2 missing in
+  plan` + `+73% écart count`.
+- `read_section_floor_slabs` Coupes 1/2/3 : 2 dalles chacune,
+  thickness=0.250m, top_y_m ∈ {0.00, 3.00}.
+- `dwg_create_floors_many` : run dry-run sur KG ancien (paths
+  obsolètes après renommage user des fichiers) → 0 floors (skip
+  silencieux des fichiers inexistants — comportement correct).
+
+**Validation runtime user** (Phase 2b après fix oversize) : 13
+fenêtres créées + 2 rejetées (oversize for wall), 0 erreur Revit
+"ne coupent rien". Vue 3D OK, types `DXF_WIN_210x99cm`.
+
+### Bugs rencontrés + fix
+
+1. **Double conversion d'unités** dans `_collect_plan_openings_world` :
+   `dwg_reader.parse` retourne déjà les coords en mètres, mais je
+   re-multiplie par `units_factor_to_m`. Résultat : toutes positions
+   à `(0, 0)` au lieu de `(-15.49, 5.83)` etc. Fix : supprimer la
+   conversion.
+
+2. **`parse_block_id` ne matchait pas Élévation** (accent) — détaillé
+   en Phase B. Sans ce fix, cross-val largeur/sill/head impossible
+   pour P7.
+
+3. **`elev_dims` retournait `{}`** alors que les coupes contiennent
+   bien des INSERTs A-GLAZ : cause `parse_block_id` (bug 2). Trace
+   inattendue : on lisait correctement les BLOCK_DEFINITIONs mais
+   bid était None partout.
+
+4. **Conversion Edit fantôme** : un Edit a généré une duplication
+   de la signature `_collect_coupe_openings_world` (header dupliqué).
+   Fix par Edit supplémentaire pour supprimer le doublon.
+
+5. **`Set` import manquant** dans `floors.py` après extension Phase
+   2c. Fix : ajout `Set` dans `from typing import`.
+
+### État final
+
+**Fichiers modifiés** (5) :
+- `dwg_section_reader.py` : +`PlanOpening`, `read_plan_opening_inserts`,
+  `read_section_floor_slabs`, `SectionFloorSlab`,
+  `read_plan_opening_dims_by_block_id`,
+  `read_elevation_opening_dims_by_block_id`,
+  `_extract_aglaz_bbox_per_block`, fix regex accents.
+- `dwg_coherence.py` : +`check_openings_plan_vs_elevation`.
+- `tools/dwg_import.py` : +`_collect_plan_openings_world`,
+  `_build_plan_dims_index`, `_build_elevation_dims_index`,
+  `_build_sill_index_from_coupes`, `_plan_path_to_level_elev`,
+  `_build_elevation_inserts_by_direction`, `_slab_thicknesses_per_level`,
+  `_convex_hull_2d`, `_shoelace_area_2d`, `dwg_create_floors_many`
+  (tier-2), `kg_reset_dxf_imports` (tier-2), garde-fou oversize dans
+  `add_openings_to_walls_many`, intégration check Phase 1.
+- `tools/floors.py` : +`floors_get_or_create_dxf_type[_many]` (tier-1).
+- `prompt.pushbutton/script.py` : prompt système Phase 2a→2b→2c
+  enchaînées.
+
+**Reste à faire** :
+
+- **Vraie reconstruction topologique du boundary sol** : convex hull
+  marche pour P7 rectangle, fail pour plans en L / atrium / courette.
+  Solution : parcourir le graphe des murs pour identifier le tour
+  extérieur (algorithme face-tracing).
+- **Filter automatique 100%** sur faux positifs murs : 14 tentatives
+  V3.x toutes régressives (session t), encore à ouvrir avec un signal
+  multi-source plus robuste (vote 3D + longueur min mur + linéarité).
+- **Investigation `V2` manquant en plan P7** : remontée par cross-val
+  Phase 1. À traiter au cas par cas (export Revit défaillant ?).
+- **Toiture** : skip systématique en Phase 2c. Phase 2d à ouvrir si
+  besoin (Roof.CreateBasic + slope + perimeter).
+- **Phase 2.6 raffinements** : mappage des types DXF custom vers des
+  types métier du template Revit (post-import par user, sous-tools à
+  outiller).
+
+---
+
 ## 2026-05-13 (session t) — V2 vote multi-sources complet : élévation + récupération orphans
 
 ### Contexte & objectif

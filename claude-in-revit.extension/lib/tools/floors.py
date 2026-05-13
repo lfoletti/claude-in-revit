@@ -26,7 +26,7 @@ implémenter quand le runtime le demande.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ._helpers import bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
@@ -484,3 +484,369 @@ def delete_many(
             kg.soft_delete(lid)
 
     return bulk_summary(llm_ids)
+
+
+# ----- DXF custom FloorType creation (Phase 2c — sols) -----------------
+#
+# Parallèle de `walls_get_or_create_dxf_type[_many]` : pour chaque
+# épaisseur observée dans les coupes du DXF, créer (ou réutiliser) un
+# FloorType nommé `DXF_FLOOR_<cm>cm`. Pas de matching aux types
+# existants — l'user remappe après import.
+
+
+_DXF_FLOOR_TYPE_PREFIX = "DXF_FLOOR_"
+
+
+def _dxf_floor_type_name(thickness_m: float, bucket_cm: int = 1) -> str:
+    if bucket_cm < 1:
+        raise ValueError("bucket_cm must be >= 1")
+    cm = int(round(thickness_m * 100 / bucket_cm)) * bucket_cm
+    return "{}{}cm".format(_DXF_FLOOR_TYPE_PREFIX, cm)
+
+
+def _find_dxf_floor_type_in_kg(
+    kg: ProjectKG, target_name: str,
+) -> Optional[str]:
+    for nid in kg.find_by_type("FloorType"):
+        node = kg.get_node(nid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        if node.get("name") == target_name:
+            return nid
+    return None
+
+
+def _validate_or_drop_stale_floor_type_binding(
+    kg: ProjectKG, doc: Any, llm_id: str,
+) -> bool:
+    """Mêmes garanties que `_validate_or_drop_stale_wall_type_binding`
+    pour FloorType. Cf. runtime P7 session r."""
+    if doc is None:
+        return True
+    revit_id_raw = kg.get_revit_id(llm_id)
+    if revit_id_raw is None:
+        kg.soft_delete(llm_id)
+        return False
+    from Autodesk.Revit.DB import ElementId, FloorType
+    elem = doc.GetElement(ElementId(revit_id_raw))
+    if elem is None:
+        kg.soft_delete(llm_id)
+        return False
+    try:
+        if not isinstance(elem, FloorType):
+            kg.soft_delete(llm_id)
+            return False
+    except TypeError:
+        try:
+            cat_id = elem.Category.Id.Value
+            if int(cat_id) != -2000032:  # OST_Floors category id
+                kg.soft_delete(llm_id)
+                return False
+        except Exception:  # noqa: BLE001
+            kg.soft_delete(llm_id)
+            return False
+    return True
+
+
+def _find_simple_basic_floor_type(doc: Any) -> Any:
+    """Trouve un FloorType template (1 layer si possible, sinon le 1er
+    avec CompoundStructure non vide)."""
+    from .. import revit_primitives as rp
+
+    fallback = None
+    for ft in rp.floor_types(doc):
+        try:
+            cs = ft.GetCompoundStructure()
+        except Exception:  # noqa: BLE001
+            continue
+        if cs is None:
+            continue
+        if fallback is None:
+            fallback = ft
+        if cs.LayerCount == 1:
+            return ft
+    return fallback
+
+
+def _create_dxf_floor_type_in_revit(
+    doc: Any, base_ft: Any, target_name: str, thickness_m: float,
+) -> int:
+    """Duplique `base_ft`, renomme, ajuste sa layer principale.
+    Doit être appelé à l'intérieur d'une `rp.transaction`."""
+    from .. import revit_primitives as rp
+
+    new_ft = base_ft.Duplicate(target_name)
+    cs = new_ft.GetCompoundStructure()
+    new_width_ft = rp.meters_to_internal(thickness_m)
+
+    if cs is not None and cs.LayerCount > 0:
+        layer_idx = 0
+        if cs.LayerCount > 1:
+            struct_idx = -1
+            try:
+                struct_idx = int(cs.StructuralMaterialIndex)
+            except Exception:  # noqa: BLE001
+                struct_idx = -1
+            if struct_idx >= 0:
+                layer_idx = struct_idx
+            else:
+                try:
+                    from Autodesk.Revit.DB import MaterialFunctionAssignment
+                    for i in range(cs.LayerCount):
+                        if cs.GetLayerFunction(i) == MaterialFunctionAssignment.Structure:
+                            layer_idx = i
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+            other_total_ft = 0.0
+            for i in range(cs.LayerCount):
+                if i == layer_idx:
+                    continue
+                other_total_ft += float(cs.GetLayerWidth(i))
+            target_struct_ft = max(
+                new_width_ft - other_total_ft, rp.meters_to_internal(0.01),
+            )
+            cs.SetLayerWidth(layer_idx, target_struct_ft)
+        else:
+            cs.SetLayerWidth(0, new_width_ft)
+        new_ft.SetCompoundStructure(cs)
+
+    return int(new_ft.Id.Value)
+
+
+@tool(name="floors_get_or_create_dxf_type", tier=1)
+def get_or_create_dxf_type(
+    kg: ProjectKG,
+    doc: Any,
+    thickness_m: float,
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cherche ou crée un FloorType `DXF_FLOOR_<cm>cm` (Phase 2c).
+
+    Parallèle de `walls_get_or_create_dxf_type`. Idempotent : si le type
+    existe, le réutilise (avec validation Revit-binding). Sinon, duplique
+    un BasicFloor du template et ajuste l'épaisseur de la layer Core.
+
+    Concepts: sol, dalle, floor, type, floortype, dxf, import, phase 2,
+              épaisseur, thickness, custom
+    Phrases: "crée le type dxf de sol", "get or create floor type",
+             "type de dalle pour l'import"
+    Similar: floors_get_or_create_dxf_type_many, walls_get_or_create_dxf_type
+
+    Args:
+        thickness_m: épaisseur en mètres.
+        bucket_cm: granularité du bucketing (défaut 1).
+        base_type_ref: llm_id d'un FloorType template à dupliquer.
+            Si None, recherche auto.
+
+    Returns:
+        {"ok", "llm_id", "name", "thickness_m", "created", "revit_id"}
+    """
+    if not isinstance(thickness_m, (int, float)) or thickness_m <= 0:
+        raise ValueError("thickness_m must be a positive number")
+    bucketed_cm = int(round(thickness_m * 100 / bucket_cm)) * bucket_cm
+    bucketed_m = bucketed_cm / 100.0
+    target_name = _dxf_floor_type_name(thickness_m, bucket_cm=bucket_cm)
+
+    existing = _find_dxf_floor_type_in_kg(kg, target_name)
+    if existing is not None:
+        if _validate_or_drop_stale_floor_type_binding(kg, doc, existing):
+            node = kg.get_node(existing)
+            return {
+                "ok": True,
+                "llm_id": existing,
+                "name": target_name,
+                "thickness_m": float(node.get("total_thickness", bucketed_m)),
+                "created": False,
+                "revit_id": kg.get_revit_id(existing),
+            }
+
+    if doc is None:
+        llm_id = kg.add_node("FloorType", {
+            "name": target_name,
+            "total_thickness": bucketed_m,
+        })
+        return {
+            "ok": True,
+            "llm_id": llm_id,
+            "name": target_name,
+            "thickness_m": bucketed_m,
+            "created": True,
+            "revit_id": None,
+        }
+
+    # Revit-backed path.
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        from .. import revit_primitives as rp
+        from Autodesk.Revit.DB import ElementId
+        base_ft = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_ft = _find_simple_basic_floor_type(doc)
+        if base_ft is None:
+            raise ValueError(
+                "No FloorType template available. Provide `base_type_ref` "
+                "or add a basic FloorType to your project template."
+            )
+
+    from .. import revit_primitives as rp
+    with rp.transaction(doc, "floors.get_or_create_dxf_type"):
+        revit_id = _create_dxf_floor_type_in_revit(
+            doc, base_ft, target_name, bucketed_m,
+        )
+        llm_id = kg.add_node("FloorType", {
+            "name": target_name,
+            "total_thickness": bucketed_m,
+        })
+        kg.set_revit_id(llm_id, revit_id)
+
+    return {
+        "ok": True,
+        "llm_id": llm_id,
+        "name": target_name,
+        "thickness_m": bucketed_m,
+        "created": True,
+        "revit_id": revit_id,
+    }
+
+
+@tool(name="floors_get_or_create_dxf_type_many", tier=1)
+def get_or_create_dxf_type_many(
+    kg: ProjectKG,
+    doc: Any,
+    thicknesses_m: List[float],
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Variante bulk de `floors_get_or_create_dxf_type` (1 seule Tx Revit
+    pour N épaisseurs). Réutilise et déduplique par bucket.
+
+    Concepts: sol, dalle, floor, type, dxf, import, phase 2, bulk, many
+    Phrases: "crée les types de dalle dxf", "get or create floor types many"
+    Similar: floors_get_or_create_dxf_type, walls_get_or_create_dxf_type_many
+
+    Returns:
+        {"ok", "types": [{llm_id, name, thickness_m, created, revit_id}, ...],
+         "created_count", "reused_count"}
+    """
+    if not isinstance(thicknesses_m, list) or not thicknesses_m:
+        raise ValueError("thicknesses_m must be a non-empty list")
+
+    # Dédup par bucket.
+    seen_cm: Set[int] = set()
+    unique: List[float] = []
+    for t in thicknesses_m:
+        if not isinstance(t, (int, float)) or t <= 0:
+            raise ValueError("thicknesses_m must contain positive numbers")
+        cm = int(round(float(t) * 100 / bucket_cm)) * bucket_cm
+        if cm in seen_cm:
+            continue
+        seen_cm.add(cm)
+        unique.append(cm / 100.0)
+
+    out_types: List[Dict[str, Any]] = []
+    created_count = 0
+    reused_count = 0
+
+    if doc is None:
+        for t in unique:
+            res = get_or_create_dxf_type(
+                kg=kg, doc=None, thickness_m=t, bucket_cm=bucket_cm,
+                base_type_ref=base_type_ref,
+            )
+            out_types.append(res)
+            created_count += 1 if res["created"] else 0
+            reused_count += 0 if res["created"] else 1
+        return {
+            "ok": True,
+            "types": out_types,
+            "created_count": created_count,
+            "reused_count": reused_count,
+        }
+
+    # Revit-backed : 1 Tx pour toutes les créations.
+    base_ft: Any = None
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        from Autodesk.Revit.DB import ElementId
+        base_ft = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_ft = _find_simple_basic_floor_type(doc)
+        if base_ft is None:
+            raise ValueError(
+                "No FloorType template available. Provide `base_type_ref` "
+                "or add a basic FloorType to your project template."
+            )
+
+    from .. import revit_primitives as rp
+    to_create_in_revit: List[float] = []
+    pre_existing: Dict[float, str] = {}  # thickness_m -> llm_id
+    for t in unique:
+        target_name = _dxf_floor_type_name(t, bucket_cm=bucket_cm)
+        existing = _find_dxf_floor_type_in_kg(kg, target_name)
+        if existing is not None and _validate_or_drop_stale_floor_type_binding(
+            kg, doc, existing,
+        ):
+            pre_existing[t] = existing
+        else:
+            to_create_in_revit.append(t)
+
+    new_bindings: Dict[float, int] = {}  # thickness_m -> revit_id
+    if to_create_in_revit:
+        with rp.transaction(doc, "floors.get_or_create_dxf_type_many"):
+            for t in to_create_in_revit:
+                target_name = _dxf_floor_type_name(t, bucket_cm=bucket_cm)
+                new_bindings[t] = _create_dxf_floor_type_in_revit(
+                    doc, base_ft, target_name, t,
+                )
+
+    for t in unique:
+        target_name = _dxf_floor_type_name(t, bucket_cm=bucket_cm)
+        if t in pre_existing:
+            llm_id = pre_existing[t]
+            node = kg.get_node(llm_id)
+            out_types.append({
+                "ok": True,
+                "llm_id": llm_id,
+                "name": target_name,
+                "thickness_m": float(node.get("total_thickness", t)),
+                "created": False,
+                "revit_id": kg.get_revit_id(llm_id),
+            })
+            reused_count += 1
+        else:
+            revit_id = new_bindings[t]
+            llm_id = kg.add_node("FloorType", {
+                "name": target_name,
+                "total_thickness": t,
+            })
+            kg.set_revit_id(llm_id, revit_id)
+            out_types.append({
+                "ok": True,
+                "llm_id": llm_id,
+                "name": target_name,
+                "thickness_m": t,
+                "created": True,
+                "revit_id": revit_id,
+            })
+            created_count += 1
+
+    return {
+        "ok": True,
+        "types": out_types,
+        "created_count": created_count,
+        "reused_count": reused_count,
+    }

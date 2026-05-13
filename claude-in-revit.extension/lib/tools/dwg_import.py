@@ -22,6 +22,8 @@ Tier-2 — chargés via routing keyword `dwg` / `dxf` / `importe` / `plan d'arch
 """
 from __future__ import annotations
 
+import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -1776,6 +1778,34 @@ def check_planset_integrity(
 
     openings_check = dwg_coherence.check_openings_matching(openings_reports)
 
+    # --- 7b. Openings plan ↔ élévations (cross-val non positionnelle) ---
+    # User 2026-05-13 : un opening présent en plan doit aussi apparaître
+    # en élévation, et inversement. Phase 1 fait le check de comptage et
+    # de présence par block_id ; Phase 2b complète avec le matching
+    # positionnel précis (qui dépend de l'orientation des murs).
+    plan_block_ids_all: List[str] = []
+    plan_total_inserts = 0
+    for pp in plan_paths:
+        plan_ents = parsed[pp]["entities"]
+        for po in dwg_section_reader.read_plan_opening_inserts(plan_ents):
+            plan_total_inserts += 1
+            if po.block_id:
+                plan_block_ids_all.append(po.block_id)
+    elev_block_ids_all: List[str] = []
+    elev_total_inserts = 0
+    for ep in elevation_paths:
+        elev_ents = parsed[ep]["entities"]
+        for eo in dwg_section_reader.read_section_openings(elev_ents):
+            elev_total_inserts += 1
+            if eo.block_id:
+                elev_block_ids_all.append(eo.block_id)
+    openings_pv_check = dwg_coherence.check_openings_plan_vs_elevation(
+        plan_block_ids=plan_block_ids_all,
+        elevation_block_ids=elev_block_ids_all,
+        plan_total_inserts=plan_total_inserts,
+        elevation_total_inserts=elev_total_inserts,
+    )
+
     # --- 8. Agrégation + gate -------------------------------------------
     # Setup check : remonte les warnings de structure (pas de coupe,
     # 1 seule coupe, unknown files). Severity = warnings si non vide.
@@ -1793,7 +1823,7 @@ def check_planset_integrity(
     )
     checks = [
         setup_check, source_check, scale_check, levels_check,
-        walls_check, openings_check,
+        walls_check, openings_check, openings_pv_check,
     ]
     report = dwg_coherence.aggregate_planset_integrity(
         checks, files_summary,
@@ -2389,21 +2419,19 @@ def add_openings_to_walls_many(
     perp_tol_m: float = 0.30,
 ) -> Dict[str, Any]:
     """Phase 2b — Ajoute fenêtres/portes sur murs existants du KG via
-    vote orientation par élévation.
+    énumération depuis le plan + vote orientation par élévation.
 
-    Use case : Phase 2a a créé les murs continus (sans openings). Ce
-    tool ajoute les openings en utilisant les coupes (source primaire,
-    block_id + sill/height) ET les élévations (vote orientation pour
-    désambiguïser mur traversé vs arrière-plan).
+    Sources de vérité (user 2026-05-13) :
+    - **Localisation + nombre** : plan (énumération INSERT A-GLAZ).
+    - **Largeur** : plan (bbox bloc, dim longue).
+    - **Hauteur** : élévation (bbox bloc), fallback coupe.
+    - **Sill (allège)** : coupe (lookup par block_id, niveau hôte).
+    - **Profondeur** (info) : plan (bbox bloc, dim courte).
 
-    Pour chaque opening de coupe :
-    1. Projette en world plan (convention DXF anchor).
-    2. Vote orientation via les 4 élévations : EW (Nord/Sud confirment)
-       ou NS (Est/Ouest confirment).
-    3. Trouve le mur hôte parmi les Wall vivants du KG dont :
-       - orientation matche le vote (EW/NS),
-       - position projetée tombe sur le mur (perp_tol),
-       - level matche le level_elevation de l'opening.
+    Pour chaque opening du plan :
+    1. Position 2D + level (depuis plan_file → linked_view → Level).
+    2. Vote orientation via les 4 élévations.
+    3. Trouve le mur hôte parmi les Wall vivants du KG.
     4. Classify door (sill ≤ 0.15, height ≥ 1.9) ou window.
     5. Crée via `openings_create_many`.
 
@@ -2457,9 +2485,13 @@ def add_openings_to_walls_many(
             continue
         level_elev_by_id[nid] = float(node.get("elevation", 0.0))
 
-    # 4. Lis les openings des coupes.
-    coupe_openings = _collect_coupe_openings_world(
-        kg, section_lines, scale_override, level_elev_by_id,
+    # 4. Énumération **primaire** des openings depuis les **plans**
+    #    (user 2026-05-13 : localisation + nombre dérivés du plan, pas
+    #    des coupes). Width/depth depuis plan, height depuis élévation
+    #    (fallback coupe), sill depuis coupe (fallback 0.9m fenêtre /
+    #    0m porte selon height).
+    plan_openings = _collect_plan_openings_world(
+        kg, section_lines, scale_override,
     )
 
     # 5. Récupère les murs vivants du KG par level.
@@ -2474,13 +2506,30 @@ def add_openings_to_walls_many(
         elev = level_elev_by_id[lvl_ref]
         walls_by_level.setdefault(elev, []).append((nid, node))
 
+    # 5b. Index INSERTs A-GLAZ par élévation (pour cross-val nombre +
+    # position). Position résolue (INSERT + bbox bloc local).
+    elev_inserts_by_dir = _build_elevation_inserts_by_direction(
+        kg, scale_override=scale_override,
+    )
+
     # 6. Première passe : pour chaque opening, vote orientation, classify
     # door/window, find host wall, accumule (kind, w, h) pour bulk types.
     pending_openings: List[Dict[str, Any]] = []  # [{co, host_ref, hp1, hp2, kind, w, h}]
     orphan_count = 0
     unmatched_count = 0
+    oversize_count = 0  # fenêtre trop large pour son mur (skip pre-création)
+    oversize_examples: List[Dict[str, Any]] = []
     orientation_stats = {"EW": 0, "NS": 0, "unknown": 0}
-    for co in coupe_openings:
+    # Matchs élévation par direction : compte combien de plan-openings
+    # ont trouvé un INSERT correspondant.
+    elev_match_stats: Dict[str, int] = {"Nord": 0, "Sud": 0, "Est": 0, "Ouest": 0}
+    elev_unmatched_count = 0  # opening plan SANS aucun match élév attendu
+    # Pour détecter les "orphelins" élévation (INSERT vu en élév sans
+    # plan correspondant), on track les inserts consommés.
+    consumed_inserts: Dict[str, Set[int]] = {
+        d: set() for d in ("Nord", "Sud", "Est", "Ouest")
+    }
+    for co in plan_openings:
         opening_xy = (co["x_world"], co["y_world"])
         sill_m = co.get("sill_m")
         height_m = co.get("height_m")
@@ -2534,6 +2583,75 @@ def add_openings_to_walls_many(
         if kind == "unknown":
             unmatched_count += 1
             continue
+
+        # Garde-fou : la fenêtre tient dans le mur ?
+        # Revit refuse de créer une instance qui dépasse les bornes du
+        # mur hôte (« Des occurrences de DXF_WIN ne coupent rien »).
+        # On reject ici, plutôt que de laisser Revit planter en cours
+        # de Tx. Marge 5cm aux extrémités.
+        wall_len = math.hypot(hp2[0] - hp1[0], hp2[1] - hp1[1])
+        t_proj = dwg_plan_openings._project_param(opening_xy, hp1, hp2)
+        pos_on_wall = max(0.0, min(1.0, t_proj)) * wall_len
+        half_w = float(width_m) / 2.0
+        edge_margin = 0.05
+        if (
+            pos_on_wall - half_w < edge_margin
+            or pos_on_wall + half_w > wall_len - edge_margin
+        ):
+            oversize_count += 1
+            if len(oversize_examples) < 10:
+                oversize_examples.append({
+                    "block_id": co["block_id"],
+                    "level": co["level_elevation_m"],
+                    "host_wall_ref": host_ref,
+                    "wall_length_m": round(wall_len, 3),
+                    "pos_on_wall_m": round(pos_on_wall, 3),
+                    "opening_width_m": float(width_m),
+                })
+            continue
+
+        # Cross-val nombre + position via élévations (user 2026-05-13).
+        # L'orientation détermine les 2 élévations cardinales attendues.
+        # EW (mur horizontal sur le plan) → visible en Nord et Sud.
+        # NS (mur vertical) → visible en Est et Ouest.
+        z_world_sill = co["level_elevation_m"] + sill_m
+        expected_dirs: List[str] = []
+        if orientation == "EW":
+            expected_dirs = ["Nord", "Sud"]
+        elif orientation == "NS":
+            expected_dirs = ["Est", "Ouest"]
+        seen_in: List[str] = []
+        best_elev_dis_m: Optional[float] = None
+        for d in expected_dirs:
+            x_elev_exp, _y_elev_exp = (
+                dwg_elevation_reader.project_world_to_elevation(
+                    co["x_world"], co["y_world"], z_world_sill, d,
+                )
+            )
+            inserts = elev_inserts_by_dir.get(d, [])
+            best_ins_idx: Optional[int] = None
+            best_ins_dis: float = float("inf")
+            for idx, ins in enumerate(inserts):
+                if idx in consumed_inserts[d]:
+                    continue
+                dis = abs(ins.x_dxf_m - x_elev_exp)
+                if dis < 0.30 and dis < best_ins_dis:
+                    best_ins_idx = idx
+                    best_ins_dis = dis
+            if best_ins_idx is not None:
+                consumed_inserts[d].add(best_ins_idx)
+                seen_in.append(d)
+                elev_match_stats[d] += 1
+                if best_elev_dis_m is None or best_ins_dis < best_elev_dis_m:
+                    best_elev_dis_m = best_ins_dis
+        if expected_dirs and not seen_in:
+            elev_unmatched_count += 1
+
+        co["elev_seen_in"] = seen_in
+        co["elev_position_disagreement_cm"] = (
+            round(best_elev_dis_m * 100, 1) if best_elev_dis_m is not None else None
+        )
+
         pending_openings.append({
             "co": co,
             "host_ref": host_ref,
@@ -2613,27 +2731,108 @@ def add_openings_to_walls_many(
     else:
         inner = None
 
+    # Stats cross-validation dimensions plan/élévation/coupe.
+    width_disagreements: List[Dict[str, Any]] = []
+    sill_disagreements: List[Dict[str, Any]] = []
+    head_disagreements: List[Dict[str, Any]] = []
+    width_source_stats: Dict[str, int] = {}
+    sill_source_stats: Dict[str, int] = {}
+    for po in plan_openings:
+        wsrc = po.get("width_source") or "unknown"
+        ssrc = po.get("sill_source") or "unknown"
+        width_source_stats[wsrc] = width_source_stats.get(wsrc, 0) + 1
+        sill_source_stats[ssrc] = sill_source_stats.get(ssrc, 0) + 1
+        if po.get("width_disagreement_cm") is not None:
+            width_disagreements.append({
+                "block_id": po["block_id"],
+                "level": po["level_elevation_m"],
+                "plan_width_m": po["width_m"],
+                "disagreement_cm": po["width_disagreement_cm"],
+            })
+        if po.get("sill_disagreement_cm") is not None:
+            sill_disagreements.append({
+                "block_id": po["block_id"],
+                "level": po["level_elevation_m"],
+                "section_sill_m": po["sill_m"],
+                "disagreement_cm": po["sill_disagreement_cm"],
+            })
+        if po.get("head_disagreement_cm") is not None:
+            head_disagreements.append({
+                "block_id": po["block_id"],
+                "level": po["level_elevation_m"],
+                "computed_head_m": (po["sill_m"] or 0) + (po["height_m"] or 0),
+                "disagreement_cm": po["head_disagreement_cm"],
+            })
+
+    # Cross-val nombre + position : orphans élévation (INSERTs non
+    # consommés par aucune fenêtre du plan).
+    elev_total_per_dir: Dict[str, int] = {}
+    elev_orphans_per_dir: Dict[str, int] = {}
+    for d, inserts in elev_inserts_by_dir.items():
+        elev_total_per_dir[d] = len(inserts)
+        elev_orphans_per_dir[d] = len(inserts) - len(consumed_inserts[d])
+    elev_position_disagreements: List[Dict[str, Any]] = []
+    for po in plan_openings:
+        d_cm = po.get("elev_position_disagreement_cm")
+        if d_cm is not None and d_cm > 10.0:
+            elev_position_disagreements.append({
+                "block_id": po["block_id"],
+                "level": po["level_elevation_m"],
+                "x_world": po["x_world"],
+                "y_world": po["y_world"],
+                "disagreement_cm": d_cm,
+                "seen_in": po.get("elev_seen_in", []),
+            })
+
     note = (
         "Phase 2b : {} portes + {} fenêtres hostées via vote orientation, "
         "{} types DXF custom créés / {} réutilisés. {} orphelins (pas de "
-        "mur hôte trouvé), {} non matchés. Orientations : EW={}, NS={}, "
-        "unknown={}".format(
+        "mur hôte trouvé), {} non matchés, {} rejetés (trop larges pour "
+        "leur mur — évite l'erreur Revit 'ne coupent rien'). Orientations : "
+        "EW={}, NS={}, unknown={}. Cross-val dims plan↔élév : largeur "
+        "{}match/{}désaccord, "
+        "allège {}match/{}désaccord/{}élev-fallback, linteau {}désaccord. "
+        "Cross-val position élév : {} plan-openings non vus en élévation, "
+        "{} inserts élévation orphelins (somme toutes directions), "
+        "{} désaccords position > 10cm."
+        .format(
             len(door_items), len(window_items),
             types_result["created_count"], types_result["reused_count"],
-            orphan_count, unmatched_count,
+            orphan_count, unmatched_count, oversize_count,
             orientation_stats["EW"], orientation_stats["NS"],
             orientation_stats["unknown"],
+            width_source_stats.get("plan_elev_match", 0),
+            width_source_stats.get("plan_disagrees_with_elev", 0),
+            sill_source_stats.get("section_elev_match", 0),
+            sill_source_stats.get("section_disagrees_with_elev", 0),
+            sill_source_stats.get("elevation", 0),
+            len(head_disagreements),
+            elev_unmatched_count,
+            sum(elev_orphans_per_dir.values()),
+            len(elev_position_disagreements),
         )
     )
 
     return {
         "ok": True,
-        "coupe_openings_detected": len(coupe_openings),
+        "plan_openings_detected": len(plan_openings),
         "openings_doors_created": len(door_items),
         "openings_windows_created": len(window_items),
         "openings_orphan": orphan_count,
         "openings_unmatched": unmatched_count,
+        "openings_oversize_for_wall": oversize_count,
+        "openings_oversize_examples": oversize_examples,
         "orientation_stats": orientation_stats,
+        "width_source_stats": width_source_stats,
+        "sill_source_stats": sill_source_stats,
+        "width_disagreements": width_disagreements,
+        "sill_disagreements": sill_disagreements,
+        "head_disagreements": head_disagreements,
+        "elevation_match_stats": elev_match_stats,
+        "elevation_total_per_direction": elev_total_per_dir,
+        "elevation_orphans_per_direction": elev_orphans_per_dir,
+        "elevation_unmatched_plan_count": elev_unmatched_count,
+        "elevation_position_disagreements": elev_position_disagreements,
         "opening_types_created": types_result["created_count"],
         "opening_types_reused": types_result["reused_count"],
         "opening_types": types_result["types"],
@@ -2746,6 +2945,56 @@ def _try_recover_orphan_via_vote(
     return True
 
 
+def _build_elevation_inserts_by_direction(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+) -> Dict[str, List[Any]]:
+    """Énumère les INSERT A-GLAZ par élévation cardinale, avec position
+    résolue (INSERT + bbox locale du bloc — même algo que coupe).
+
+    Returns:
+        `{direction: [SectionOpening, ...]}` avec direction ∈ {Nord, Sud,
+        Est, Ouest}. Chaque opening a `x_dxf_m` (= x_elev_abs) et
+        `y_dxf_m` (= y_elev_abs ≈ sill_abs si convention Revit AIA
+        respectée).
+    """
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+    out: Dict[str, List[Any]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "elevation":
+            continue
+        pp = Path(fi.get("path") or "")
+        if not pp.exists():
+            continue
+        name_low = pp.name.lower()
+        direction: Optional[str] = None
+        for d, aliases in (
+            ("Nord", ("nord", "north")),
+            ("Sud", ("sud", "south")),
+            ("Est", ("est", "east")),
+            ("Ouest", ("ouest", "west")),
+        ):
+            if any(a in name_low for a in aliases):
+                direction = d
+                break
+        if direction is None:
+            continue
+        try:
+            ents, meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        ops = dwg_section_reader.read_section_openings(ents)
+        ops = dwg_section_reader.resolve_section_opening_positions(
+            pp, ops, units_factor_to_m=meta.get("units_factor_to_m", 1.0),
+        )
+        out[direction] = ops
+    return out
+
+
 def _load_elevations_from_kg(
     kg: ProjectKG,
     scale_override: Optional[float] = None,
@@ -2808,6 +3057,387 @@ def _load_elevations_from_kg(
     return elevations
 
 
+def _build_plan_dims_index(
+    kg: ProjectKG,
+    scale_override: Optional[float],
+) -> Dict[str, Dict[str, float]]:
+    """Mapping `{block_id → {"width_m", "depth_m"}}` depuis tous les plans
+    du DxfImportContext.
+
+    En plan, la bbox du bloc A-GLAZ a dimension longue = largeur, dim
+    courte = profondeur (= épaisseur mur traversé). Agrégation max() en
+    cas de divergence inter-plan (Niveau 0 vs Niveau 1 même block_id).
+    """
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+    index: Dict[str, Dict[str, float]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "plan":
+            continue
+        pp = Path(fi.get("path") or "")
+        if not pp.exists():
+            continue
+        try:
+            _, meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        plan_dims = dwg_section_reader.read_plan_opening_dims_by_block_id(
+            pp, units_factor_to_m=meta.get("units_factor_to_m", 0.001),
+        )
+        for bid, dims in plan_dims.items():
+            cur = index.get(bid)
+            if cur is None or dims["width_m"] > cur["width_m"]:
+                index[bid] = {
+                    "width_m": dims["width_m"],
+                    "depth_m": dims["depth_m"],
+                }
+    return index
+
+
+def _build_plan_width_index(
+    kg: ProjectKG,
+    scale_override: Optional[float],
+) -> Dict[str, float]:
+    """Compat wrapper. Préférer `_build_plan_dims_index` pour aussi depth_m."""
+    return {bid: d["width_m"] for bid, d in _build_plan_dims_index(kg, scale_override).items()}
+
+
+def _build_elevation_dims_index(
+    kg: ProjectKG,
+    scale_override: Optional[float],
+) -> Dict[str, Dict[str, float]]:
+    """Mapping `{block_id → {"width_m", "height_m"}}` depuis toutes les
+    élévations du DxfImportContext.
+
+    La **hauteur** est l'info utile (cross-check avec coupe ; prioritaire
+    selon décision user 2026-05-13). La largeur permet un cross-check
+    avec le plan.
+    """
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+    index: Dict[str, Dict[str, float]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "elevation":
+            continue
+        pp = Path(fi.get("path") or "")
+        if not pp.exists():
+            continue
+        try:
+            _, meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        elev_dims = dwg_section_reader.read_elevation_opening_dims_by_block_id(
+            pp, units_factor_to_m=meta.get("units_factor_to_m", 0.001),
+        )
+        for bid, dims in elev_dims.items():
+            cur = index.get(bid)
+            if cur is None or dims["height_m"] > cur["height_m"]:
+                index[bid] = dict(dims)
+    return index
+
+
+def _build_sill_index_from_coupes(
+    kg: ProjectKG,
+    section_lines: List[Dict[str, Any]],
+    scale_override: Optional[float],
+) -> Dict[Tuple[str, float], Dict[str, float]]:
+    """Mapping `{(block_id, level_elevation_m) → {"sill_m", "height_m"}}`
+    depuis toutes les coupes référencées.
+
+    Le sill_m (hauteur d'allège relative au niveau hôte) n'est lisible
+    que depuis la coupe : on regarde y_dxf - level_y. La height_m
+    extraite ici sert de fallback à `_build_elevation_dims_index`.
+    """
+    out: Dict[Tuple[str, float], Dict[str, float]] = {}
+    for sl in section_lines:
+        coupe_path = sl.get("coupe_path")
+        if not coupe_path:
+            continue
+        cp = Path(coupe_path)
+        if not cp.exists():
+            continue
+        try:
+            ents, meta = dwg_reader.parse(cp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        levels = sorted(
+            dwg_section_reader.read_levels(ents),
+            key=lambda l: l.elevation_m,
+        )
+        sec_openings = dwg_section_reader.read_section_openings(ents)
+        sec_openings = dwg_section_reader.resolve_section_opening_positions(
+            cp, sec_openings,
+            units_factor_to_m=meta.get("units_factor_to_m", 1.0),
+        )
+        for so in sec_openings:
+            if so.block_id is None:
+                continue
+            host_lvl_elev: Optional[float] = None
+            for lv in levels:
+                if lv.elevation_m <= so.y_dxf_m + 1e-3:
+                    host_lvl_elev = lv.elevation_m
+            if host_lvl_elev is None:
+                continue
+            sill = round(so.y_dxf_m - host_lvl_elev, 4)
+            key = (so.block_id, round(host_lvl_elev, 3))
+            cur = out.get(key)
+            entry = {"sill_m": sill, "height_m": so.height_m}
+            if cur is None:
+                out[key] = entry
+            # Sinon on garde le premier — multi-coupes même opening = même valeurs.
+    return out
+
+
+def _plan_path_to_level_elev(
+    kg: ProjectKG,
+) -> Dict[str, float]:
+    """Mapping `{plan_file_path → level_elevation_m}` via le DxfImportContext.
+
+    Stratégie : pour chaque linked_view de view_kind="plan", le `view_name`
+    matche un Level node (par `name`). Robuste à l'ordre/numérotation des
+    levels. Fallback : si view_name absent ou pas de Level matching,
+    parser le nom de fichier `Niveau N` et matcher au N-ième Level trié.
+    """
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+
+    levels_by_name: Dict[str, float] = {}
+    sorted_levels: List[Tuple[str, float]] = []
+    for lid in kg.find_by_type("Level"):
+        node = kg.get_node(lid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        name = node.get("name") or ""
+        elev = float(node.get("elevation", 0.0))
+        levels_by_name[name] = elev
+        sorted_levels.append((name, elev))
+    sorted_levels.sort(key=lambda kv: kv[1])
+
+    out: Dict[str, float] = {}
+    for lv in ctx.get("linked_views") or []:
+        if lv.get("view_kind") != "plan":
+            continue
+        fp = lv.get("file_path")
+        if not fp:
+            continue
+        vname = lv.get("view_name") or ""
+        if vname in levels_by_name:
+            out[fp] = levels_by_name[vname]
+            continue
+        # Fallback : parse N depuis "Niveau N" et matcher au N-ième level trié.
+        m = re.search(r"(?:Niveau|Level)\s+(\d+)", vname, re.IGNORECASE)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(sorted_levels):
+                out[fp] = sorted_levels[idx][1]
+    return out
+
+
+def _collect_plan_openings_world(
+    kg: ProjectKG,
+    section_lines: List[Dict[str, Any]],
+    scale_override: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Énumération **primaire** des openings depuis les plans (source de
+    référence pour la localisation et le nombre — user 2026-05-13).
+
+    Pipeline :
+    1. Pour chaque plan du DxfImportContext, lit les INSERT A-GLAZ
+       (position 2D + block_id).
+    2. Détermine le level via `_plan_path_to_level_elev`.
+    3. Enrichit avec :
+       - `width_m`, `depth_m` ← plan (bbox bloc, déjà extrait).
+       - `height_m` ← élévation (bbox), fallback coupe.
+       - `sill_m` ← coupe (lookup par block_id), fallback 0.9m (fenêtre) / 0.0m (porte).
+
+    Returns:
+        Liste de dicts `{block_id, block_name, x_world, y_world, sill_m,
+        height_m, width_m, depth_m, level_elevation_m, plan_path,
+        width_source, height_source, sill_source}`.
+    """
+    plan_dims = _build_plan_dims_index(kg, scale_override=scale_override)
+    elev_dims = _build_elevation_dims_index(kg, scale_override=scale_override)
+    sill_idx = _build_sill_index_from_coupes(kg, section_lines, scale_override)
+    plan_levels = _plan_path_to_level_elev(kg)
+
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return []
+    ctx = kg.get_node(nid)
+
+    raw: List[Dict[str, Any]] = []
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "plan":
+            continue
+        plan_path = fi.get("path")
+        if not plan_path:
+            continue
+        pp = Path(plan_path)
+        if not pp.exists():
+            continue
+        level_elev = plan_levels.get(plan_path)
+        if level_elev is None:
+            continue
+        try:
+            ents, meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        plan_openings = dwg_section_reader.read_plan_opening_inserts(ents)
+        for po in plan_openings:
+            # `dwg_reader.parse` retourne déjà les coords en mètres.
+            x_world = po.x_dxf_m
+            y_world = po.y_dxf_m
+            bid = po.block_id
+
+            # Width/depth via plan index.
+            pd = plan_dims.get(bid) if bid else None
+            width_m = pd["width_m"] if pd else None
+            depth_m = pd["depth_m"] if pd else None
+            width_source = "plan" if pd else None
+
+            # Height via élévation, fallback coupe (par sill_idx au même level).
+            ed = elev_dims.get(bid) if bid else None
+            # Garde-fou : la bbox élévation peut être dégénérée (~17mm)
+            # pour des blocs où la géométrie GLAZ est partiellement
+            # encapsulée dans des sous-INSERTs. On accepte la hauteur
+            # élévation seulement si elle est plausible (≥ 0.30m), sinon
+            # fallback coupe.
+            ed_height_plausible = (
+                ed is not None and ed["height_m"] >= 0.30
+            )
+            height_m: Optional[float] = (
+                ed["height_m"] if ed_height_plausible else None
+            )
+            height_source = "elevation" if ed_height_plausible else None
+
+            # Cross-validation largeur plan ↔ élévation (user 2026-05-13).
+            # Tolérance 5cm. Le plan reste source primaire.
+            width_disagreement_cm: Optional[float] = None
+            if width_m is not None and ed is not None and ed["width_m"] >= 0.30:
+                w_elev = ed["width_m"]
+                disagreement_cm = abs(width_m - w_elev) * 100.0
+                if disagreement_cm <= 5.0:
+                    width_source = "plan_elev_match"
+                else:
+                    width_disagreement_cm = round(disagreement_cm, 1)
+                    width_source = "plan_disagrees_with_elev"
+            elif width_m is not None and bid is not None:
+                width_source = "plan_only"
+            sill_entry = (
+                sill_idx.get((bid, round(level_elev, 3))) if bid else None
+            )
+            if height_m is None and sill_entry is not None:
+                height_m = sill_entry.get("height_m")
+                height_source = "section"
+
+            # Sill via coupe au même level.
+            sill_m: Optional[float] = (
+                sill_entry.get("sill_m") if sill_entry is not None else None
+            )
+            sill_source = "section" if sill_m is not None else None
+
+            # Cross-validation sill (allège) + head (linteau) ↔ élévation
+            # (user 2026-05-13). Sill local du bloc en élévation =
+            # sill relatif au level (INSERT placé à (x_elev, level_y)).
+            # Head local = sill + height. Tolérance 5cm.
+            sill_disagreement_cm: Optional[float] = None
+            head_disagreement_cm: Optional[float] = None
+            if (
+                ed is not None
+                and ed.get("sill_local_m") is not None
+                and ed["height_m"] >= 0.30  # bbox plausible
+            ):
+                sill_elev = ed["sill_local_m"]
+                head_elev = ed["head_local_m"]
+                if sill_m is not None:
+                    dis = abs(sill_m - sill_elev) * 100.0
+                    if dis <= 5.0:
+                        sill_source = "section_elev_match"
+                    else:
+                        sill_disagreement_cm = round(dis, 1)
+                        sill_source = "section_disagrees_with_elev"
+                else:
+                    # Coupe muette pour cet opening → sill depuis élévation.
+                    sill_m = sill_elev
+                    sill_source = "elevation"
+                # Cross-val head si height connue (= linteau attendu).
+                if height_m is not None and sill_m is not None:
+                    head_expected = sill_m + height_m
+                    dis_h = abs(head_expected - head_elev) * 100.0
+                    if dis_h > 5.0:
+                        head_disagreement_cm = round(dis_h, 1)
+
+            # Fallback dimensions depuis le nom de bloc.
+            if width_m is None or height_m is None:
+                dims_from_name = dwg_section_reader.parse_block_dimensions(
+                    po.block_name,
+                )
+                if dims_from_name is not None:
+                    nw, nh = dims_from_name
+                    if width_m is None:
+                        width_m = nw
+                        width_source = "block_name"
+                    if height_m is None:
+                        height_m = nh
+                        height_source = "block_name"
+
+            if width_m is None or height_m is None:
+                # Pas de dims utilisables — skip (signalera dans le tool).
+                continue
+
+            # Sill par défaut : 0.9m si height suggère fenêtre, 0.0m si porte.
+            if sill_m is None:
+                # Convention user : sill ≤ 0.15 + height ≥ 1.9 → door, else window.
+                if height_m >= 1.9:
+                    sill_m = 0.0
+                    sill_source = "default_door"
+                else:
+                    sill_m = 0.9
+                    sill_source = "default_window"
+
+            raw.append({
+                "block_id": bid,
+                "block_name": po.block_name,
+                "x_world": round(x_world, 4),
+                "y_world": round(y_world, 4),
+                "sill_m": sill_m,
+                "height_m": height_m,
+                "width_m": width_m,
+                "depth_m": depth_m,
+                "level_elevation_m": level_elev,
+                "plan_path": plan_path,
+                "width_source": width_source,
+                "height_source": height_source,
+                "sill_source": sill_source,
+                "width_disagreement_cm": width_disagreement_cm,
+                "sill_disagreement_cm": sill_disagreement_cm,
+                "head_disagreement_cm": head_disagreement_cm,
+            })
+
+    # Dédup par (block_id, round position, level) — multi-plans même opening = 1.
+    seen: Dict[Tuple[Any, float, float, float], Dict[str, Any]] = {}
+    for co in raw:
+        key = (
+            co["block_id"] or co["block_name"],
+            round(co["x_world"], 2),
+            round(co["y_world"], 2),
+            round(co["level_elevation_m"], 3),
+        )
+        if key not in seen:
+            seen[key] = co
+    return list(seen.values())
+
+
 def _collect_coupe_openings_world(
     kg: ProjectKG,
     section_lines: List[Dict[str, Any]],
@@ -2818,11 +3448,16 @@ def _collect_coupe_openings_world(
     """Lit les openings de chaque coupe référencée, projette en world plan,
     déterminé leur niveau hôte, déduplique par block_id+position.
 
+    La **largeur** (`width_m`) est lue **depuis le plan** (bbox du bloc,
+    dimension longue) via `_build_plan_width_index`, pas depuis la coupe :
+    en coupe la bbox = tranche de profil, pas la vraie largeur.
+
     Returns:
         Liste de dicts `{block_id, block_name, x_world, y_world, sill_m,
         height_m, width_m, level_elevation_m, coupe_path,
         section_line_index}`.
     """
+    plan_widths = _build_plan_width_index(kg, scale_override=scale_override)
     raw: List[Dict[str, Any]] = []
     for sl_idx, sl in enumerate(section_lines):
         coupe_path = sl.get("coupe_path")
@@ -2860,6 +3495,12 @@ def _collect_coupe_openings_world(
             x_w, y_w = dwg_plan_openings.project_section_opening_to_world(
                 so.x_dxf_m, sp1, sp2,
             )
+            # `width_m` prioritaire depuis le plan (bbox bloc, dim longue) ;
+            # fallback sur la valeur extraite de la coupe (bbox de profil)
+            # si block_id absent ou non indexé.
+            width_from_plan = (
+                plan_widths.get(so.block_id) if so.block_id else None
+            )
             raw.append({
                 "block_id": so.block_id,
                 "block_name": so.block_name,
@@ -2867,7 +3508,8 @@ def _collect_coupe_openings_world(
                 "y_world": y_w,
                 "sill_m": sill,
                 "height_m": so.height_m,
-                "width_m": so.width_m,
+                "width_m": width_from_plan if width_from_plan is not None else so.width_m,
+                "width_source": "plan" if width_from_plan is not None else "section",
                 "level_elevation_m": host_lvl_elev,
                 "coupe_path": str(cp),
                 "section_line_index": sl_idx,
@@ -3705,3 +4347,527 @@ def _build_planset_integrity_note(
         "majeur (mauvais matching trait↔coupe), conflit d'élévation pour "
         "un même niveau entre coupes, ou mismatch d'épaisseur > 10cm."
     ).format(len(report.errors))
+
+
+# ----- Phase 2c — Sols (épaisseur coupes + boundary murs) ---------------
+#
+# Reproduit le pattern Phase 2a/2b pour les sols. La géométrie des
+# dalles n'étant typiquement pas exportée en plan, on dérive :
+# - **boundary** depuis l'enveloppe des Wall du niveau (convex hull p1/p2)
+# - **épaisseur** depuis les paires de LINEs A-FLOR horizontales des
+#   coupes du DxfImportContext
+# - **type** : FloorType custom `DXF_FLOOR_<cm>cm` par épaisseur.
+# Pas de toiture (= dernier niveau exclu — décision user 2026-05-13).
+
+
+def _convex_hull_2d(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Andrew's monotone chain. Retourne le polygone fermé (sans répéter
+    le 1er point en fin). Si < 3 points uniques, retourne tels quels."""
+    pts = sorted(set((round(x, 4), round(y, 4)) for x, y in points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _shoelace_area_2d(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    s = 0.0
+    n = len(points)
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _slab_thicknesses_per_level(
+    kg: ProjectKG,
+    scale_override: Optional[float],
+    level_match_tol_m: float = 0.05,
+) -> Dict[float, float]:
+    """Pour chaque niveau du KG, retourne l'épaisseur de dalle observée
+    en coupe (max vote inter-coupes si plusieurs).
+
+    Retourne `{level_elevation_m → thickness_m}`. Un niveau sans dalle
+    visible (typiquement le sommet = toiture) est absent.
+    """
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+    # level_elevations cibles depuis le KG
+    target_elevs: List[float] = []
+    for lid in kg.find_by_type("Level"):
+        n = kg.get_node(lid)
+        if n.get("deleted_at_turn") is not None:
+            continue
+        target_elevs.append(float(n.get("elevation", 0.0)))
+    target_elevs.sort()
+
+    thickness_votes: Dict[float, List[float]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "section":
+            continue
+        pp = Path(fi.get("path") or "")
+        if not pp.exists():
+            continue
+        try:
+            ents, _meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        slabs = dwg_section_reader.read_section_floor_slabs(ents)
+        for s in slabs:
+            # Match top_y à un niveau (tol).
+            for elev in target_elevs:
+                if abs(s.top_y_m - elev) <= level_match_tol_m:
+                    thickness_votes.setdefault(elev, []).append(s.thickness_m)
+                    break
+
+    out: Dict[float, float] = {}
+    for elev, thks in thickness_votes.items():
+        # Vote max — défense contre une coupe occasionnellement
+        # mal-dimensionnée. Pour P7, tous les votes sont identiques (25cm).
+        out[elev] = max(thks)
+    return out
+
+
+@tool(name="dwg_create_floors_many", tier=2)
+def create_floors_many(
+    kg: ProjectKG,
+    doc: Any,
+    scale_override: Optional[float] = None,
+    bucket_cm: int = 1,
+    base_floor_type_ref: Optional[str] = None,
+    skip_top_level: bool = True,
+    boundary_inflation_m: float = 0.0,
+) -> Dict[str, Any]:
+    """Phase 2c — Crée les sols par niveau, en dérivant :
+    - **épaisseur** depuis les paires A-FLOR horizontales des coupes,
+    - **boundary** depuis le convex hull des murs Wall du niveau,
+    - **type** : FloorType custom `DXF_FLOOR_<cm>cm`.
+
+    Use case : Phase 2a a créé les murs continus, Phase 2b a posé les
+    ouvertures. Ce tool ferme l'enveloppe par les dalles. Le dernier
+    niveau (toiture) est skip par défaut (`skip_top_level=True`).
+
+    Concepts: sol, dalle, floor, slab, plancher, phase 2c, dxf, import,
+              boundary, convex hull, épaisseur
+    Phrases: "crée les sols", "ajoute les dalles", "phase 2c",
+             "import des planchers"
+    Similar: dwg_create_continuous_walls_many,
+             dwg_add_openings_to_walls_many, floors_create_many
+
+    Args:
+        scale_override: cf. dwg_inspect.
+        bucket_cm: granularité du bucketing épaisseur (défaut 1).
+        base_floor_type_ref: FloorType à dupliquer. Sinon auto.
+        skip_top_level: ne pas créer le sol au niveau le plus haut
+            (= toiture, à traiter séparément). Défaut True.
+        boundary_inflation_m: dilatation isotrope du convex hull pour
+            inclure une marge autour des murs (typiquement 0, set à
+            ~0.10m si tu veux que le sol déborde des murs extérieurs).
+
+    Returns:
+        {ok, floors_created_count, floors_per_level, types_created,
+         types_reused, types, inner_floors, note}
+    """
+    if doc is not None:
+        try:
+            from .. import revit_primitives as rp
+            rp.ensure_shared_param_binding(doc)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 1. Épaisseur par niveau (depuis coupes).
+    thk_by_elev = _slab_thicknesses_per_level(kg, scale_override)
+    if not thk_by_elev:
+        return {
+            "ok": True,
+            "floors_created_count": 0,
+            "floors_per_level": {},
+            "types_created": 0,
+            "types_reused": 0,
+            "types": [],
+            "inner_floors": None,
+            "note": (
+                "Aucune dalle détectée dans les coupes (A-FLOR horizontales). "
+                "Soit le DXF n'inclut pas les sols, soit la convention de "
+                "layer diffère — vérifier dwg_inspect_sections."
+            ),
+        }
+
+    # 2. Murs vivants par niveau (level_ref → list of (p1, p2)).
+    level_to_ref: Dict[float, str] = {}
+    for lid in kg.find_by_type("Level"):
+        n = kg.get_node(lid)
+        if n.get("deleted_at_turn") is not None:
+            continue
+        level_to_ref[round(float(n.get("elevation", 0.0)), 3)] = lid
+
+    walls_by_level: Dict[float, List[Tuple[Tuple[float, float], Tuple[float, float]]]] = {}
+    for nid in kg.find_by_type("Wall"):
+        n = kg.get_node(nid)
+        if n.get("deleted_at_turn") is not None:
+            continue
+        lvl_ref = n.get("level_ref")
+        if lvl_ref is None:
+            continue
+        lvl_node = kg.get_node(lvl_ref)
+        elev = round(float(lvl_node.get("elevation", 0.0)), 3)
+        p1 = n.get("p1")
+        p2 = n.get("p2")
+        if not p1 or not p2:
+            continue
+        walls_by_level.setdefault(elev, []).append(
+            ((float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))),
+        )
+
+    # 3. Détermine la liste des niveaux à traiter (skip toiture).
+    elevs_with_walls = sorted(walls_by_level.keys())
+    if not elevs_with_walls:
+        return {
+            "ok": True,
+            "floors_created_count": 0,
+            "floors_per_level": {},
+            "types_created": 0,
+            "types_reused": 0,
+            "types": [],
+            "inner_floors": None,
+            "note": (
+                "Aucun mur vivant dans le KG par niveau — Phase 2a n'a "
+                "pas été exécutée ou les murs ont été supprimés. Sans "
+                "murs, pas de boundary pour les sols."
+            ),
+        }
+    target_elevs = [e for e in elevs_with_walls if e in thk_by_elev]
+    if skip_top_level and target_elevs:
+        # Le niveau le plus haut traité par Phase 2a = toiture probable.
+        # On le retire seulement s'il est aussi le plus haut tout court
+        # (= pas de niveau au-dessus). Conservateur : on garde l'avant-dernier.
+        # En pratique pour P7, on a niveaux 0/1/2, walls aux 0+1, slabs aux 0+1
+        # → on traite les 2 niveaux (pas de skip nécessaire).
+        # On ne skip QUE si le top wall-level matche aussi le top slab-level
+        # *et* qu'il existe un niveau au-dessus dans le KG.
+        all_kg_elevs = sorted(level_to_ref.keys())
+        max_walls = target_elevs[-1]
+        if max_walls < all_kg_elevs[-1] - 1e-3:
+            # Il y a un niveau au-dessus du dernier mur → garder.
+            pass
+        # Sinon : pas de skip (P7 cas typique).
+
+    # 4. Build per-level items : boundary, thickness, level_ref.
+    floor_items_raw: List[Dict[str, Any]] = []
+    thicknesses_unique: Set[int] = set()
+    for elev in target_elevs:
+        thk = thk_by_elev[elev]
+        wall_pts: List[Tuple[float, float]] = []
+        for p1, p2 in walls_by_level[elev]:
+            wall_pts.append(p1)
+            wall_pts.append(p2)
+        hull = _convex_hull_2d(wall_pts)
+        if len(hull) < 3:
+            continue
+        # Inflation isotrope (optionnelle).
+        if boundary_inflation_m > 0:
+            cx = sum(p[0] for p in hull) / len(hull)
+            cy = sum(p[1] for p in hull) / len(hull)
+            inflated: List[Tuple[float, float]] = []
+            for x, y in hull:
+                vx = x - cx
+                vy = y - cy
+                length = math.hypot(vx, vy)
+                if length < 1e-6:
+                    inflated.append((x, y))
+                    continue
+                k = (length + boundary_inflation_m) / length
+                inflated.append((cx + vx * k, cy + vy * k))
+            hull = inflated
+        boundary = [[round(p[0], 4), round(p[1], 4)] for p in hull]
+        area_m2 = round(_shoelace_area_2d(hull), 4)
+        thk_cm = int(round(thk * 100 / bucket_cm)) * bucket_cm
+        thicknesses_unique.add(thk_cm)
+        floor_items_raw.append({
+            "level_ref": level_to_ref[elev],
+            "level_elevation_m": elev,
+            "thickness_m": thk_cm / 100.0,
+            "boundary": boundary,
+            "area_m2": area_m2,
+        })
+
+    if not floor_items_raw:
+        return {
+            "ok": True,
+            "floors_created_count": 0,
+            "floors_per_level": {},
+            "types_created": 0,
+            "types_reused": 0,
+            "types": [],
+            "inner_floors": None,
+            "note": (
+                "Aucun sol candidat construit (épaisseur ↔ niveau matchant "
+                "+ murs disponibles). Vérifier dwg_inspect_sections et "
+                "Phase 2a."
+            ),
+        }
+
+    # 5. Bulk get_or_create FloorType DXF.
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    ft_entry = registry.get("floors_get_or_create_dxf_type_many")
+    types_result: Dict[str, Any] = {"types": [], "created_count": 0, "reused_count": 0}
+    type_ref_by_cm: Dict[int, str] = {}
+    if ft_entry is not None:
+        types_result = ft_entry.fn(
+            kg=kg, doc=doc,
+            thicknesses_m=[c / 100.0 for c in sorted(thicknesses_unique)],
+            bucket_cm=bucket_cm,
+            base_type_ref=base_floor_type_ref,
+        )
+        for t in types_result["types"]:
+            cm = int(round(t["thickness_m"] * 100))
+            type_ref_by_cm[cm] = t["llm_id"]
+
+    # 6. Build floors_create_many items.
+    floors_items: List[Dict[str, Any]] = []
+    floors_per_level: Dict[float, int] = {}
+    for it in floor_items_raw:
+        thk_cm = int(round(it["thickness_m"] * 100))
+        type_ref = type_ref_by_cm.get(thk_cm)
+        if type_ref is None:
+            continue
+        floors_items.append({
+            "type_ref": type_ref,
+            "level_ref": it["level_ref"],
+            "boundary": it["boundary"],
+            "area_m2": it["area_m2"],
+        })
+        floors_per_level[it["level_elevation_m"]] = (
+            floors_per_level.get(it["level_elevation_m"], 0) + 1
+        )
+
+    # 7. Crée les Floor via floors_create_many.
+    floors_entry = registry.get("floors_create_many")
+    inner_floors = None
+    if floors_items and floors_entry is not None:
+        inner_floors = floors_entry.fn(
+            kg=kg, doc=doc, items=floors_items,
+        )
+
+    note = (
+        "Phase 2c : {} sol(s) créé(s) sur {} niveau(x). "
+        "{} FloorType DXF créé(s) / {} réutilisé(s). Épaisseurs : {}."
+        .format(
+            len(floors_items), len(floors_per_level),
+            types_result["created_count"], types_result["reused_count"],
+            sorted(thicknesses_unique),
+        )
+    )
+
+    return {
+        "ok": True,
+        "floors_created_count": len(floors_items),
+        "floors_per_level": {str(k): v for k, v in floors_per_level.items()},
+        "types_created": types_result["created_count"],
+        "types_reused": types_result["reused_count"],
+        "types": types_result["types"],
+        "inner_floors": inner_floors,
+        "note": note,
+    }
+
+
+# ----- Reset des imports DXF (Phase 2 maintenance) ----------------------
+#
+# Outil de nettoyage : soft-delete dans le KG tous les Wall/Window/Door
+# vivants + WallType/FamilyType DXF_*, et supprime côté Revit en une
+# seule transaction. Utile entre deux itérations d'import pour repartir
+# vierge sans avoir à effacer manuellement dans Revit + supprimer le
+# fichier .kg.json. Atomicité KG+Revit : si le commit Revit échoue, le
+# KG rollback via `kg.transaction()`.
+
+
+_DXF_TYPE_PREFIXES = ("DXF_WALL_", "DXF_WIN_", "DXF_DOOR_", "DXF_FLOOR_")
+
+
+def _is_dxf_type_node(attrs: Dict[str, Any]) -> bool:
+    """Match WallType/FloorType/FamilyType DXF_* (Phase 2a/b/c)."""
+    t = attrs.get("_type")
+    if t == "WallType":
+        name = attrs.get("name") or ""
+        return name.startswith("DXF_WALL_")
+    if t == "FloorType":
+        name = attrs.get("name") or ""
+        return name.startswith("DXF_FLOOR_")
+    if t == "FamilyType":
+        tn = attrs.get("type_name") or ""
+        return tn.startswith("DXF_WIN_") or tn.startswith("DXF_DOOR_")
+    return False
+
+
+@tool(name="kg_reset_dxf_imports", tier=2)
+def kg_reset_dxf_imports(
+    kg: ProjectKG,
+    doc: Any = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Reset des imports DXF : soft-delete tous les Wall/Window/Door/Floor
+    vivants du KG + WallType `DXF_WALL_*` + FloorType `DXF_FLOOR_*` +
+    FamilyType `DXF_WIN_*`/`DXF_DOOR_*`, et supprime côté Revit en une
+    seule transaction.
+
+    Cible : repartir vierge entre deux itérations d'import sans toucher
+    manuellement le `.kg.json` ni purger Revit à la main. Atomique :
+    si le commit Revit échoue, le KG rollback.
+
+    **Ne touche pas** : Level, Room, DxfImportContext, View — seuls
+    les artefacts de modélisation Phase 2 (murs + ouvertures + sols)
+    et leurs types custom sont impactés. Pour un reset total, supprimer
+    le `.kg.json` à la main.
+
+    Si un node n'a pas de binding `revit_id` ou si l'élément a déjà
+    disparu côté Revit (binding périmé), le KG est soft-delete quand
+    même (pas de crash, comptabilisé dans `already_gone`).
+
+    Concepts: reset, cleanup, nettoyage, dxf, import, soft-delete,
+              purge, vierge, repartir
+    Phrases: "reset des imports DXF", "nettoie ce que j'ai importé",
+             "repars à zéro", "supprime tous les murs/fenêtres DXF",
+             "vide le KG des imports"
+    Similar: walls_delete_many, dwg_import_clear_context
+
+    Args:
+        dry_run: si True, n'effectue aucune mutation, retourne juste
+            l'inventaire de ce qui serait supprimé. Défaut False.
+
+    Returns:
+        {"ok": bool, "dry_run": bool,
+         "walls": {"count": int, "llm_ids": [...]},
+         "windows": {"count": int, "llm_ids": [...]},
+         "doors": {"count": int, "llm_ids": [...]},
+         "wall_types": {"count": int, "llm_ids": [...]},
+         "family_types": {"count": int, "llm_ids": [...]},
+         "revit_deleted": int,        # nb d'éléments Revit effectivement supprimés
+         "already_gone": int,         # nb sans binding ou binding périmé
+         "deleted_at_turn": int | None}
+    """
+    # --- 1. Inventaire : nodes vivants à reset ------------------------------
+    walls_ids = kg.find_by_type("Wall")
+    windows_ids = kg.find_by_type("Window")
+    doors_ids = kg.find_by_type("Door")
+    floors_ids = kg.find_by_type("Floor")
+
+    wall_types_ids: List[str] = []
+    floor_types_ids: List[str] = []
+    family_types_ids: List[str] = []
+    for nid in kg.find_by_type("WallType"):
+        attrs = kg.get_node(nid)
+        if _is_dxf_type_node(attrs):
+            wall_types_ids.append(nid)
+    for nid in kg.find_by_type("FloorType"):
+        attrs = kg.get_node(nid)
+        if _is_dxf_type_node(attrs):
+            floor_types_ids.append(nid)
+    for nid in kg.find_by_type("FamilyType"):
+        attrs = kg.get_node(nid)
+        if _is_dxf_type_node(attrs):
+            family_types_ids.append(nid)
+
+    inventory = {
+        "walls": {"count": len(walls_ids), "llm_ids": walls_ids},
+        "windows": {"count": len(windows_ids), "llm_ids": windows_ids},
+        "doors": {"count": len(doors_ids), "llm_ids": doors_ids},
+        "floors": {"count": len(floors_ids), "llm_ids": floors_ids},
+        "wall_types": {"count": len(wall_types_ids), "llm_ids": wall_types_ids},
+        "floor_types": {"count": len(floor_types_ids), "llm_ids": floor_types_ids},
+        "family_types": {
+            "count": len(family_types_ids), "llm_ids": family_types_ids,
+        },
+    }
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "revit_deleted": 0,
+            "already_gone": 0,
+            "deleted_at_turn": None,
+            **inventory,
+        }
+
+    # Ordre de suppression : instances d'abord (Window/Door dépendent du
+    # host Wall), puis Walls, puis Types. Côté Revit, supprimer un host
+    # supprime ses hosted ; on supprime explicitement quand même pour
+    # propager les soft-delete KG proprement.
+    ordered = (
+        windows_ids + doors_ids + floors_ids + walls_ids
+        + wall_types_ids + floor_types_ids + family_types_ids
+    )
+
+    if doc is None:
+        # Hors-Revit (CLI / tests) — KG-only soft-delete.
+        with kg.transaction():
+            for nid in ordered:
+                kg.soft_delete(nid)
+        return {
+            "ok": True,
+            "dry_run": False,
+            "revit_deleted": 0,
+            "already_gone": len(ordered),
+            "deleted_at_turn": kg.turn,
+            **inventory,
+        }
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    revit_deleted = 0
+    already_gone = 0
+
+    with kg.transaction():
+        with rp.transaction(doc, "kg_reset_dxf_imports"):
+            for nid in ordered:
+                eid_raw = kg.get_revit_id(nid)
+                if eid_raw is None:
+                    kg.soft_delete(nid)
+                    already_gone += 1
+                    continue
+                try:
+                    element = doc.GetElement(ElementId(eid_raw))
+                except Exception:  # noqa: BLE001
+                    element = None
+                if element is None:
+                    kg.soft_delete(nid)
+                    already_gone += 1
+                    continue
+                try:
+                    doc.Delete(ElementId(eid_raw))
+                    revit_deleted += 1
+                except Exception:  # noqa: BLE001 — Revit refuse parfois
+                    # Hosted déjà supprimée en cascade par le host, ou
+                    # contrainte. Soft-delete KG quand même.
+                    already_gone += 1
+                kg.soft_delete(nid)
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "revit_deleted": revit_deleted,
+        "already_gone": already_gone,
+        "deleted_at_turn": kg.turn,
+        **inventory,
+    }

@@ -189,6 +189,7 @@ LAYER_LEVELS = "A-FLOR-LEVL"
 LAYER_GLAZING = "A-GLAZ"
 LAYER_AREA_LABELS = "A-AREA-IDEN"
 LAYER_WALLS = "A-WALL"
+LAYER_FLOORS = "A-FLOR"
 
 
 # ----- Classification plan vs coupe -------------------------------------
@@ -313,7 +314,8 @@ def classify_dxf(
 # `[A-Za-z0-9_]+` mais on borne fermement par `-` + le suffixe vue
 # pour éviter de capturer des fragments arbitraires du nom.
 _BLOCK_ID_RE = re.compile(
-    r"-([A-Za-z0-9_]+)-(?:Niveau|Coupe|Plan|Elevation)\b", re.IGNORECASE,
+    r"-([A-Za-z0-9_]+)-(?:Niveau|Coupe|Plan|[ÉE]l[ée]vation|Elevation)\b",
+    re.IGNORECASE,
 )
 _BLOCK_DIM_RE = re.compile(r"(\d+)_(\d+)\s*m\s*x\s*(\d+)_(\d+)\s*m", re.IGNORECASE)
 
@@ -922,6 +924,304 @@ def resolve_section_opening_positions(
         # else : conserver width_m / height_m déjà posés par
         # `read_section_openings` (parse_block_dimensions du nom).
     return openings
+
+
+def _extract_aglaz_bbox_per_block(
+    file_path: Any,
+    units_factor_to_m: float,
+    aglaz_sub_layers: Tuple[str, ...],
+) -> Dict[str, Tuple[float, float, float, float]]:
+    """Helper : ouvre un DXF avec ezdxf et retourne pour chaque
+    BLOCK_DEFINITION dont le nom expose un `block_id` reconnaissable
+    le tuple `(bbox_w, bbox_h, y_min, y_max)` de ses sub-entities A-GLAZ.
+
+    Valeurs en **mètres dans l'espace local du bloc**. Le caller
+    interprète :
+    - en **plan** : `bbox_w` × `bbox_h` = (largeur, profondeur) selon
+      laquelle est la plus longue ; `y_min`/`y_max` sans intérêt.
+    - en **élévation** : `bbox_w` = largeur, `bbox_h` = hauteur,
+      `y_min` = sill local (= sill relatif au level d'insertion si
+      l'INSERT est posé à `(x_elev, level_y)`, ce qui est la
+      convention Revit observée), `y_max` = head local.
+
+    Retourne `{}` si ezdxf indisponible ou fichier illisible.
+    """
+    try:
+        import ezdxf
+    except ImportError:
+        return {}
+
+    try:
+        doc = ezdxf.readfile(str(file_path))
+    except Exception:  # noqa: BLE001
+        return {}
+
+    out: Dict[str, Tuple[float, float, float, float]] = {}
+    for blk in doc.blocks:
+        if blk.name.startswith("*"):
+            continue
+        bid = parse_block_id(blk.name)
+        if bid is None:
+            continue
+        xs: List[float] = []
+        ys: List[float] = []
+        for e in blk:
+            try:
+                ly = e.dxf.layer
+            except Exception:  # noqa: BLE001
+                continue
+            if ly not in aglaz_sub_layers:
+                continue
+            if e.dxftype() == "LINE":
+                xs.extend([e.dxf.start.x, e.dxf.end.x])
+                ys.extend([e.dxf.start.y, e.dxf.end.y])
+            elif e.dxftype() in ("LWPOLYLINE", "POLYLINE"):
+                try:
+                    for pt in e.vertices():
+                        xs.append(float(pt.dxf.location.x))
+                        ys.append(float(pt.dxf.location.y))
+                except Exception:  # noqa: BLE001
+                    try:
+                        for v in e:
+                            xs.append(float(v[0]))
+                            ys.append(float(v[1]))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if not xs:
+            continue
+        bbox_w = (max(xs) - min(xs)) * units_factor_to_m
+        bbox_h = (max(ys) - min(ys)) * units_factor_to_m
+        y_min = min(ys) * units_factor_to_m
+        y_max = max(ys) * units_factor_to_m
+        out[bid] = (
+            round(bbox_w, 4), round(bbox_h, 4),
+            round(y_min, 4), round(y_max, 4),
+        )
+    return out
+
+
+def read_plan_opening_dims_by_block_id(
+    file_path: Any,
+    units_factor_to_m: float = 0.001,
+    aglaz_sub_layers: Tuple[str, ...] = ("A-GLAZ", "A-GLAZ-SILL", "A-GLAZ-FRAM"),
+) -> Dict[str, Dict[str, float]]:
+    """Lit un DXF de **plan** (Revit AIA export) et retourne un mapping
+    `{block_id → {"width_m": float, "depth_m": float}}`.
+
+    **Convention** : en plan, la bbox du bloc A-GLAZ a deux dimensions :
+    la longue (= largeur de la fenêtre dans la direction du mur), la
+    courte (= profondeur d'encastrement / épaisseur du mur traversé,
+    ~0.15-0.30 m). On les nomme `width_m` et `depth_m`.
+
+    `block_id` est extrait via `parse_block_id` (regex `-<id>-Niveau`) —
+    identifiant Revit stable, partagé avec coupe `-<id>-Coupe` et
+    élévation `-<id>-Elevation`.
+    """
+    bboxes = _extract_aglaz_bbox_per_block(
+        file_path, units_factor_to_m, aglaz_sub_layers,
+    )
+    out: Dict[str, Dict[str, float]] = {}
+    for bid, (w, h, _y_min, _y_max) in bboxes.items():
+        long_dim = max(w, h)
+        short_dim = min(w, h)
+        out[bid] = {"width_m": long_dim, "depth_m": short_dim}
+    return out
+
+
+def read_plan_opening_widths_by_block_id(
+    file_path: Any,
+    units_factor_to_m: float = 0.001,
+    aglaz_sub_layers: Tuple[str, ...] = ("A-GLAZ", "A-GLAZ-SILL", "A-GLAZ-FRAM"),
+) -> Dict[str, float]:
+    """Compat wrapper — retourne `{bid → width_m}` seulement.
+    Préfère `read_plan_opening_dims_by_block_id` pour avoir aussi depth_m.
+    """
+    return {
+        bid: dims["width_m"]
+        for bid, dims in read_plan_opening_dims_by_block_id(
+            file_path, units_factor_to_m, aglaz_sub_layers,
+        ).items()
+    }
+
+
+def read_elevation_opening_dims_by_block_id(
+    file_path: Any,
+    units_factor_to_m: float = 0.001,
+    aglaz_sub_layers: Tuple[str, ...] = ("A-GLAZ", "A-GLAZ-SILL", "A-GLAZ-FRAM"),
+) -> Dict[str, Dict[str, float]]:
+    """Lit un DXF d'**élévation** et retourne `{block_id → {"width_m",
+    "height_m", "sill_local_m", "head_local_m"}}`.
+
+    **Convention** : en élévation, la bbox du bloc A-GLAZ a `bbox_x` =
+    largeur visible (horizontal du cadre) et `bbox_y` = hauteur visible
+    (vertical du cadre). `y_min` local = sill relatif au level
+    d'insertion (l'INSERT est placé à `(x_elev, level_y)` en Revit AIA).
+    `y_max` local = head relatif au level. Utilisé pour cross-validation
+    sill/head ↔ coupe.
+    """
+    bboxes = _extract_aglaz_bbox_per_block(
+        file_path, units_factor_to_m, aglaz_sub_layers,
+    )
+    out: Dict[str, Dict[str, float]] = {}
+    for bid, (bw, bh, y_min, y_max) in bboxes.items():
+        # En élévation, `y_min` du bloc = sill local. Si l'INSERT est
+        # placé à (x_elev, level_y) — convention Revit AIA observée
+        # P7 — alors sill_local = sill relatif au level. `head_local`
+        # = sill + height.
+        out[bid] = {
+            "width_m": bw,
+            "height_m": bh,
+            "sill_local_m": y_min,
+            "head_local_m": y_max,
+        }
+    return out
+
+
+# ----- Ouvertures lues en plan (Phase 2b — source primaire) -------------
+#
+# Convention runtime (user 2026-05-13) : la **localisation** et le
+# **nombre** des fenêtres se dérivent des plans (énumération des INSERT
+# A-GLAZ). Les coupes ne voient que les fenêtres traversées par un cut →
+# couverture partielle. Le plan est exhaustif et donne directement la
+# position 2D + orientation (via le mur traversé).
+#
+# `PlanOpening.position_m` est la coordonnée d'insertion du bloc en
+# **mètres dans le system DXF du plan**. L'origin DXF d'un plan Revit
+# coïncide en général avec l'origin du projet (les murs Phase 2a
+# confirment l'alignement direct). Le caller applique dx/dy si besoin.
+
+
+@dataclass
+class PlanOpening:
+    """Un INSERT A-GLAZ extrait d'un plan DXF.
+
+    `x_dxf_m`/`y_dxf_m` : position d'insertion du bloc en mètres dans le
+    coord system du plan. C'est la **vraie position 2D de la fenêtre**
+    (pas un (0, level_y) comme en coupe).
+    `block_id` : ID Revit partagé avec coupe et élévation (lookup pour
+    sill, height).
+    """
+    block_name: str
+    block_id: Optional[str]
+    x_dxf_m: float
+    y_dxf_m: float
+    rotation_deg: float
+
+
+def read_plan_opening_inserts(entities: List[DwgEntity]) -> List[PlanOpening]:
+    """Extrait les INSERT du layer `A-GLAZ` d'un DXF de **plan**.
+
+    Analogue de `read_section_openings` pour les plans : énumération
+    exhaustive des fenêtres avec position d'insertion 2D directe.
+    """
+    out: List[PlanOpening] = []
+    for e in entities:
+        if e.layer != LAYER_GLAZING or e.kind != "INSERT":
+            continue
+        x, y, _ = e.coords[0]
+        block_name = e.attrs.get("block_name", "")
+        out.append(PlanOpening(
+            block_name=block_name,
+            block_id=parse_block_id(block_name),
+            x_dxf_m=round(x, 6),
+            y_dxf_m=round(y, 6),
+            rotation_deg=float(e.attrs.get("rotation_deg", 0.0)),
+        ))
+    return out
+
+
+# ----- Dalles observées en coupe (Phase 2c — sols) ---------------------
+#
+# Une dalle vue en coupe est délimitée par deux LINEs horizontales sur le
+# layer `A-FLOR` : la face haute (= elevation du niveau qu'elle porte) et
+# la face basse (= elevation - thickness). L'épaisseur typique est 15-40 cm.
+
+
+@dataclass
+class SectionFloorSlab:
+    """Une dalle observée en coupe : face haute, face basse, épaisseur."""
+    top_y_m: float
+    bot_y_m: float
+    thickness_m: float
+    x_min_m: float
+    x_max_m: float
+
+
+def read_section_floor_slabs(
+    entities: List[DwgEntity],
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    horizontal_tol_m: float = 0.005,
+) -> List[SectionFloorSlab]:
+    """Détecte les dalles dans une coupe par appariement de LINEs A-FLOR
+    horizontales (top + bot d'une même dalle).
+
+    Algo :
+    1. Collecter les LINEs A-FLOR horizontales (|y2-y1| < tol).
+    2. Pour chaque paire (line_top, line_bot) telle que :
+       - 0.05 < (top_y - bot_y) < 0.60 (épaisseur plausible),
+       - les abscisses se recouvrent (au moins une partie),
+       garder la paire avec écart vertical minimal.
+    3. Dédoublonner les paires (chaque face haute = 1 seule dalle).
+
+    Args:
+        min_thickness_m / max_thickness_m: bornes plausibles d'épaisseur.
+        horizontal_tol_m: tolérance pour considérer une LINE horizontale.
+
+    Returns:
+        Liste de `SectionFloorSlab` triées par `top_y_m`.
+    """
+    horiz_lines: List[Tuple[float, float, float]] = []  # (y, x_min, x_max)
+    for e in entities:
+        if e.layer != LAYER_FLOORS or e.kind != "LINE":
+            continue
+        (x1, y1, _), (x2, y2, _) = e.coords
+        if abs(y2 - y1) > horizontal_tol_m:
+            continue
+        y = round((y1 + y2) / 2.0, 4)
+        x_min, x_max = (x1, x2) if x1 <= x2 else (x2, x1)
+        horiz_lines.append((y, round(x_min, 4), round(x_max, 4)))
+    horiz_lines.sort(key=lambda l: l[0])
+
+    used_top: Set[int] = set()
+    used_bot: Set[int] = set()
+    slabs: List[SectionFloorSlab] = []
+    # Pour chaque ligne candidate top, chercher la meilleure ligne bot
+    # (= ligne en dessous, dans la fenêtre d'épaisseur plausible, avec
+    # recouvrement horizontal).
+    for ti, (ty, tx_min, tx_max) in enumerate(horiz_lines):
+        if ti in used_top:
+            continue
+        best_bi: Optional[int] = None
+        best_thk: float = float("inf")
+        for bi, (by, bx_min, bx_max) in enumerate(horiz_lines):
+            if bi == ti or bi in used_bot:
+                continue
+            thk = ty - by
+            if thk <= min_thickness_m or thk > max_thickness_m:
+                continue
+            # Recouvrement horizontal ?
+            overlap_min = max(tx_min, bx_min)
+            overlap_max = min(tx_max, bx_max)
+            if overlap_max <= overlap_min:
+                continue
+            if thk < best_thk:
+                best_thk = thk
+                best_bi = bi
+        if best_bi is None:
+            continue
+        used_top.add(ti)
+        used_bot.add(best_bi)
+        by, bx_min, bx_max = horiz_lines[best_bi]
+        slabs.append(SectionFloorSlab(
+            top_y_m=ty,
+            bot_y_m=by,
+            thickness_m=round(best_thk, 4),
+            x_min_m=max(tx_min, bx_min),
+            x_max_m=min(tx_max, bx_max),
+        ))
+    slabs.sort(key=lambda s: s.top_y_m)
+    return slabs
 
 
 # ----- Walls observés en coupe (Phase 2 Étape 1) ------------------------

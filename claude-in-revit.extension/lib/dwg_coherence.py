@@ -727,6 +727,111 @@ class PlansetIntegrityReport:
     files_summary: Dict[str, Any]
 
 
+def check_openings_plan_vs_elevation(
+    plan_block_ids: List[str],
+    elevation_block_ids: List[str],
+    plan_total_inserts: int,
+    elevation_total_inserts: int,
+) -> IntegrityCheck:
+    """Cross-validation comptage + présence par block_id entre plans et
+    élévations (user 2026-05-13).
+
+    Une fenêtre représentée en plan doit aussi apparaître dans au moins
+    une élévation cardinale, et inversement. Le matching positionnel
+    précis est fait en Phase 2b (après création des murs : on a besoin
+    de l'orientation pour savoir quelle élévation est attendue). Phase 1
+    se limite à un check **non positionnel** : présence du `block_id`
+    et écart de comptage.
+
+    Args:
+        plan_block_ids: liste des block_id observés dans **tous** les
+            plans (avec multiplicité — chaque INSERT compte).
+        elevation_block_ids: idem pour les élévations.
+        plan_total_inserts: nb total d'INSERTs A-GLAZ dans les plans.
+        elevation_total_inserts: nb total d'INSERTs A-GLAZ dans les
+            élévations (toutes directions sommées).
+
+    Severity :
+    - `clean` si chaque bid plan est présent en élévation et écart de
+      comptage < 20%.
+    - `warnings` sinon (non bloquant — l'user décide).
+    """
+    plan_set = set(b for b in plan_block_ids if b)
+    elev_set = set(b for b in elevation_block_ids if b)
+    missing_in_elev = sorted(plan_set - elev_set)
+    missing_in_plan = sorted(elev_set - plan_set)
+
+    # Écart de comptage : peut diverger légitimement (1 fenêtre EW visible
+    # dans Nord ET Sud → 2 inserts élév pour 1 plan-opening). On s'attend
+    # à ce que elevation_total ≈ plan_total (chaque fenêtre dans 1 élév
+    # cardinale, sauf cas particuliers). Seuil 20% retenu.
+    count_diff_pct: Optional[float] = None
+    if plan_total_inserts > 0:
+        count_diff_pct = round(
+            abs(elevation_total_inserts - plan_total_inserts)
+            / plan_total_inserts * 100.0,
+            1,
+        )
+
+    issues: List[Dict[str, Any]] = []
+    if missing_in_elev:
+        issues.append({
+            "kind": "block_ids_missing_in_elevation",
+            "block_ids": missing_in_elev,
+            "message": (
+                "{} block_id(s) présent(s) en plan mais absent(s) des "
+                "élévations : {}. Fenêtres potentiellement orientées vers "
+                "une face non documentée par une élévation.".format(
+                    len(missing_in_elev), ", ".join(missing_in_elev)[:200],
+                )
+            ),
+        })
+    if missing_in_plan:
+        issues.append({
+            "kind": "block_ids_missing_in_plan",
+            "block_ids": missing_in_plan,
+            "message": (
+                "{} block_id(s) présent(s) en élévation mais absent(s) "
+                "des plans : {}. Soit fenêtres dessinées en élévation "
+                "mais oubliées en plan, soit fenêtres d'un niveau "
+                "non-exporté.".format(
+                    len(missing_in_plan), ", ".join(missing_in_plan)[:200],
+                )
+            ),
+        })
+    if count_diff_pct is not None and count_diff_pct >= 20.0:
+        issues.append({
+            "kind": "opening_count_divergence",
+            "plan_total": plan_total_inserts,
+            "elevation_total": elevation_total_inserts,
+            "diff_pct": count_diff_pct,
+            "message": (
+                "Plan: {} INSERT(s) A-GLAZ, Élévations cumulées: {} → "
+                "écart {}% (seuil warning 20%). Investigation conseillée "
+                "avant de créer les fenêtres.".format(
+                    plan_total_inserts, elevation_total_inserts,
+                    count_diff_pct,
+                )
+            ),
+        })
+
+    severity = "warnings" if issues else "clean"
+    return IntegrityCheck(
+        name="openings_plan_vs_elevation",
+        severity=severity,
+        summary={
+            "plan_total_inserts": plan_total_inserts,
+            "elevation_total_inserts": elevation_total_inserts,
+            "count_diff_pct": count_diff_pct,
+            "plan_block_ids_unique": len(plan_set),
+            "elevation_block_ids_unique": len(elev_set),
+            "missing_in_elevation_count": len(missing_in_elev),
+            "missing_in_plan_count": len(missing_in_plan),
+        },
+        issues=issues,
+    )
+
+
 def aggregate_planset_integrity(
     checks: List[IntegrityCheck],
     files_summary: Dict[str, Any],
