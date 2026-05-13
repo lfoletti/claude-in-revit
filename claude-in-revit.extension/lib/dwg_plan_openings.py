@@ -847,22 +847,39 @@ def filter_walls_via_elevation_vote(
         all_abstain = all(v.answer is None for v in votes)
         any_no = any(v.answer is False for v in votes)
 
-        if has_yes_confident or all_abstain:
+        # Critère V3.2 (prudent — runtime P7 session t a montré que le
+        # vote élévation seul ne discrimine pas suffisamment vrais murs
+        # extérieurs sans fenêtre vs faux positifs. Une suppression
+        # automatique causait des régressions sévères sur les façades
+        # sans détails. On revient au critère laxiste : ne supprime que
+        # si tous votes sont no/abstain mixed (aucun yes même faible).
+        # Cas wall_161/166 P7 : conf=0.3 = yes faible → garde par
+        # défaut. User supprime manuellement via llm_id visible Revit).
+        if has_yes_confident:
             kept.append(w)
             continue
-        if any_no:
-            removed.append({
-                "wall_p1": list(w.p1),
-                "wall_p2": list(w.p2),
-                "thickness_m": round(w.thickness, 4),
-                "votes": [
-                    {"source": v.source, "answer": v.answer,
-                     "confidence": round(v.confidence, 3)}
-                    for v in votes
-                ],
-            })
+        if all_abstain:
+            kept.append(w)
             continue
-        kept.append(w)
+        # Au moins un yes faible OR au moins un no, et pas de yes
+        # confident : laisse passer en V3.2 (trop d'incertitude pour
+        # arbitrer automatiquement). À renforcer avec d'autres signaux
+        # (cohérence multi-niveaux, vote coupes, etc.) en V3.4.
+        has_any_yes = any(v.answer is True for v in votes)
+        if has_any_yes:
+            kept.append(w)
+            continue
+        # Tous votes sont no (aucun yes même faible) → faux positif probable.
+        removed.append({
+            "wall_p1": list(w.p1),
+            "wall_p2": list(w.p2),
+            "thickness_m": round(w.thickness, 4),
+            "votes": [
+                {"source": v.source, "answer": v.answer,
+                 "confidence": round(v.confidence, 3)}
+                for v in votes
+            ],
+        })
     return kept, removed
 
 
