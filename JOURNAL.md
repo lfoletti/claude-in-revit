@@ -14,6 +14,92 @@
 
 ---
 
+## 2026-05-13 (session q) — Lever l'interruption Phase 1 → Phase 2 dans le prompt système
+
+### Contexte & objectif
+
+User signale runtime sur P7 : « aucun mur créé ». Phase 1 complète
+(audit + setup + 3D), mais l'agent S'ARRÊTE et propose à l'user de
+« relancer pour Phase 2 », au lieu d'enchaîner directement.
+
+User : « as-tu levé l'interruption du pipeline ? » → moi : interprété
+à tort comme une question sur le hard-gate côté code. Rectifié :
+l'« interruption » désigne la non-continuité Phase 1 → Phase 2 dans
+le même tour de conversation.
+
+### Cause racine
+
+Le prompt système (`prompt.pushbutton/script.py` ligne 374 avant fix)
+contenait une instruction explicite **« IMPORT PROJET — STOP après
+Phase 1 (setup uniquement) ... NE CRÉE PAS DE MURS ... propose qu'il
+prompte à nouveau pour Phase 2 »**. Cette instruction date de session
+m (quand Phase 2 n'était pas encore livrée). Les sessions o (audit) et
+p (extract + types + import_typed[_many]) ont livré les tools Phase 2
+mais **n'ont pas mis à jour le prompt système** — donc l'agent suit
+fidèlement la consigne et stoppe.
+
+### Fix
+
+Réécriture du bloc IMPORT PROJET dans `_STATIC_SYSTEM_PROMPT`. Nouveau
+flow explicite :
+
+```
+1. check_planset_integrity(directory)         ← gate
+   ├─ gate=abort       → stoppe, présente errors à l'user
+   ├─ gate=needs_user  → ui_confirm_yes_no warnings, puis continue
+   └─ gate=pass        → enchaîne directement
+2. Phase 1 : inspect + traits + levels reconcile (dialog GROUPÉ) +
+   views_create_section_many + views_link_cad_many (tous DXF) +
+   dxf_context_register_*_many
+3. Phase 2 : dwg_extract_wall_thicknesses_many (info pour résumé) +
+   dwg_import_walls_typed_many (1 appel pour tous les plans)
+4. views_open_3d + résumé consolidé
+```
+
+Points-clés du nouveau prompt :
+- **Gate explicite** avec 3 branches selon `gate_status`.
+- **Pas de confirmation préalable sur la distribution d'épaisseurs**
+  (Phase 2 enchaîne directement — l'user a déjà demandé l'import).
+- **Bulks obligatoires** listés explicitement (économies tokens).
+- **Exception niveaux** maintenue (dialog GROUPÉ après
+  `levels_reconcile_with_dxf`).
+- L'instruction « propose qu'il prompte à nouveau pour Phase 2 » a
+  disparu.
+
+### Validation
+
+**564 tests verts** (pas de régression — le prompt système n'est pas
+testé directement). À valider runtime sur P7 :
+
+- Prompt « importe ce projet C:\... » devrait enchaîner Phase 1
+  complète + Phase 2 (murs N0 + N1 + types DXF_WALL_*cm) dans un
+  seul tour.
+- Si l'user veut explicitement stopper après Phase 1 (« inspecte
+  seulement »), le wording le permet — c'est l'INTENT user qui dicte,
+  pas une consigne hardcodée.
+
+### Reste à faire / dette ouverte
+
+- **Hard-gate code-side** : actuellement soft (basé sur compliance
+  LLM avec `ok=False`). Pour un vrai blocage côté code, il faudrait
+  persister `gate_status` dans le `DxfImportContext` + helper
+  `_assert_dxf_gate_open(kg)` à brancher dans les tools mutants +
+  tool `dxf_gate_release(reason)`. Pas urgent vu que le soft suffit
+  en pratique (LLM bien instruit respecte `ok=False`). À refaire si
+  un incident runtime se produit.
+
+### Méta : leçon de session
+
+**Prompt système et tools livrent ensemble**. Quand on livre un
+nouveau scope fonctionnel (ici Phase 2), il faut mettre à jour
+**à la fois** les tools ET le prompt système qui les orchestre.
+Sinon les tools sont disponibles mais inertes — c'est exactement ce
+qui s'est passé runtime. Ajout à la checklist mentale : « est-ce
+que le prompt système connaît mes nouveaux tools ? est-ce qu'il
+dit à l'agent quand les utiliser ? ».
+
+---
+
 ## 2026-05-13 (session p) — Phase 2 étapes 2-4 : extract + types custom + import typed
 
 ### Contexte & objectif
