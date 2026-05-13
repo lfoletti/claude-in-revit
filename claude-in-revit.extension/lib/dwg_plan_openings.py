@@ -782,6 +782,66 @@ def merge_fragments_via_elevation_vote(
     return current, events
 
 
+# ----- V3.10 — Cohérence multi-niveaux --------------------------------
+
+
+def has_equivalent_wall_at_other_level(
+    wall: Any,
+    walls_other_levels: List[Any],
+    *,
+    perp_tol_m: float = 0.30,
+    angle_tol_rad: float = math.radians(3.0),
+    min_overlap_m: float = 0.50,
+) -> bool:
+    """Vérifie si un mur a un équivalent à un autre niveau (= même ligne
+    portante + overlap projeté ≥ min_overlap_m).
+
+    Use case : sur P7, les faux positifs identifiés (wall_180/181 N1)
+    n'existent qu'au N1 (zone spécifique N1, pas d'équivalent N0). Les
+    vrais murs intérieurs N1 ont typiquement un équivalent N0. Cette
+    fonction permet au filter de garder les murs avec cohérence multi-
+    niveaux malgré un vote élévation no.
+
+    Args:
+        wall: mur à tester (p1, p2, thickness).
+        walls_other_levels: liste des murs des autres niveaux à comparer.
+        perp_tol_m: tolérance perpendiculaire (défaut 30cm).
+        angle_tol_rad: tolérance d'angle (défaut 3°).
+        min_overlap_m: overlap min sur la ligne pour considérer un
+            équivalent (défaut 50cm).
+
+    Returns:
+        True si un wall des autres niveaux est sur la même ligne avec
+        overlap suffisant.
+    """
+    if not walls_other_levels:
+        return False
+    wall_angle = _angle_mod_pi(wall.p1, wall.p2)
+    wall_length = math.sqrt(
+        (wall.p2[0] - wall.p1[0]) ** 2 + (wall.p2[1] - wall.p1[1]) ** 2
+    )
+    if wall_length < 1e-6:
+        return False
+    for w_other in walls_other_levels:
+        # Same angle ?
+        a_other = _angle_mod_pi(w_other.p1, w_other.p2)
+        if not _angles_close(wall_angle, a_other, angle_tol_rad):
+            continue
+        # Same supporting line ? (perp distance from w_other.p1 to wall's line)
+        perp = _perp_distance_point_to_line(w_other.p1, wall.p1, wall.p2)
+        if perp > perp_tol_m:
+            continue
+        # Overlap projeté sur wall's line.
+        t1 = _project_param(w_other.p1, wall.p1, wall.p2) * wall_length
+        t2 = _project_param(w_other.p2, wall.p1, wall.p2) * wall_length
+        t_lo = max(0.0, min(t1, t2))
+        t_hi = min(wall_length, max(t1, t2))
+        overlap = max(0.0, t_hi - t_lo)
+        if overlap >= min_overlap_m:
+            return True
+    return False
+
+
 # ----- V3.1 — Filtre faux positifs murs via vote élévation -----------
 
 

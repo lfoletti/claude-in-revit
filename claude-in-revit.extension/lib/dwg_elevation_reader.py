@@ -238,10 +238,15 @@ def vote_wall_visible_in_elevation(
     # Cherche des A-WALL lines dans la zone projetée. **Exclure** les
     # lignes horizontales alignées avec les niveaux (= dalles).
     level_tol_m = 0.10
+    edge_dist_m = 0.50  # V3.10 : une verticale est « médiane » si elle
+                       # est à ≥ 50cm des 2 bords du x_range. Sinon =
+                       # bord de silhouette (coin du bâtiment), pas un
+                       # mur à l'intérieur.
     overlap_h = 0.0
     overlap_v = 0.0
     h_lines_count = 0
     v_lines_count = 0
+    v_lines_centered = 0
     for line in elevation.a_wall_lines:
         x_l, x_r = sorted((line.p1[0], line.p2[0]))
         y_l, y_h = sorted((line.p1[1], line.p2[1]))
@@ -267,23 +272,28 @@ def vote_wall_visible_in_elevation(
                 if ov_v > 0:
                     overlap_v += ov_v
                     v_lines_count += 1
+                    # V3.10 : médiane si à >= edge_dist_m des 2 bords.
+                    dist_from_min = x_v - x_min_w
+                    dist_from_max = x_max_w - x_v
+                    if min(dist_from_min, dist_from_max) >= edge_dist_m:
+                        v_lines_centered += 1
 
     evidence = {
         "wall_x_range": [round(x_min_w, 3), round(x_max_w, 3)],
         "wall_y_range": [round(y_min_w, 3), round(y_max_w, 3)],
         "h_lines_count": h_lines_count,
         "v_lines_count": v_lines_count,
+        "v_lines_centered": v_lines_centered,
         "overlap_h_m": round(overlap_h, 3),
         "overlap_v_m": round(overlap_v, 3),
         "profile_view": profile_view,
     }
 
-    # V3.8 final : critère unifié simple. Tentatives V3.7/V3.9 (critère
-    # face strict `v>=2 OR oh>=min`) régressent sur P7 (11/19 vrais
-    # murs supprimés à tort). Les vrais murs intérieurs ou extérieurs
-    # vus de l'arrière ont souvent juste 1 verticale isolée → critère
-    # strict les exclut indûment. Garde le critère permissif (overlap
-    # quelconque >= seuil) ; le filter auto reste désactivé côté tool.
+    # Critère V3.8 final permissif (overlap quelconque suffit) car les
+    # critères plus stricts (V3.7/V3.9/V3.10) casent les fusions et
+    # régressent sur P7 sans pour autant filtrer correctement les 3 FP
+    # restants. Le filter côté tool reste désactivé ; suspects flagués
+    # via score 3D consensus.
     if overlap_h >= min_overlap_m or overlap_v >= min_overlap_m:
         # Confidence proportional to combined overlap, capped at 1.0.
         wall_length = math.sqrt(

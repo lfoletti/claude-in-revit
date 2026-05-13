@@ -3226,14 +3226,10 @@ def create_continuous_walls_many(
         total_fusion_events += len(events)
         fusion_events_detail.extend(events)
 
-    # --- 3bis. Filter auto DÉSACTIVÉ (V3.8 final) ---------------------
-    # Toutes les tentatives V3.1 → V3.9 de filter automatique des
-    # faux positifs causent des régressions sur P7. Le signal élévation
-    # seul ne discrimine pas faux positif d'un vrai mur intérieur ou
-    # extérieur vu de l'arrière. Filter désactivé ; suspects flagués
-    # via le score 3D plus bas pour suppression manuelle par l'user
-    # via llm_id visible Revit. V4 TODO : multi-signaux (cohérence
-    # multi-niveaux, intersections, etc.).
+    # --- 3bis. Filter auto DÉSACTIVÉ (final après 11 tentatives) ------
+    # Voir commit final V3.8 : pas de critère discriminant fiable sans
+    # multi-signaux (cohérence multi-niveaux, etc.). Suspects flagués
+    # via score 3D consensus plus bas.
     total_walls_filtered = 0
     filtered_walls_detail: List[Dict[str, Any]] = []
 
