@@ -422,14 +422,22 @@ def _create_dxf_opening_type_kg_only(
     kg: ProjectKG, kind: str, target_name: str,
     width_m: float, height_m: float,
 ) -> str:
-    """KG-only path : crée le node FamilyType avec attrs."""
+    """KG-only path : crée le node FamilyType avec attrs.
+
+    Le schema `FamilyType` accepte `family_name`, `type_name`,
+    `category` (required) et `dimensions` (optional dict). On stocke
+    width/height dans `dimensions` plutôt qu'en attrs top-level (qui
+    auraient été rejetés par le schema strict).
+    """
     category = "Windows" if kind == "window" else "Doors"
     return kg.add_node("FamilyType", {
         "family_name": "DXF Generic " + ("Window" if kind == "window" else "Door"),
         "type_name": target_name,
         "category": category,
-        "width_m": float(width_m),
-        "height_m": float(height_m),
+        "dimensions": {
+            "width_m": float(width_m),
+            "height_m": float(height_m),
+        },
     })
 
 
@@ -486,10 +494,11 @@ def get_or_create_dxf_opening_type(
         kg, doc, existing,
     ):
         node = kg.get_node(existing)
+        dims = node.get("dimensions") or {}
         return {
             "ok": True, "llm_id": existing, "name": target_name, "kind": kind,
-            "width_m": float(node.get("width_m", bucketed_w_m)),
-            "height_m": float(node.get("height_m", bucketed_h_m)),
+            "width_m": float(dims.get("width_m", bucketed_w_m)),
+            "height_m": float(dims.get("height_m", bucketed_h_m)),
             "created": False,
             "revit_id": kg.get_revit_id(existing),
         }
