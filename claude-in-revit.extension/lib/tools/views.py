@@ -279,17 +279,22 @@ def link_cad(
             except AttributeError:
                 link_revit_id = int(out_id)
 
-        # **Fix runtime 2026-05-13 (3D screenshot)** : avec
+        # **Fix runtime 2026-05-13 (3D screenshots itérés)** : avec
         # `ImportPlacement.Origin`, Revit ancre le DXF à world (0,0,0).
-        # Pour une vue Section où l'Origin est ailleurs (cut plane à
+        # Pour une ViewSection où l'Origin est ailleurs (cut plane à
         # world X=5.25 par ex.), le DXF se retrouve décalé. On le
         # translate par view.Origin pour qu'il aligne sur le cut plane
-        # exactement. NB : seulement pour les ViewSection — pour un
-        # plan d'étage, world (0,0,0) est déjà le bon endroit.
+        # exactement.
+        #
+        # **Avec `OrientToView=True`**, Revit auto-épingle le link
+        # (`Pinned=True`). Il faut le dépingler avant le move, sinon
+        # `MoveElement` lève « impossible de déplacer l'élément
+        # verrouillé ». On le laisse dépinglé après — le user peut
+        # re-pingler manuel si besoin (ou ajouter `restore_pinned`
+        # plus tard).
         from Autodesk.Revit.DB import (
             ElementId as _EID,
             ElementTransformUtils,
-            View,
             ViewSection,
         )
         if (
@@ -304,17 +309,17 @@ def link_cad(
                 or abs(origin.Z) > 1e-9
             ):
                 try:
-                    # out_id peut être ElementId ou un objet plus
-                    # complexe — on extrait l'ElementId proprement.
-                    target_eid = out_id if hasattr(out_id, "IntegerValue") or hasattr(out_id, "Value") else _EID(int(out_id))
-                    if not isinstance(target_eid, _EID):
-                        target_eid = _EID(int(link_revit_id))
+                    target_eid = out_id if isinstance(out_id, _EID) else _EID(int(link_revit_id))
+                    # Unpin before move (OrientToView auto-pins).
+                    instance = doc.GetElement(target_eid)
+                    if instance is not None and getattr(instance, "Pinned", False):
+                        instance.Pinned = False
                     ElementTransformUtils.MoveElement(doc, target_eid, origin)
                     aligned_to_view_origin = True
-                except Exception as e:  # noqa: BLE001
-                    # Si le move échoue, on garde le DXF tel qu'il est.
-                    # Le link existe, c'est juste son alignement qui
-                    # peut être à corriger manuellement.
+                except Exception:  # noqa: BLE001
+                    # Si le move échoue malgré l'unpin (cas exotique),
+                    # le link reste posé mais sans alignement — user
+                    # peut corriger manuel via UI Revit.
                     aligned_to_view_origin = False
 
     return {
