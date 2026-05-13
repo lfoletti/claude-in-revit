@@ -14,6 +14,105 @@
 
 ---
 
+## 2026-05-13 (session k) — Dette pair detection réglée : endpoint adjacency + length ratio
+
+### Contexte & objectif
+
+Suite directe session j. Attaque de la dette pair detection
+identifiée : faux pair entre cloison simple-trait fragmentée et mur
+isolé parallèle (cas Projet4 — fragment 4.81m face à mur 19.80m
+parallèle à 0.20m).
+
+### Décisions
+
+1. **Contrainte topologique : adjacence d'endpoints.** Une vraie paire
+   de faces de mur a au moins 1 endpoint joint perpendiculairement
+   par un épaulement (coin). Une « paire » fortuite entre 2 cloisons
+   distinctes a tous ses endpoints éloignés. Critère :
+   `_min_endpoint_distance(s_i, s_j) <= max_thickness_m × 2`.
+
+2. **Insuffisant à lui seul** sur le cas Projet4 : les 2 segments
+   partagent par coïncidence un endpoint au coin du bâtiment (y=9.90).
+   Distance 0.20m → passe le critère endpoint.
+
+3. **Ajout critère ratio de longueur.** Une vraie paire de faces a des
+   longueurs similaires (à fragmentation près). Critère :
+   `max(L_i, L_j) <= max_length_ratio × min(L_i, L_j)`, défaut
+   `max_length_ratio=4`.
+
+   Sur Projet4 : 19.80 / 4.81 = 4.11 > 4 → faux pair rejeté. ✓
+   Sur façades fragmentées : segments de longueur similaire (ratio ≈ 1)
+   → match. ✓
+   Sur T-jonction limite (face courte 5m + face longue 10m, ratio 2)
+   → match. ✓
+   Sur faux pair Projet4-style (ratio > 4) → rejet.
+
+4. **Flags configurables** : `require_endpoint_adjacency=True` et
+   `max_length_ratio=4.0` sur `detect_wall_segments`. Désactivables
+   pour les cas atypiques où l'utilisateur sait que sa géométrie
+   sort des conventions.
+
+### Résultat sur Projet4
+
+Avant fix (session j v2) :
+- 29 pairs (dont 1 faux à centerline x=3.80, partie haute de la
+  cloison).
+- 3 centerlines (dont 1 vrai résidu de cloison 7.49m + 2 chambranles
+  faux positifs).
+- **Visuellement** : la cloison apparaissait fragmentée en 2 walls
+  décalés de 10cm en x (3.80 vs 3.70).
+
+Après fix (session k) :
+- **28 pairs** (1 faux pair éliminé).
+- **6 centerlines** :
+  - **3 segments alignés à x=3.70** : 4.81 + 7.80 + 6.79 = 19.40m, la
+    vraie cloison interne en 3 morceaux séparés par des portes
+    (gaps > 0.20m donc pas fusionnés). **Plus de décalage 10cm.** ✓
+  - **1 mur séparé à x=3.90** (19.80m) : ancien membre du faux pair,
+    maintenant traité comme centerline isolé.
+  - 2 trumeaux à x=10 et x=0 (faux positifs persistants comme avant
+    — chambranles biais).
+
+Total 34 walls (vs 32 avant). Le mur à x=3.90 est désormais correctement
+traité comme un mur isolé (probablement une face d'un mur structurel
+sans paire dans le DXF).
+
+### Tests
+
+2 nouveaux tests dans `tests/test_dwg.py` :
+- **`test_pair_detection_rejects_endpoint_distant_false_pair`** : exact
+  reproduction du cas Projet4 (4.81m face à 19.80m, ratio 4.11) →
+  refus, 2 segments orphelins.
+- **`test_pair_detection_accepts_similar_length_aligned_faces`** :
+  vraie paire (2 segments de 5m, perp 0.20m, endpoints alignés) →
+  match.
+
+### Validation
+
+- `pytest -q` : **353 verts** (351 → +2). Aucune régression sur la
+  suite synthétique (fixtures `_make_rectangle_room_dxf` avec paires
+  de longueurs identiques → ratio 1 → pass).
+- Runtime à valider à la prochaine session côté Revit (re-import
+  Projet4 DXF pour confirmer visuellement).
+
+### Acquis session k
+
+- Critère endpoint adjacency ✓
+- Critère length ratio ✓
+- Test ciblé du cas Projet4 ✓
+- **Dette pair detection greedy réglée** pour les cas typiques ✓
+
+### Dettes restantes
+
+- **Chambranles biais aux fenêtres** (faux positifs 1.20m sur façades) :
+  pas fixé. Heuristique angle-strict (tol 2°) ne les distingue pas
+  des cloisons légères. Workaround user : delete_many.
+- Plus large : reste les dettes héritées (routing tier-2 propre,
+  get_element_or_raise étendu, drift utilisateur, boundary_walls,
+  connects_at, catalog_list_views).
+
+---
+
 ## 2026-05-13 (session j) — Runtime UC1 DWG suite : centerline subtraction, 529 retry, dette pair detection
 
 ### Contexte & objectif

@@ -253,6 +253,30 @@ def _overlap_along_reference(s_ref: Segment, s_other: Segment) -> Tuple[float, f
     return overlap, min(ratio, 1.0)
 
 
+def _min_endpoint_distance(s_a: Segment, s_b: Segment) -> float:
+    """Minimum euclidean distance entre les 4 endpoints possibles
+    (s_a.p1 ↔ s_b.p1, s_a.p1 ↔ s_b.p2, s_a.p2 ↔ s_b.p1, s_a.p2 ↔ s_b.p2).
+
+    Critère **topologique** pour valider une vraie paire de faces de
+    mur : les 2 faces d'un mur ont leurs extrémités jointes par des
+    perpendiculaires (épaulements / chambranles), donc au moins
+    1 endpoint de l'une est proche d'1 endpoint de l'autre. Une
+    « paire » fortuite entre 2 cloisons distinctes parallèles (cas
+    cloison simple-trait + mur isolé du DXF Projet4 2026-05-13) a
+    des endpoints très éloignés → filtrable.
+    """
+    candidates = [
+        (s_a.p1, s_b.p1), (s_a.p1, s_b.p2),
+        (s_a.p2, s_b.p1), (s_a.p2, s_b.p2),
+    ]
+    best = float("inf")
+    for a, b in candidates:
+        d = math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+        if d < best:
+            best = d
+    return best
+
+
 def detect_wall_segments(
     segments: List[Segment],
     *,
@@ -260,6 +284,8 @@ def detect_wall_segments(
     max_thickness_m: float = 0.50,
     angle_tol_rad: float = math.radians(2.0),
     min_overlap_ratio: float = 0.5,
+    require_endpoint_adjacency: bool = True,
+    max_length_ratio: float = 4.0,
 ) -> Tuple[List[WallCandidate], List[Dict[str, Any]]]:
     """Détecte les paires de lignes parallèles → wall segments.
 
@@ -271,7 +297,14 @@ def detect_wall_segments(
        - angles parallèles (mod π) à `angle_tol_rad` près ;
        - distance perpendiculaire du milieu de j à la droite de i dans
          `[min_thickness_m, max_thickness_m]` ;
-       - overlap projeté ≥ `min_overlap_ratio` du segment court.
+       - overlap projeté ≥ `min_overlap_ratio` du segment court ;
+       - **adjacence d'endpoints** : au moins 1 endpoint de i à <
+         `max_thickness_m × 2` d'un endpoint de j (contrainte
+         topologique d'une vraie paire de faces de mur ; rejette les
+         « paires » fortuites entre cloison simple-trait et mur isolé
+         parallèle — fix Projet4 2026-05-13 / session j dette).
+         Désactivable via `require_endpoint_adjacency=False` pour les
+         cas atypiques.
     2. Si oui → synthétiser un WallCandidate :
        - centerline = projection du milieu de la paire sur la bissectrice
          des deux segments (en pratique : milieu des points appariés).
@@ -288,6 +321,7 @@ def detect_wall_segments(
     used: List[bool] = [False] * len(segments)
     walls: List[WallCandidate] = []
     angles = [_segment_angle_normalized(s) for s in segments]
+    endpoint_threshold = max_thickness_m * 2.0
 
     for i in range(len(segments)):
         if used[i]:
@@ -308,6 +342,24 @@ def detect_wall_segments(
             _, ratio = _overlap_along_reference(s_i, s_j)
             if ratio < min_overlap_ratio:
                 continue
+            if require_endpoint_adjacency:
+                # Contrainte topologique : une vraie paire de faces de
+                # mur a au moins 1 endpoint joint perpendiculairement.
+                # Distance attendue ≈ thickness ; on tolère jusqu'à
+                # `2 × max_thickness_m` pour les jonctions en T / L
+                # légèrement décalées.
+                if _min_endpoint_distance(s_i, s_j) > endpoint_threshold:
+                    continue
+                # Contrainte de longueur : une vraie paire de faces a
+                # des longueurs similaires (à fragmentation près). Une
+                # « paire » entre une face courte et un mur entier
+                # parallèle isolé (Projet4 2026-05-13 : fragment 4.81m
+                # face à mur 19.80m, ratio 4.1) est probablement
+                # fortuite — refusée si ratio > max_length_ratio.
+                L_i = _segment_length(s_i)
+                L_j = _segment_length(s_j)
+                if max(L_i, L_j) > max_length_ratio * min(L_i, L_j):
+                    continue
 
             # Pair retenue. Synthèse centerline = milieux appariés.
             # On apparie p1↔p1' et p2↔p2' par proximité projective pour

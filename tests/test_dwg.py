@@ -262,6 +262,40 @@ def test_detect_wall_pair_different_layers_no_match():
     assert len(walls) == 0
 
 
+def test_pair_detection_rejects_endpoint_distant_false_pair():
+    """Fix dette session j : 2 segments parallèles à 0.20m (= thickness
+    plausible) mais aux endpoints très éloignés (= structure
+    architecturale distincte) NE doivent PAS être appariés.
+
+    Cas Projet4 : un fragment de cloison simple-trait (4.81m, x=3.70)
+    apparié faussement avec un mur isolé parallèle (19.80m, x=3.90).
+    Le critère endpoint adjacency + length ratio < 4 rejette la
+    fausse paire."""
+    segments = [
+        # Fragment court à x=3.70.
+        Segment(p1=(3.70, 5.09), p2=(3.70, 9.90), layer="WALL"),
+        # Mur entier à x=3.90, 19.80m de long, partageant seulement
+        # un endpoint au coin (y=9.90).
+        Segment(p1=(3.90, -9.90), p2=(3.90, 9.90), layer="WALL"),
+    ]
+    walls, rejected = detect_wall_segments(segments)
+    # Le critère length_ratio < 4 rejette : 19.80 / 4.81 = 4.1 > 4.
+    assert len(walls) == 0
+    assert len(rejected) == 2
+
+
+def test_pair_detection_accepts_similar_length_aligned_faces():
+    """Vraie paire de faces : longueurs similaires + endpoints alignés
+    aux 2 extrémités → match."""
+    segments = [
+        Segment(p1=(0.0, 0.0), p2=(0.0, 5.0), layer="WALL"),
+        Segment(p1=(0.20, 0.0), p2=(0.20, 5.0), layer="WALL"),
+    ]
+    walls, rejected = detect_wall_segments(segments)
+    assert len(walls) == 1
+    assert math.isclose(walls[0].thickness, 0.20, abs_tol=1e-9)
+
+
 def test_detect_full_orthogonal_room(tmp_path):
     """Pièce rect 4 murs → 4 WallCandidate après extraction + détection."""
     path = _make_rectangle_room_dxf(tmp_path)
