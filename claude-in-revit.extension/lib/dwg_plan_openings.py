@@ -637,6 +637,196 @@ def merge_fragments_around_opening(
     return walls, None
 
 
+# ----- V2.1 — Fusion collinéaires (post-classify, pré-pipeline) -------
+
+
+def merge_collinear_walls(
+    walls: List[Any],
+    *,
+    max_gap_m: float = 0.50,
+    angle_tol_rad: float = math.radians(3.0),
+    thickness_tol_m: float = 0.03,
+    perp_tol_m: float = 0.05,
+) -> List[Any]:
+    """Fusionne les `WallCandidate` collinéaires adjacents (gap ≤
+    `max_gap_m`, même thickness ± tol, même ligne portante).
+
+    Use case : sur P7 le classifier détecte 26 paires mais beaucoup
+    sont des fragments du même mur réel séparés par une petite
+    interruption (porte intérieure sans INSERT A-GLAZ, joint de
+    matériau, gap visuel). Résultat 3D : murs hachés. Cette fonction
+    reconstruit les murs continus en fusionnant les fragments collinéaires.
+
+    Pour chaque paire (i, j) de walls, vérifie :
+    - même angle modulo π (tolérance `angle_tol_rad`),
+    - même perpendiculaire à l'origine (mêmes ligne portante,
+      tolérance `perp_tol_m`),
+    - même thickness (tolérance `thickness_tol_m`),
+    - gap entre endpoints faisant face ≤ `max_gap_m`.
+
+    Si OK → remplace les 2 walls par 1 wall continu (endpoints
+    extrêmes). Itère jusqu'à stabilité.
+
+    Args:
+        walls: liste de `WallCandidate` (ou MergedWall, duck-typed).
+        max_gap_m: gap max pour fusion (défaut 50cm — absorbe portes
+            intérieures + joints sans devenir trop laxiste).
+        angle_tol_rad / thickness_tol_m / perp_tol_m: tolérances.
+
+    Returns:
+        Nouvelle liste de walls (peut être plus courte si fusions).
+    """
+    current = list(walls)
+    while True:
+        n = len(current)
+        merged_any = False
+        for i in range(n):
+            if merged_any:
+                break
+            w_i = current[i]
+            angle_i = _angle_mod_pi(w_i.p1, w_i.p2)
+            for j in range(i + 1, n):
+                w_j = current[j]
+                # Same thickness ?
+                if abs(w_i.thickness - w_j.thickness) > thickness_tol_m:
+                    continue
+                # Same layer ?
+                if getattr(w_i, "layer", None) != getattr(w_j, "layer", None):
+                    continue
+                # Same angle ?
+                angle_j = _angle_mod_pi(w_j.p1, w_j.p2)
+                if not _angles_close(angle_i, angle_j, angle_tol_rad):
+                    continue
+                # Same supporting line ? Check perp distance from w_j.p1
+                # to w_i's centerline.
+                perp = _perp_distance_point_to_line(w_j.p1, w_i.p1, w_i.p2)
+                if perp > perp_tol_m:
+                    continue
+                # Project the 4 endpoints on w_i's line, sort by t.
+                endpoints = [w_i.p1, w_i.p2, w_j.p1, w_j.p2]
+                params = [_project_param(e, w_i.p1, w_i.p2) for e in endpoints]
+                pair = sorted(zip(params, endpoints), key=lambda x: x[0])
+                t_sorted = [p[0] for p in pair]
+                e_sorted = [p[1] for p in pair]
+                # Gap entre endpoints du milieu = (t_sorted[2] - t_sorted[1])
+                # × ||w_i||.
+                wi_len = math.sqrt(
+                    (w_i.p2[0] - w_i.p1[0]) ** 2
+                    + (w_i.p2[1] - w_i.p1[1]) ** 2
+                )
+                gap = max(0.0, t_sorted[2] - t_sorted[1]) * wi_len
+                if gap > max_gap_m:
+                    continue
+                # OK fusion : new endpoints = e_sorted[0] et e_sorted[-1].
+                merged_wall = MergedWall(
+                    p1=e_sorted[0],
+                    p2=e_sorted[-1],
+                    thickness=(w_i.thickness + w_j.thickness) / 2.0,
+                    layer=w_i.layer,
+                    confidence=min(
+                        getattr(w_i, "confidence", 1.0),
+                        getattr(w_j, "confidence", 1.0),
+                    ),
+                    source_indices=(
+                        list(getattr(w_i, "source_indices", []))
+                        + list(getattr(w_j, "source_indices", []))
+                        or [i, j]
+                    ),
+                )
+                new_current = [w for k, w in enumerate(current) if k != i and k != j]
+                new_current.append(merged_wall)
+                current = new_current
+                merged_any = True
+                break
+        if not merged_any:
+            break
+    return current
+
+
+# ----- V2.1 — Snap mur virtuel vers murs voisins -----------------------
+
+
+def snap_virtual_wall_to_neighbors(
+    virtual: Dict[str, Any],
+    walls: List[Any],
+    *,
+    max_snap_m: float = 5.0,
+    angle_tol_rad: float = math.radians(5.0),
+    perp_tol_m: float = 0.30,
+) -> Dict[str, Any]:
+    """Étend les endpoints d'un mur virtuel pour rejoindre les murs
+    adjacents collinéaires.
+
+    Use case : `build_virtual_wall_hypothesis` produit un mur de 2.5m
+    isolé. Visuellement → mur flottant en 3D. Si des murs réels sont
+    collinéaires et proches, on snap les endpoints vers leur extrémité
+    la plus proche → mur visuellement raccordé.
+
+    Pour chaque endpoint du virtual, cherche un mur collinéaire dont
+    un endpoint est dans le prolongement à ≤ `max_snap_m`. Si trouvé,
+    remplace l'endpoint du virtual par celui du voisin.
+
+    Args:
+        virtual: dict `{p1, p2, thickness, layer, confidence}` (cf.
+            `build_virtual_wall_hypothesis`).
+        walls: liste de walls réels du plan.
+        max_snap_m: distance max pour snap (défaut 5m).
+        angle_tol_rad / perp_tol_m: tolérances collinearité.
+
+    Returns:
+        Le `virtual` dict modifié (in-place modifié + retourné).
+    """
+    v_angle = _angle_mod_pi(virtual["p1"], virtual["p2"])
+    new_p1 = virtual["p1"]
+    new_p2 = virtual["p2"]
+
+    # Direction unit vector from p1 to p2.
+    dx = virtual["p2"][0] - virtual["p1"][0]
+    dy = virtual["p2"][1] - virtual["p1"][1]
+    norm = math.sqrt(dx * dx + dy * dy)
+    if norm < 1e-9:
+        return virtual
+    ux, uy = dx / norm, dy / norm
+
+    # Find collinear walls and the closest endpoint extending in each
+    # direction (p1-side: negative direction ; p2-side: positive).
+    best_extension_p1 = 0.0  # distance to extend on p1 side (negative direction)
+    best_endpoint_p1 = new_p1
+    best_extension_p2 = 0.0  # distance to extend on p2 side
+    best_endpoint_p2 = new_p2
+
+    for w in walls:
+        if getattr(w, "_virtual", False):
+            continue
+        w_angle = _angle_mod_pi(w.p1, w.p2)
+        if not _angles_close(v_angle, w_angle, angle_tol_rad):
+            continue
+        # Check same supporting line.
+        if _perp_distance_point_to_line(w.p1, virtual["p1"], virtual["p2"]) > perp_tol_m:
+            continue
+        # Project both endpoints of w onto virtual centerline, in param
+        # space relative to virtual.p1 with unit (ux, uy).
+        for endpoint in (w.p1, w.p2):
+            t = (endpoint[0] - virtual["p1"][0]) * ux + (endpoint[1] - virtual["p1"][1]) * uy
+            # t < 0 → endpoint is on the p1 side of virtual ; t > virtual_length
+            # → endpoint is on the p2 side.
+            if t < -1e-3:
+                # Distance from virtual.p1 to this endpoint along the line.
+                dist = -t
+                if 0 < dist <= max_snap_m and dist > best_extension_p1:
+                    best_extension_p1 = dist
+                    best_endpoint_p1 = endpoint
+            elif t > norm + 1e-3:
+                dist = t - norm
+                if 0 < dist <= max_snap_m and dist > best_extension_p2:
+                    best_extension_p2 = dist
+                    best_endpoint_p2 = endpoint
+
+    virtual["p1"] = best_endpoint_p1
+    virtual["p2"] = best_endpoint_p2
+    return virtual
+
+
 # ----- V2 — Construction hypothèses mur pour récupération orphans ------
 
 

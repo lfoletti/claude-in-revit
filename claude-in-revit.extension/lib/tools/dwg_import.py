@@ -2436,6 +2436,12 @@ def _try_recover_orphan_via_vote(
     sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
     opening_xy = (co["x_world"], co["y_world"])
     hypo = dwg_plan_openings.build_virtual_wall_hypothesis(opening_xy, sp1, sp2)
+    # V2.1 fix mur virtuel isolé : snap endpoints vers murs voisins
+    # collinéaires (max 5m d'extension). Évite les murs flottants visibles
+    # en 3D.
+    hypo = dwg_plan_openings.snap_virtual_wall_to_neighbors(
+        hypo, plan_record["walls_current"],
+    )
 
     votes = []
     for direction, ev in elevations.items():
@@ -2759,10 +2765,16 @@ def import_walls_and_openings_typed_many(
                     i, path.name, len(classified.walls), max_walls_per_file,
                 )
             )
+        # V2.1 fix fragments persistants : fusion des collinéaires
+        # adjacents (gap ≤ 50cm). Réduit le nombre de murs créés et
+        # produit des murs visuellement continus en 3D.
+        walls_pre_merged = dwg_plan_openings.merge_collinear_walls(
+            list(classified.walls),
+        )
         plan_records.append({
             "item": it,
-            "walls_initial": list(classified.walls),
-            "walls_current": list(classified.walls),  # muté pendant la fusion
+            "walls_initial": walls_pre_merged,
+            "walls_current": list(walls_pre_merged),  # muté pendant la fusion via openings
             "openings_assigned": [],  # liste de (coupe_opening, host_idx_in_current)
         })
 
