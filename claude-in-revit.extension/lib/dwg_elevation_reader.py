@@ -215,28 +215,18 @@ def vote_wall_visible_in_elevation(
             elev_x_range=[bx_min, bx_max],
         )
 
-    # **Restriction par orientation** (V3.2) : une élévation ne « voit »
-    # de face qu'un mur perpendiculaire à sa direction de regard. Un mur
-    # E-W (horizontal au plan) est vu de face par les élévations Nord/Sud
-    # uniquement. Un mur N-S (vertical au plan) par Est/Ouest. Les
-    # autres élévations le voient « de profil » (= juste un trait fin
-    # de l'épaisseur, signal très faible) — on les fait s'abstenir.
-    # Bug runtime P7 session t : sans cette restriction, les dalles
-    # horizontales (lignes A-WALL aux Y des niveaux) donnaient un faux
-    # vote yes pour des murs intérieurs vus en silhouette latérale.
+    # V3.4 (user 2026-05-13) : « les élévations Ouest, Nord et Sud
+    # donnent des indications sur les 3 murs. certains de ces murs sont
+    # parfois vus de face, parfois de profil ». **On laisse toutes les
+    # élévations voter** (suppression de la restriction V3.2 par
+    # orientation). Une élévation qui voit le mur de profil émet quand
+    # même un vote — typiquement no s'il n'y a pas de matière dans la
+    # zone projetée (= ligne aplatie à x_elev=constante). Le signal
+    # discriminant principal est : **au moins 1 élévation vote no**
+    # pour un mur projeté dans sa bbox → faux positif probable.
     wall_dx_world = wall_p2[0] - wall_p1[0]
     wall_dy_world = wall_p2[1] - wall_p1[1]
     wall_is_ew = abs(wall_dx_world) > abs(wall_dy_world)
-    wall_is_ns = not wall_is_ew
-    relevant = (
-        (elevation.direction in ("Nord", "Sud") and wall_is_ew)
-        or (elevation.direction in ("Est", "Ouest") and wall_is_ns)
-    )
-    if not relevant:
-        return abstain(
-            "elevation_{}".format(elevation.direction),
-            reason="elevation views wall from the side (not perpendicular)",
-        )
 
     # Cherche des A-WALL lines dans la zone projetée. **Exclure** les
     # lignes horizontales alignées avec les niveaux (= dalles).

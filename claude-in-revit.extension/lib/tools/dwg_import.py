@@ -3077,6 +3077,7 @@ def create_continuous_walls_many(
     base_type_ref: Optional[str] = None,
     max_walls_per_file: int = 500,
     fusion_max_gap_m: float = 4.0,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """V3 — Crée uniquement des murs **continus** depuis les plans DXF
     (sans openings). Étape 1 d'un pipeline décomposé (user 2026-05-13).
@@ -3143,6 +3144,23 @@ def create_continuous_walls_many(
             rp.ensure_shared_param_binding(doc)
         except Exception:  # noqa: BLE001 — UX surface, jamais fatal.
             pass
+
+    # V3.4 : charger section_lines depuis le KG si non fourni (pour
+    # score 3D consensus).
+    if section_lines is None:
+        section_lines = []
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is not None:
+            ctx = kg.get_node(nid)
+            seen_keys = set()
+            for sl in ctx.get("section_lines", []):
+                key = (sl.get("coupe_path"), tuple(sl.get("plan_p1", [])),
+                       tuple(sl.get("plan_p2", [])))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                section_lines.append(sl)
 
     # --- 1. Pré-validation + classify per plan -------------------------
     plan_records: List[Dict[str, Any]] = []
@@ -3292,14 +3310,89 @@ def create_continuous_walls_many(
     else:
         inner_walls = None
 
+    # Récupère les wall_llm_ids dans l'ordre de création.
+    wall_llm_ids: List[str] = []
+    if inner_walls is not None:
+        if "llm_ids" in inner_walls:
+            wall_llm_ids = list(inner_walls["llm_ids"])
+        elif inner_walls.get("contiguous") and "first_llm_id" in inner_walls:
+            first = inner_walls["first_llm_id"]
+            last = inner_walls["last_llm_id"]
+            prefix = first.rsplit("_", 1)[0]
+            start = int(first.rsplit("_", 1)[1])
+            end = int(last.rsplit("_", 1)[1])
+            wall_llm_ids = [
+                "{}_{:03d}".format(prefix, n) for n in range(start, end + 1)
+            ]
+
+    # --- V3.4 : score 3D consensus pour identifier les suspects ---------
+    # Pour chaque mur, calculer combien de sources le confirment :
+    # plan (toujours +1), coupes traversées avec présence confirmée (+1
+    # par coupe), élévations pertinentes votant yes confident (+1 par
+    # élévation). Score < 2 = mur confirmé UNIQUEMENT par le plan →
+    # suspect car aucune autre vue ne le valide. User décide via
+    # llm_id côté Revit (Panneau Propriétés > claude-in-revit:llm_id).
+    section_walls_by_coupe_v34: Dict[str, List[Dict[str, Any]]] = {}
+    for sl in section_lines or []:
+        cp = sl.get("coupe_path")
+        if not cp or cp in section_walls_by_coupe_v34:
+            continue
+        cp_path = Path(cp)
+        if not cp_path.exists():
+            continue
+        try:
+            ents, _ = dwg_reader.parse(cp_path, scale_override=scale_override)
+            sw_list = dwg_section_reader.read_section_walls(ents)
+            section_walls_by_coupe_v34[cp] = [
+                _section_wall_to_dict(sw) for sw in sw_list
+            ]
+        except Exception:  # noqa: BLE001
+            section_walls_by_coupe_v34[cp] = []
+
+    walls_suspect: List[Dict[str, Any]] = []
+    walls_score_distribution: Dict[int, int] = {}
+    if all_wall_items:
+        # Reconstitue la liste « walls finaux » dans l'ordre des items.
+        global_idx = 0
+        for pr in plan_records:
+            level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
+            height_m_local = float(pr["item"].get("height_m") or 3.0)
+            for w in pr["walls"]:
+                score_info = dwg_plan_openings.compute_3d_consensus_score(
+                    w, level_elev, height_m_local,
+                    section_lines or [],
+                    section_walls_by_coupe_v34,
+                    elevations,
+                )
+                score = score_info["score"]
+                walls_score_distribution[score] = walls_score_distribution.get(score, 0) + 1
+                if score < 2:
+                    llm_id = (
+                        wall_llm_ids[global_idx]
+                        if global_idx < len(wall_llm_ids) else None
+                    )
+                    walls_suspect.append({
+                        "llm_id": llm_id,
+                        "p1": [round(w.p1[0], 3), round(w.p1[1], 3)],
+                        "p2": [round(w.p2[0], 3), round(w.p2[1], 3)],
+                        "thickness_m": round(w.thickness, 3),
+                        "score": score,
+                        "section_yes": score_info["section_yes"],
+                        "elevation_yes_confident": score_info["elevation_yes_confident"],
+                    })
+                global_idx += 1
+
     note = (
-        "**Walls-only V3** : {} murs continus créés (dont {} fusions "
-        "confirmées par vote élévation), {} types DXF custom. Pas "
-        "d'openings — étape 1 du pipeline décomposé. Valider visuellement "
-        "en 3D avant `dwg_add_openings_to_walls_many` (à venir).".format(
+        "**Walls-only V3.4** : {} murs continus créés ({} fusions via "
+        "vote élévation), {} types DXF custom. **{} suspect(s) à score "
+        "3D < 2** (= confirmés seulement par le plan, aucune coupe ni "
+        "élévation pertinente ne les valide) — `llm_id` exposés pour "
+        "suppression manuelle ciblée par l'user. Pas d'openings — "
+        "étape 1 du pipeline décomposé.".format(
             len(all_wall_items),
             total_fusion_events,
             types_result["created_count"] + types_result["reused_count"],
+            len(walls_suspect),
         )
     )
 
@@ -3309,9 +3402,11 @@ def create_continuous_walls_many(
         "walls_imported_total": len(all_wall_items),
         "walls_per_file": walls_per_file,
         "fusion_events": total_fusion_events,
-        "fusion_events_detail": fusion_events_detail[:20],  # truncate
+        "fusion_events_detail": fusion_events_detail[:20],
         "walls_filtered_via_vote": total_walls_filtered,
         "filtered_walls_detail": filtered_walls_detail[:20],
+        "walls_suspect_low_3d_consensus": walls_suspect,
+        "walls_score_distribution": walls_score_distribution,
         "types_created": types_result["created_count"],
         "types_reused": types_result["reused_count"],
         "types": types_result["types"],

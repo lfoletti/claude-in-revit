@@ -840,47 +840,126 @@ def filter_walls_via_elevation_vote(
             )
             votes.append(v)
 
-        has_yes_confident = any(
-            v.answer is True and v.confidence >= min_yes_confidence
-            for v in votes
-        )
-        all_abstain = all(v.answer is None for v in votes)
-        any_no = any(v.answer is False for v in votes)
-
-        # Critère V3.2 (prudent — runtime P7 session t a montré que le
-        # vote élévation seul ne discrimine pas suffisamment vrais murs
-        # extérieurs sans fenêtre vs faux positifs. Une suppression
-        # automatique causait des régressions sévères sur les façades
-        # sans détails. On revient au critère laxiste : ne supprime que
-        # si tous votes sont no/abstain mixed (aucun yes même faible).
-        # Cas wall_161/166 P7 : conf=0.3 = yes faible → garde par
-        # défaut. User supprime manuellement via llm_id visible Revit).
-        if has_yes_confident:
-            kept.append(w)
+        # Critère V3.5 (calibré runtime P7 session t après diag llm_ids
+        # 161/162/166) : **au moins 1 vote no parmi les 4 élévations →
+        # faux positif probable**. Validé sur P7 : élimine 161 + 162
+        # (2 no chacun), garde tous les vrais murs (0 no). 166 reste un
+        # angle mort (4 yes faibles indistinguables d'un vrai mur
+        # extérieur sans fenêtre) — à supprimer manuellement via llm_id
+        # visible Revit.
+        no_count = sum(1 for v in votes if v.answer is False)
+        if no_count >= 1:
+            removed.append({
+                "wall_p1": list(w.p1),
+                "wall_p2": list(w.p2),
+                "thickness_m": round(w.thickness, 4),
+                "no_count": no_count,
+                "votes": [
+                    {"source": v.source, "answer": v.answer,
+                     "confidence": round(v.confidence, 3)}
+                    for v in votes
+                ],
+            })
             continue
-        if all_abstain:
-            kept.append(w)
-            continue
-        # Au moins un yes faible OR au moins un no, et pas de yes
-        # confident : laisse passer en V3.2 (trop d'incertitude pour
-        # arbitrer automatiquement). À renforcer avec d'autres signaux
-        # (cohérence multi-niveaux, vote coupes, etc.) en V3.4.
-        has_any_yes = any(v.answer is True for v in votes)
-        if has_any_yes:
-            kept.append(w)
-            continue
-        # Tous votes sont no (aucun yes même faible) → faux positif probable.
-        removed.append({
-            "wall_p1": list(w.p1),
-            "wall_p2": list(w.p2),
-            "thickness_m": round(w.thickness, 4),
-            "votes": [
-                {"source": v.source, "answer": v.answer,
-                 "confidence": round(v.confidence, 3)}
-                for v in votes
-            ],
-        })
+        kept.append(w)
     return kept, removed
+
+
+# ----- V3.4 — Score 3D : consensus plan + coupes + élévations ---------
+
+
+def compute_3d_consensus_score(
+    wall: Any,
+    level_elevation_m: float,
+    height_m: float,
+    section_lines: List[Dict[str, Any]],
+    section_walls_by_coupe: Dict[str, List[Dict[str, Any]]],
+    elevations: Dict[str, Any],
+    *,
+    elev_yes_threshold: float = 0.4,
+) -> Dict[str, Any]:
+    """Calcule un score de consensus 3D pour un wall_candidate, en
+    combinant les votes de toutes les sources (plan, coupes,
+    élévations).
+
+    User 2026-05-13 : « c'est bien une lecture en 3D (3 axes) qui permet
+    de modéliser, pas juste 1 ou 2 axes ». Un mur réel apparaît :
+    - **plan** : paire parallèle (toujours yes par construction).
+    - **coupe** : si traversé par un trait, présence d'un section_wall
+      à la position correspondante (vote_wall_visible_in_section).
+    - **élévation** : silhouette visible depuis Nord/Sud (mur EW) ou
+      Est/Ouest (mur NS).
+
+    Score = nombre de sources votant yes :
+    - Plan : +1 toujours.
+    - Coupes : +1 par coupe traversée avec présence confirmée
+      (`vote_wall_visible_in_section.answer is True`).
+    - Élévations : +1 par élévation pertinente votant yes avec
+      `confidence >= elev_yes_threshold`.
+
+    Returns:
+        `{score: int, plan_vote: 1, section_yes: int,
+        elevation_yes_confident: int, total_sources_checked: int,
+        votes_summary: [...]}`.
+    """
+    from .dwg_elevation_reader import vote_wall_visible_in_elevation
+
+    score = 1  # plan always yes by construction
+    plan_vote = 1
+    section_yes = 0
+    section_checked = 0
+    section_votes_detail: List[Dict[str, Any]] = []
+
+    # Vote depuis chaque coupe (si traversée).
+    for sl in section_lines:
+        coupe_path = sl.get("coupe_path")
+        if not coupe_path:
+            continue
+        sec_walls = section_walls_by_coupe.get(coupe_path, [])
+        v = vote_wall_visible_in_section(
+            wall.p1, wall.p2, level_elevation_m, height_m,
+            sl, sec_walls, wall_thickness_m=wall.thickness,
+        )
+        section_votes_detail.append({
+            "coupe": coupe_path,
+            "answer": v.answer, "confidence": round(v.confidence, 3),
+        })
+        if v.answer is None:
+            continue
+        section_checked += 1
+        if v.answer is True:
+            section_yes += 1
+            score += 1
+
+    # Vote depuis chaque élévation.
+    elev_yes_confident = 0
+    elev_checked = 0
+    elev_votes_detail: List[Dict[str, Any]] = []
+    for direction, ev in elevations.items():
+        v = vote_wall_visible_in_elevation(
+            wall.p1, wall.p2, level_elevation_m, height_m, ev,
+        )
+        elev_votes_detail.append({
+            "direction": direction,
+            "answer": v.answer, "confidence": round(v.confidence, 3),
+        })
+        if v.answer is None:
+            continue
+        elev_checked += 1
+        if v.answer is True and v.confidence >= elev_yes_threshold:
+            elev_yes_confident += 1
+            score += 1
+
+    return {
+        "score": score,
+        "plan_vote": plan_vote,
+        "section_yes": section_yes,
+        "section_checked": section_checked,
+        "elevation_yes_confident": elev_yes_confident,
+        "elevation_checked": elev_checked,
+        "section_votes": section_votes_detail,
+        "elevation_votes": elev_votes_detail,
+    }
 
 
 # ----- V2.1 — Fusion collinéaires (post-classify, pré-pipeline) -------
