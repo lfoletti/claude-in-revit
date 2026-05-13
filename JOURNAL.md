@@ -14,6 +14,101 @@
 
 ---
 
+## 2026-05-13 (session p) — Phase 2 étapes 2-4 : extract + types custom + import typed
+
+### Contexte & objectif
+
+Session p directement après validation runtime de session o sur P7
+(Phase 1 + audit `check_planset_integrity` OK). User : « ok vas-y ».
+Objectif : livrer les 3 micro-étapes Phase 2 restantes côté creation :
+
+- **Étape 2** : détection des épaisseurs uniques observées dans le plan.
+- **Étape 3** : création des `WallType` custom `DXF_WALL_<cm>cm`.
+- **Étape 4** : création des murs en mappant chaque épaisseur à son type.
+
+Source de vérité : mémoire `project-phase2-custom-types` (« créer des
+types custom sans matching des types existants ; user refine après »).
+
+### Phases livrées
+
+**Étape 2 — `dwg_extract_wall_thicknesses`** (`tools/dwg_import.py`,
+tier-2). Preview seul : classify plan → distribution par bucket cm
+(configurable via `bucket_cm`). Output : `thickness_buckets: [{cm,
+count, type_name, wall_indices}]`. Read-only — sert à l'agent à
+présenter au user avant import.
+
+**Étape 3 — `walls_get_or_create_dxf_type` + `_many`**
+(`tools/walls.py`, tier-1).
+
+- `_dxf_wall_type_name(thickness_m, bucket_cm)` : construit le nom
+  canonique `DXF_WALL_<cm>cm`.
+- `_find_dxf_wall_type_in_kg(kg, target_name)` : lookup KG (idempotence).
+- `_find_simple_basic_wall_type(doc)` : auto-détection d'un BasicWall
+  template à dupliquer. Préférence : 1-layer (plus prévisible à
+  ajuster). Fallback : 1er BasicWall trouvé.
+- `_create_dxf_wall_type_in_revit(doc, base, name, thickness)` :
+  `Duplicate` + `GetCompoundStructure` + ajustement de la layer Core
+  (ou layer 0 si 1 layer unique). Doit être appelé dans une
+  transaction outer.
+- Tool unitaire `walls_get_or_create_dxf_type` : idempotent par
+  recherche KG sur le nom canonique. KG-only fallback (doc=None) crée
+  juste le node WallType.
+- Bulk `_many` : dédup interne sur buckets, 1 Tx Revit pour tous les
+  types non-existants. Coding policy bulk respectée d'emblée.
+
+**Étape 4 — `dwg_import_walls_typed`** (`tools/dwg_import.py`,
+tier-2). Orchestre :
+
+1. Classify plan → WallCandidates.
+2. Bucket épaisseurs uniques.
+3. Délègue à `walls_get_or_create_dxf_type_many` (Tx 1).
+4. Build items avec mapping `bucket_cm → wall_type_ref`.
+5. Délègue à `walls_create_many` (Tx 2).
+6. Sort `{walls_imported, types_created, types_reused,
+   thickness_distribution, types, inner_walls}`.
+
+**Atomicité** : 2 transactions Revit séparées (types puis murs). Pas
+atomique entre les deux mais idempotent — si la création des murs
+échoue, les types restent et sont réutilisés au prochain run. Pas
+critique car la création des murs ne modifie pas les types existants.
+
+### Tests
+
+**Nouveau `tests/test_dwg_phase2.py`** — 12 tests. Couverture :
+
+- `dwg_extract_wall_thicknesses` (2) : 3 buckets, bucket_cm=5 merge.
+- `walls_get_or_create_dxf_type` (4) : KG create, idempotence,
+  bucket cm name, reject négatif.
+- `walls_get_or_create_dxf_type_many` (2) : dédup, reuse.
+- `dwg_import_walls_typed` (4) : roundtrip 3 épaisseurs, idempotence
+  re-import, level_ref inconnu rejeté, refuse DXF section.
+
+### Validation
+
+**559 tests verts** (547 → 559, +12). Pas de régression.
+
+### Flow d'import end-to-end (à valider runtime sur P7)
+
+```
+1. check_planset_integrity(directory)          ← gate (session o)
+2. dwg_inspect_sections + find_section_markers + ...  ← Phase 1
+3. levels_reconcile_with_dxf → levels_create_many (si besoin)
+4. views_create_section_many + views_link_cad_many
+5. (NEW) dwg_extract_wall_thicknesses(plan)    ← preview Phase 2
+6. (NEW) ui_confirm_choices                    ← user valide distribution
+7. (NEW) dwg_import_walls_typed(plan, level)   ← création murs typés
+8. views_open_3d                               ← validation visuelle
+```
+
+### Reste à faire Phase 2
+
+5. **Ouvertures** sill/head depuis coupes/élévations.
+6. **Sols** Floor avec FloorTypes custom DXF_FLOOR_<cm>cm
+   (pattern identique aux walls — pourrait être livré en session q).
+7. **Vue 3D** déjà couverte par `views_open_3d` existant.
+
+---
+
 ## 2026-05-13 (session o) — Phase 2 étape 1 + Audit d'intégrité du plan set
 
 ### Contexte & objectif

@@ -23,7 +23,7 @@ Tier-2 — chargés via routing keyword `dwg` / `dxf` / `importe` / `plan d'arch
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .. import dwg_classifier, dwg_coherence, dwg_reader, dwg_section_reader
 from ..llm_protocol import tool
@@ -1811,6 +1811,252 @@ def check_planset_integrity(
         "errors": report.errors,
         "warnings": report.warnings,
         "note": note,
+    }
+
+
+# ----- 10. Phase 2 : extraction épaisseurs + import typed --------------
+
+
+@tool(name="dwg_extract_wall_thicknesses", tier=2)
+def extract_wall_thicknesses(
+    kg: ProjectKG,
+    file_path: str,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    bucket_cm: int = 1,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+) -> Dict[str, Any]:
+    """Preview des épaisseurs uniques observées dans un plan DXF (Phase 2.2).
+
+    Classifie le plan (paires parallèles + centerline) et agrège les
+    épaisseurs par bucket cm. Sort une distribution `{cm: count}` +
+    suggested type names (`DXF_WALL_<cm>cm`). Read-only — aucune
+    création.
+
+    Use case : avant de lancer `dwg_import_walls_typed`, l'agent
+    présente à l'user la distribution pour validation. Si une bucket
+    paraît suspect (1 mur à 5cm = artefact ? mur cloison ?), l'user
+    peut ajuster `bucket_cm` ou les bornes avant l'import.
+
+    Concepts: dxf, dwg, plan, épaisseur, thickness, distribution, preview,
+              phase 2, walltype, custom
+    Phrases: "quelles épaisseurs de murs dans ce plan",
+             "preview des types DXF à créer", "distribution des murs"
+    Similar: dwg_classify, dwg_import_walls_typed,
+             walls_get_or_create_dxf_type_many
+
+    Args:
+        file_path: chemin du DXF plan.
+        layer_mapping: défaut `{"A-WALL": "wall"}`.
+        scale_override: cf. `dwg_inspect`.
+        bucket_cm: granularité bucketing (défaut 1cm).
+        min_thickness_m / max_thickness_m: bornes (défaut 5cm / 60cm).
+        include_centerline: passe centerline du classifier (défaut True).
+
+    Returns:
+        {"ok": bool, "walls_count": int,
+         "thickness_buckets": [{cm: int, count: int, type_name: str,
+                                 wall_indices: [...]}, ...],
+         "rejected_count": int}
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError("File not found: {}".format(path))
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+    if bucket_cm < 1:
+        raise ValueError("bucket_cm must be >= 1")
+
+    entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    classified = dwg_classifier.classify(
+        entities, layer_mapping,
+        min_thickness_m=min_thickness_m,
+        max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+    )
+
+    # Bucket par cm.
+    by_bucket: Dict[int, Dict[str, Any]] = {}
+    for i, w in enumerate(classified.walls):
+        cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+        bucket = by_bucket.setdefault(cm, {
+            "cm": cm,
+            "count": 0,
+            "type_name": "DXF_WALL_{}cm".format(cm),
+            "wall_indices": [],
+        })
+        bucket["count"] += 1
+        bucket["wall_indices"].append(i)
+
+    buckets_sorted = sorted(by_bucket.values(), key=lambda b: b["cm"])
+    return {
+        "ok": True,
+        "walls_count": len(classified.walls),
+        "thickness_buckets": buckets_sorted,
+        "rejected_count": len(classified.rejected),
+        "bucket_cm": bucket_cm,
+    }
+
+
+@tool(name="dwg_import_walls_typed", tier=2)
+def import_walls_typed(
+    kg: ProjectKG,
+    doc: Any,
+    file_path: str,
+    level_ref: str,
+    height_m: Optional[float] = None,
+    dx_m: float = 0.0,
+    dy_m: float = 0.0,
+    bucket_cm: int = 1,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+    base_type_ref: Optional[str] = None,
+    max_walls: int = 500,
+) -> Dict[str, Any]:
+    """Importe les murs d'un DXF en mappant chaque épaisseur à son type
+    custom `DXF_WALL_<cm>cm` (Phase 2.3 + 2.4).
+
+    Variante typée de `dwg_import_walls` : au lieu d'utiliser un seul
+    `wall_type_ref` pour tous les murs, le tool crée (ou réutilise) un
+    WallType custom par bucket d'épaisseur observé dans le plan, puis
+    assigne chaque mur à son type.
+
+    **Atomicité** : 2 transactions Revit séparées (1 pour les types via
+    `walls_get_or_create_dxf_type_many`, 1 pour les murs via
+    `walls_create_many`). Si la création des murs échoue, les types
+    déjà créés restent et seront réutilisés au prochain run (idempotent).
+
+    Concepts: dxf, dwg, import, mur, walltype, custom, typed, phase 2,
+              épaisseur, batch
+    Phrases: "importe les murs du plan avec types DXF",
+             "crée les murs typés depuis ce DXF",
+             "phase 2 import walls"
+    Similar: dwg_extract_wall_thicknesses, dwg_import_walls,
+             walls_get_or_create_dxf_type_many, walls_create_many
+
+    Args:
+        file_path: chemin du DXF plan.
+        level_ref: llm_id du Level cible.
+        height_m: hauteur uniforme en m (None = hauteur d'étage).
+        dx_m / dy_m: translation pour aligner DXF↔Revit (défaut 0).
+        bucket_cm: granularité bucketing épaisseurs (défaut 1cm).
+        layer_mapping: défaut `{"A-WALL": "wall"}`.
+        scale_override: facteur additionnel $INSUNITS.
+        min_thickness_m / max_thickness_m: bornes (défaut 5/60cm).
+        include_centerline: passe centerline (défaut True).
+        base_type_ref: WallType template à dupliquer. None = auto-find.
+        max_walls: garde-fou (défaut 500).
+
+    Returns:
+        {"ok": bool, "walls_imported": int, "types_created": int,
+         "types_reused": int, "thickness_distribution": {cm: count, ...},
+         "types": [...], "inner_walls": <walls_create_many response>}
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError("File not found: {}".format(path))
+    _refuse_if_section(path)
+    if not kg.has_node(level_ref):
+        raise ValueError("Unknown level_ref: {}".format(level_ref))
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+
+    # --- 1. Classify plan -----------------------------------------------
+    entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    classified = dwg_classifier.classify(
+        entities, layer_mapping,
+        min_thickness_m=min_thickness_m,
+        max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+    )
+    if len(classified.walls) > max_walls:
+        raise ValueError(
+            "Classify produced {} walls (> max_walls={}). Refine layer_mapping "
+            "or raise max_walls explicitly.".format(
+                len(classified.walls), max_walls,
+            )
+        )
+    if not classified.walls:
+        return {
+            "ok": True,
+            "walls_imported": 0,
+            "types_created": 0,
+            "types_reused": 0,
+            "thickness_distribution": {},
+            "types": [],
+            "inner_walls": None,
+            "note": "No wall candidates detected.",
+        }
+
+    # --- 2. Bucket thicknesses + get_or_create types --------------------
+    unique_thicknesses_m: List[float] = []
+    seen_buckets: Set[int] = set()
+    for w in classified.walls:
+        cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+        if cm not in seen_buckets:
+            seen_buckets.add(cm)
+            unique_thicknesses_m.append(cm / 100.0)
+
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    type_entry = registry.get("walls_get_or_create_dxf_type_many")
+    if type_entry is None:
+        raise RuntimeError(
+            "walls_get_or_create_dxf_type_many not in registry — bug?"
+        )
+    types_result = type_entry.fn(
+        kg=kg, doc=doc,
+        thicknesses_m=unique_thicknesses_m,
+        bucket_cm=bucket_cm,
+        base_type_ref=base_type_ref,
+    )
+
+    # Mapping bucket_cm → wall_type_ref (llm_id).
+    type_ref_by_cm: Dict[int, str] = {}
+    for entry in types_result["types"]:
+        cm = int(round(entry["thickness_m"] * 100))
+        type_ref_by_cm[cm] = entry["llm_id"]
+
+    # --- 3. Build items + walls_create_many -----------------------------
+    items: List[Dict[str, Any]] = []
+    thickness_dist: Dict[int, int] = {}
+    for w in classified.walls:
+        cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
+        wall_type_ref = type_ref_by_cm.get(cm)
+        if wall_type_ref is None:
+            raise RuntimeError(
+                "Bucket {}cm has no associated wall_type_ref — bug in "
+                "get_or_create_dxf_type_many?".format(cm)
+            )
+        item: Dict[str, Any] = {
+            "level_ref": level_ref,
+            "wall_type_ref": wall_type_ref,
+            "p1": [w.p1[0] + dx_m, w.p1[1] + dy_m],
+            "p2": [w.p2[0] + dx_m, w.p2[1] + dy_m],
+        }
+        if height_m is not None:
+            item["height"] = float(height_m)
+        items.append(item)
+        thickness_dist[cm] = thickness_dist.get(cm, 0) + 1
+
+    walls_entry = registry.get("walls_create_many")
+    inner = walls_entry.fn(kg=kg, doc=doc, items=items)
+
+    return {
+        "ok": True,
+        "walls_imported": len(items),
+        "types_created": types_result["created_count"],
+        "types_reused": types_result["reused_count"],
+        "thickness_distribution": {
+            "{}cm".format(cm): count for cm, count in sorted(thickness_dist.items())
+        },
+        "types": types_result["types"],
+        "inner_walls": inner,
     }
 
 

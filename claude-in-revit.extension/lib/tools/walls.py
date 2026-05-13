@@ -15,7 +15,7 @@ commit Revit) reste couverte par `refresh_kg`.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ._helpers import bulk_setter_summary, bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
@@ -1077,4 +1077,401 @@ def delete_many(
         "revit_already_gone": revit_already_gone,
         "deleted_at_turn": kg.turn,
         "revit_modified": True,
+    }
+
+
+# ----- DXF custom WallType creation (Phase 2 étape 3) ------------------
+#
+# Phase 2 import : pour chaque épaisseur observée dans le plan DXF, on
+# crée (ou réutilise) un WallType nommé `DXF_WALL_<cm>cm`. Pas de
+# matching avec les types existants du template Revit — l'user refinera
+# après import (cf. mémoire `project-phase2-custom-types`).
+#
+# Convention naming : `DXF_WALL_<cm>cm` (cm bucketed au cm près par
+# défaut, paramétrable). Recognizable + filtrable au post-traitement.
+
+
+_DXF_WALL_TYPE_PREFIX = "DXF_WALL_"
+
+
+def _dxf_wall_type_name(thickness_m: float, bucket_cm: int = 1) -> str:
+    """Construit le nom canonique `DXF_WALL_<cm>cm` pour une épaisseur.
+
+    `bucket_cm` : granularité du bucketing en cm (défaut 1 — i.e. arrondi
+    au cm près). Mettre 5 pour bucketer aux 5 cm.
+    """
+    if bucket_cm < 1:
+        raise ValueError("bucket_cm must be >= 1")
+    cm = int(round(thickness_m * 100 / bucket_cm)) * bucket_cm
+    return "{}{}cm".format(_DXF_WALL_TYPE_PREFIX, cm)
+
+
+def _find_dxf_wall_type_in_kg(
+    kg: ProjectKG, target_name: str,
+) -> Optional[str]:
+    """Cherche un WallType vivant nommé `target_name` dans le KG.
+    Retourne son llm_id ou None.
+    """
+    for nid in kg.find_by_type("WallType"):
+        node = kg.get_node(nid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        if node.get("name") == target_name:
+            return nid
+    return None
+
+
+def _create_dxf_wall_type_kg_only(
+    kg: ProjectKG, target_name: str, thickness_m: float,
+) -> str:
+    """Crée le node WallType (KG-only path, doc=None)."""
+    return kg.add_node("WallType", {
+        "name": target_name,
+        "total_thickness": float(thickness_m),
+    })
+
+
+def _find_simple_basic_wall_type(doc: Any) -> Any:
+    """Trouve un WallType template pour duplication.
+
+    Préférence : WallKind.Basic avec exactement 1 layer (plus prévisible
+    à ajuster via SetLayerWidth). Fallback : 1er WallKind.Basic trouvé.
+    None si aucun BasicWall dispo (cas extrême — projet sans wall types
+    de base, à corriger côté template Revit).
+    """
+    from . import _helpers  # noqa: F401  (parent module loaded)
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import WallKind
+
+    fallback_basic = None
+    for wt in rp.wall_types(doc):
+        try:
+            if wt.Kind != WallKind.Basic:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        if fallback_basic is None:
+            fallback_basic = wt
+        try:
+            cs = wt.GetCompoundStructure()
+        except Exception:  # noqa: BLE001
+            continue
+        if cs is None:
+            continue
+        if cs.LayerCount == 1:
+            return wt
+    return fallback_basic
+
+
+def _create_dxf_wall_type_in_revit(
+    doc: Any, base_wt: Any, target_name: str, thickness_m: float,
+) -> int:
+    """Duplique `base_wt`, renomme `target_name`, ajuste la layer principale.
+
+    **Doit être appelé à l'intérieur d'une `rp.transaction`** — pas de
+    gestion de transaction ici. Retourne le `Id.Value` du nouveau type.
+
+    Stratégie d'ajustement :
+    - Si 1 layer : ajuste sa width directement.
+    - Si N layers : ajuste la layer Core (BoundaryLayerType.Core).
+      Si pas de Core layer, ajuste la layer d'index `StructuralMaterialIndex`.
+    - Fallback : ajuste la layer 0.
+    """
+    from .. import revit_primitives as rp
+
+    new_wt = base_wt.Duplicate(target_name)
+    cs = new_wt.GetCompoundStructure()
+    new_width_ft = rp.meters_to_internal(thickness_m)
+
+    if cs is not None and cs.LayerCount > 0:
+        layer_idx = 0
+        if cs.LayerCount > 1:
+            # Cherche la layer Structural (cœur du mur).
+            struct_idx = -1
+            try:
+                struct_idx = int(cs.StructuralMaterialIndex)
+            except Exception:  # noqa: BLE001
+                struct_idx = -1
+            if struct_idx >= 0:
+                layer_idx = struct_idx
+            else:
+                # Cherche par fonction (Structure).
+                try:
+                    from Autodesk.Revit.DB import MaterialFunctionAssignment
+                    for i in range(cs.LayerCount):
+                        if cs.GetLayerFunction(i) == MaterialFunctionAssignment.Structure:
+                            layer_idx = i
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Pour les types multi-layer, on doit ajuster pour que la
+            # somme des widths matche `new_width_ft`. Stratégie simple :
+            # mettre toutes les autres layers à un minimum et la Core/
+            # Structure layer à `new_width - sum(autres)`.
+            other_total_ft = 0.0
+            for i in range(cs.LayerCount):
+                if i == layer_idx:
+                    continue
+                other_total_ft += float(cs.GetLayerWidth(i))
+            target_struct_ft = max(new_width_ft - other_total_ft, rp.meters_to_internal(0.01))
+            cs.SetLayerWidth(layer_idx, target_struct_ft)
+        else:
+            cs.SetLayerWidth(0, new_width_ft)
+        new_wt.SetCompoundStructure(cs)
+
+    return int(new_wt.Id.Value)
+
+
+@tool(name="walls_get_or_create_dxf_type", tier=1)
+def get_or_create_dxf_type(
+    kg: ProjectKG,
+    doc: Any,
+    thickness_m: float,
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cherche ou crée un WallType custom `DXF_WALL_<cm>cm` (Phase 2 étape 3).
+
+    Use case : import DXF avec épaisseurs variables — chaque épaisseur
+    unique observée dans le plan se mappe à un WallType custom dédié,
+    nommé selon la convention `DXF_WALL_<cm>cm` (cm bucketé au cm près
+    par défaut). Si le type existe déjà (re-import ou type déjà créé
+    précédemment), il est retourné tel quel (idempotent).
+
+    **Pas de matching avec les types existants** du template Revit
+    (cf. mémoire `project-phase2-custom-types`) : on crée toujours un
+    type DXF dédié pour rester traçable. L'user refinera après import
+    en remappant les murs vers ses propres types.
+
+    Concepts: mur, type, walltype, dxf, import, phase 2, épaisseur,
+              thickness, custom, generic
+    Phrases: "crée le type DXF pour épaisseur X", "get or create wall type",
+             "type custom pour ce mur dxf"
+    Similar: walls_get_or_create_dxf_type_many, walls_create_many,
+             dwg_import_walls_typed
+
+    Args:
+        thickness_m: épaisseur en mètres.
+        bucket_cm: granularité du bucketing (défaut 1). Le nom et la
+            valeur stockée sont arrondis à `bucket_cm` près.
+        base_type_ref: llm_id d'un WallType template à dupliquer en
+            Revit. Si None, le tool cherche automatiquement un BasicWall
+            simple (1 layer si possible).
+
+    Returns:
+        {"ok": bool, "llm_id": str, "name": str, "thickness_m": float,
+         "created": bool, "revit_id": int | None}
+        `created=False` si le type existait déjà.
+    """
+    if not isinstance(thickness_m, (int, float)) or thickness_m <= 0:
+        raise ValueError("thickness_m must be a positive number")
+    bucketed_cm = int(round(thickness_m * 100 / bucket_cm)) * bucket_cm
+    bucketed_m = bucketed_cm / 100.0
+    target_name = _dxf_wall_type_name(thickness_m, bucket_cm=bucket_cm)
+
+    existing = _find_dxf_wall_type_in_kg(kg, target_name)
+    if existing is not None:
+        node = kg.get_node(existing)
+        return {
+            "ok": True,
+            "llm_id": existing,
+            "name": target_name,
+            "thickness_m": float(node.get("total_thickness", bucketed_m)),
+            "created": False,
+            "revit_id": kg.get_revit_id(existing),
+        }
+
+    if doc is None:
+        llm_id = _create_dxf_wall_type_kg_only(kg, target_name, bucketed_m)
+        return {
+            "ok": True,
+            "llm_id": llm_id,
+            "name": target_name,
+            "thickness_m": bucketed_m,
+            "created": True,
+            "revit_id": None,
+        }
+
+    # Revit-backed path.
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        from .. import revit_primitives as rp
+        from Autodesk.Revit.DB import ElementId
+        base_wt = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_wt = _find_simple_basic_wall_type(doc)
+        if base_wt is None:
+            raise ValueError(
+                "No BasicWall template available in this project. "
+                "Provide `base_type_ref` explicitly or add a simple "
+                "WallType to your template."
+            )
+
+    from .. import revit_primitives as rp
+    with rp.transaction(doc, "walls.get_or_create_dxf_type"):
+        revit_id = _create_dxf_wall_type_in_revit(
+            doc, base_wt, target_name, bucketed_m,
+        )
+        llm_id = _create_dxf_wall_type_kg_only(kg, target_name, bucketed_m)
+        kg.set_revit_id(llm_id, revit_id)
+
+    return {
+        "ok": True,
+        "llm_id": llm_id,
+        "name": target_name,
+        "thickness_m": bucketed_m,
+        "created": True,
+        "revit_id": revit_id,
+    }
+
+
+@tool(name="walls_get_or_create_dxf_type_many", tier=1)
+def get_or_create_dxf_type_many(
+    kg: ProjectKG,
+    doc: Any,
+    thicknesses_m: List[float],
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Crée (ou réutilise) N WallType custom `DXF_WALL_<cm>cm` en **une
+    seule** Tx Revit.
+
+    Pattern bulk : pour `dwg_import_walls_typed`, on a typiquement 2-5
+    épaisseurs uniques à traiter. Bulk = 1 Tx, 1 round-trip API,
+    économie tokens. Dédup interne sur les buckets — appeler avec
+    `[0.20, 0.205, 0.21]` et `bucket_cm=1` crée 1 type `DXF_WALL_20cm`
+    (les 3 buckets convergent à 20cm).
+
+    Concepts: mur, type, walltype, bulk, batch, dxf, import, plusieurs,
+              épaisseurs
+    Phrases: "crée tous les types DXF nécessaires", "bulk wall types"
+    Similar: walls_get_or_create_dxf_type, walls_create_many,
+             dwg_import_walls_typed
+
+    Args:
+        thicknesses_m: liste d'épaisseurs en mètres (peut contenir
+            des doublons après bucketing).
+        bucket_cm: granularité du bucketing (défaut 1).
+        base_type_ref: voir `walls_get_or_create_dxf_type`.
+
+    Returns:
+        {"ok": bool, "types": [{thickness_m, name, llm_id, created,
+            revit_id}, ...], "created_count": int, "reused_count": int}
+    """
+    if not isinstance(thicknesses_m, list) or not thicknesses_m:
+        raise ValueError("thicknesses_m must be a non-empty list")
+    for i, t in enumerate(thicknesses_m):
+        if not isinstance(t, (int, float)) or t <= 0:
+            raise ValueError(
+                "thicknesses_m[{}]: must be positive number, got {!r}".format(i, t)
+            )
+
+    # Dédup par bucket.
+    unique_buckets_m: List[float] = []
+    seen_names: Set[str] = set()
+    for t in thicknesses_m:
+        name = _dxf_wall_type_name(t, bucket_cm=bucket_cm)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        bucketed_cm = int(round(t * 100 / bucket_cm)) * bucket_cm
+        unique_buckets_m.append(bucketed_cm / 100.0)
+
+    types_payload: List[Dict[str, Any]] = []
+    created_count = 0
+    reused_count = 0
+
+    if doc is None:
+        for tm in unique_buckets_m:
+            name = _dxf_wall_type_name(tm, bucket_cm=bucket_cm)
+            existing = _find_dxf_wall_type_in_kg(kg, name)
+            if existing is not None:
+                node = kg.get_node(existing)
+                types_payload.append({
+                    "thickness_m": float(node.get("total_thickness", tm)),
+                    "name": name,
+                    "llm_id": existing,
+                    "created": False,
+                    "revit_id": None,
+                })
+                reused_count += 1
+                continue
+            nid = _create_dxf_wall_type_kg_only(kg, name, tm)
+            types_payload.append({
+                "thickness_m": tm,
+                "name": name,
+                "llm_id": nid,
+                "created": True,
+                "revit_id": None,
+            })
+            created_count += 1
+        return {
+            "ok": True,
+            "types": types_payload,
+            "created_count": created_count,
+            "reused_count": reused_count,
+        }
+
+    # Revit-backed path : 1 Tx pour tous les nouveaux types.
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    # Pre-validate base wall type.
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        base_wt = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_wt = _find_simple_basic_wall_type(doc)
+        if base_wt is None:
+            raise ValueError(
+                "No BasicWall template available in this project. "
+                "Provide `base_type_ref` explicitly or add a simple "
+                "WallType to your template."
+            )
+
+    with rp.transaction(doc, "walls.get_or_create_dxf_type_many"):
+        for tm in unique_buckets_m:
+            name = _dxf_wall_type_name(tm, bucket_cm=bucket_cm)
+            existing = _find_dxf_wall_type_in_kg(kg, name)
+            if existing is not None:
+                node = kg.get_node(existing)
+                types_payload.append({
+                    "thickness_m": float(node.get("total_thickness", tm)),
+                    "name": name,
+                    "llm_id": existing,
+                    "created": False,
+                    "revit_id": kg.get_revit_id(existing),
+                })
+                reused_count += 1
+                continue
+            revit_id = _create_dxf_wall_type_in_revit(doc, base_wt, name, tm)
+            nid = _create_dxf_wall_type_kg_only(kg, name, tm)
+            kg.set_revit_id(nid, revit_id)
+            types_payload.append({
+                "thickness_m": tm,
+                "name": name,
+                "llm_id": nid,
+                "created": True,
+                "revit_id": revit_id,
+            })
+            created_count += 1
+
+    return {
+        "ok": True,
+        "types": types_payload,
+        "created_count": created_count,
+        "reused_count": reused_count,
     }
