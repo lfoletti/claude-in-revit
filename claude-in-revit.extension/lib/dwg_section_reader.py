@@ -674,6 +674,203 @@ def read_section_openings(entities: List[DwgEntity]) -> List[SectionOpening]:
     return out
 
 
+# ----- Reconcile niveaux DXF ↔ KG (Étape 5 Phase 1) ---------------------
+
+
+@dataclass
+class LevelReconciliation:
+    """Résultat du diff entre niveaux extraits d'une coupe DXF et niveaux
+    présents dans le projet KG.
+
+    Champs :
+    - `matches` : niveaux qui matchent strictement (nom + élév à ε près).
+    - `name_only_matches` : même nom dans DXF + KG mais élévations
+      différentes → suggère `modify_elevation`.
+    - `elev_only_matches` : même élévation à ε près mais noms différents
+      → suggère `rename` (à user de décider, peut être intentionnel).
+    - `missing_in_project` : niveaux DXF absents du KG → `create_level`.
+    - `extra_in_project` : niveaux KG sans correspondance DXF → `keep`
+      par défaut (pas de `delete` automatique, trop destructeur).
+    - `suggested_actions` : liste d'actions concrètes que l'agent peut
+      enchaîner (avec confirmation user) pour aligner.
+    """
+    matches: List[Dict[str, Any]]
+    name_only_matches: List[Dict[str, Any]]
+    elev_only_matches: List[Dict[str, Any]]
+    missing_in_project: List[Dict[str, Any]]
+    extra_in_project: List[Dict[str, Any]]
+    suggested_actions: List[Dict[str, Any]]
+
+
+def reconcile_levels(
+    coupe_levels: List["Level"],
+    project_levels: List[Dict[str, Any]],
+    *,
+    elevation_tol_m: float = 0.01,
+) -> LevelReconciliation:
+    """Diff entre niveaux DXF et niveaux du projet KG.
+
+    Algo en 2 passes :
+    1. Pour chaque coupe level, chercher un project level avec nom +
+       élévation matching → "match" parfait.
+    2. Pour chaque non-matché, chercher par nom seul → "name_only_match"
+       (à modifier elev), ou par élévation seule → "elev_only_match"
+       (à renommer potentiellement).
+    3. Le reste : `missing_in_project` côté coupe, `extra_in_project`
+       côté KG.
+
+    `suggested_actions` formate la suite à exécuter :
+    - `create_level`: pour chaque missing_in_project
+    - `modify_elevation`: pour chaque name_only_match (avec llm_id du
+      project level et la nouvelle élévation)
+    - `rename`: pour chaque elev_only_match (informatif — user décide)
+
+    Args:
+        coupe_levels: liste de `Level` (output de `read_levels`).
+        project_levels: liste de dicts `{llm_id, name, elevation}` (output
+            de `catalog_list_levels`).
+        elevation_tol_m: tolérance élévation pour matching (défaut 0.01m).
+
+    Returns:
+        `LevelReconciliation` instance.
+    """
+    coupe_remaining = list(range(len(coupe_levels)))
+    project_remaining = list(range(len(project_levels)))
+
+    matches: List[Dict[str, Any]] = []
+    # Pass 1: exact match name + elevation.
+    for ci in list(coupe_remaining):
+        cl = coupe_levels[ci]
+        for pi in list(project_remaining):
+            pl = project_levels[pi]
+            if (
+                pl.get("name") == cl.name
+                and abs(float(pl.get("elevation", 0.0)) - cl.elevation_m) <= elevation_tol_m
+            ):
+                matches.append({
+                    "name": cl.name,
+                    "elevation_m": cl.elevation_m,
+                    "project_llm_id": pl["llm_id"],
+                })
+                coupe_remaining.remove(ci)
+                project_remaining.remove(pi)
+                break
+
+    # Pass 2: name match only (elev mismatch).
+    name_only: List[Dict[str, Any]] = []
+    for ci in list(coupe_remaining):
+        cl = coupe_levels[ci]
+        for pi in list(project_remaining):
+            pl = project_levels[pi]
+            if pl.get("name") == cl.name:
+                name_only.append({
+                    "name": cl.name,
+                    "coupe_elevation_m": cl.elevation_m,
+                    "project_elevation_m": float(pl.get("elevation", 0.0)),
+                    "project_llm_id": pl["llm_id"],
+                    "delta_m": round(
+                        cl.elevation_m - float(pl.get("elevation", 0.0)), 4,
+                    ),
+                })
+                coupe_remaining.remove(ci)
+                project_remaining.remove(pi)
+                break
+
+    # Pass 3: elevation match only (name mismatch).
+    elev_only: List[Dict[str, Any]] = []
+    for ci in list(coupe_remaining):
+        cl = coupe_levels[ci]
+        for pi in list(project_remaining):
+            pl = project_levels[pi]
+            if abs(float(pl.get("elevation", 0.0)) - cl.elevation_m) <= elevation_tol_m:
+                elev_only.append({
+                    "elevation_m": cl.elevation_m,
+                    "coupe_name": cl.name,
+                    "project_name": pl.get("name"),
+                    "project_llm_id": pl["llm_id"],
+                })
+                coupe_remaining.remove(ci)
+                project_remaining.remove(pi)
+                break
+
+    # Remaining.
+    missing = [
+        {"name": coupe_levels[ci].name, "elevation_m": coupe_levels[ci].elevation_m}
+        for ci in coupe_remaining
+    ]
+    extra = [
+        {
+            "name": project_levels[pi].get("name"),
+            "elevation_m": float(project_levels[pi].get("elevation", 0.0)),
+            "project_llm_id": project_levels[pi]["llm_id"],
+        }
+        for pi in project_remaining
+    ]
+
+    # Suggested actions.
+    actions: List[Dict[str, Any]] = []
+    for m in missing:
+        actions.append({
+            "action": "create_level",
+            "name": m["name"],
+            "elevation_m": m["elevation_m"],
+            "rationale": "Niveau présent dans la coupe DXF, absent du projet.",
+        })
+    for n in name_only:
+        actions.append({
+            "action": "modify_elevation",
+            "project_llm_id": n["project_llm_id"],
+            "name": n["name"],
+            "from_m": n["project_elevation_m"],
+            "to_m": n["coupe_elevation_m"],
+            "rationale": (
+                "Niveau '{}' existe avec une élévation différente "
+                "(Δ={:.3f} m). Adapter au DXF ? (confirmation user "
+                "requise — peut casser les hôtes existants)".format(
+                    n["name"], n["delta_m"],
+                )
+            ),
+        })
+    for e in elev_only:
+        actions.append({
+            "action": "rename_or_keep",
+            "project_llm_id": e["project_llm_id"],
+            "from_name": e["project_name"],
+            "to_name": e["coupe_name"],
+            "elevation_m": e["elevation_m"],
+            "rationale": (
+                "Élévation {} m match mais noms différents : '{}' (KG) "
+                "vs '{}' (DXF). Renommer ou garder le nom projet "
+                "(souvent intentionnel : RDC vs Niveau 0)."
+                .format(e["elevation_m"], e["project_name"], e["coupe_name"])
+            ),
+        })
+    # Pas d'action `delete` automatique sur extra_in_project — listé en
+    # info uniquement. Si user veut supprimer, c'est explicite via
+    # `levels_delete` (non implémenté V0 d'ailleurs).
+    for x in extra:
+        actions.append({
+            "action": "keep_extra",
+            "project_llm_id": x["project_llm_id"],
+            "name": x["name"],
+            "elevation_m": x["elevation_m"],
+            "rationale": (
+                "Niveau '{}' présent dans le projet mais absent de la "
+                "coupe DXF. Garder par défaut (suppression non automatique)."
+                .format(x["name"])
+            ),
+        })
+
+    return LevelReconciliation(
+        matches=matches,
+        name_only_matches=name_only,
+        elev_only_matches=elev_only,
+        missing_in_project=missing,
+        extra_in_project=extra,
+        suggested_actions=actions,
+    )
+
+
 # ----- Matching coupe ↔ plan --------------------------------------------
 
 

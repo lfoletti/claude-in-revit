@@ -22,6 +22,7 @@ ezdxf = pytest.importorskip("ezdxf")
 from lib import dwg_reader, dwg_section_reader as dsr
 from lib.dwg_section_reader import (
     Level,
+    LevelReconciliation,
     SectionMarker,
     SectionOpening,
     classify_dxf,
@@ -32,6 +33,7 @@ from lib.dwg_section_reader import (
     parse_block_id,
     read_levels,
     read_section_openings,
+    reconcile_levels,
 )
 
 
@@ -467,6 +469,150 @@ def test_find_section_markers_returns_empty_when_no_g_anno_layer(tmp_path):
     entities, _ = dwg_reader.parse(path)
     markers = find_section_markers(entities)
     assert markers == []
+
+
+# ----- reconcile_levels -------------------------------------------------
+
+
+def _level(name, elev):
+    return Level(name=name, elevation_m=elev, y_dxf_m=elev,
+                 line_x_range_m=(0.0, 1.0), source="test")
+
+
+def test_reconcile_all_match():
+    coupe = [_level("Niveau 0", 0.0), _level("Niveau 1", 3.0)]
+    project = [
+        {"llm_id": "level_001", "name": "Niveau 0", "elevation": 0.0},
+        {"llm_id": "level_002", "name": "Niveau 1", "elevation": 3.0},
+    ]
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.matches) == 2
+    assert not rec.missing_in_project
+    assert not rec.extra_in_project
+    assert not rec.suggested_actions  # rien à faire
+
+
+def test_reconcile_missing_in_project():
+    coupe = [_level("Niveau 0", 0.0), _level("Niveau 1", 3.0), _level("Niveau 2", 6.0)]
+    project = [
+        {"llm_id": "level_001", "name": "Niveau 0", "elevation": 0.0},
+    ]
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.matches) == 1
+    assert len(rec.missing_in_project) == 2
+    # 2 actions create_level.
+    creates = [a for a in rec.suggested_actions if a["action"] == "create_level"]
+    assert len(creates) == 2
+    assert creates[0]["name"] == "Niveau 1"
+    assert creates[0]["elevation_m"] == 3.0
+
+
+def test_reconcile_name_match_elev_mismatch():
+    """Même nom, élévation différente → suggère modify_elevation."""
+    coupe = [_level("Niveau 1", 3.0)]
+    project = [{"llm_id": "level_001", "name": "Niveau 1", "elevation": 2.7}]
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.matches) == 0
+    assert len(rec.name_only_matches) == 1
+    n = rec.name_only_matches[0]
+    assert n["delta_m"] == 0.3  # 3.0 - 2.7
+    modifies = [a for a in rec.suggested_actions if a["action"] == "modify_elevation"]
+    assert len(modifies) == 1
+    assert modifies[0]["from_m"] == 2.7
+    assert modifies[0]["to_m"] == 3.0
+
+
+def test_reconcile_elev_match_name_mismatch():
+    """RDC ↔ Niveau 0 même elev → suggère rename_or_keep (intentionnel)."""
+    coupe = [_level("Niveau 0", 0.0)]
+    project = [{"llm_id": "level_001", "name": "RDC", "elevation": 0.0}]
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.elev_only_matches) == 1
+    actions = [a for a in rec.suggested_actions if a["action"] == "rename_or_keep"]
+    assert len(actions) == 1
+    assert actions[0]["from_name"] == "RDC"
+    assert actions[0]["to_name"] == "Niveau 0"
+
+
+def test_reconcile_extra_in_project_keeps_no_delete():
+    """Niveau projet absent du DXF → action 'keep_extra', pas de delete."""
+    coupe = [_level("Niveau 0", 0.0)]
+    project = [
+        {"llm_id": "level_001", "name": "Niveau 0", "elevation": 0.0},
+        {"llm_id": "level_002", "name": "Sous-sol", "elevation": -3.0},
+    ]
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.matches) == 1
+    assert len(rec.extra_in_project) == 1
+    keeps = [a for a in rec.suggested_actions if a["action"] == "keep_extra"]
+    assert len(keeps) == 1
+    assert keeps[0]["name"] == "Sous-sol"
+    # Aucune action delete proposée.
+    assert all(a["action"] != "delete" for a in rec.suggested_actions)
+
+
+def test_reconcile_empty_project_creates_all():
+    """Projet vierge + 3 niveaux DXF → 3 create_level."""
+    coupe = [_level("Niveau 0", 0.0), _level("Niveau 1", 3.0), _level("Niveau 2", 6.0)]
+    project: list = []
+    rec = reconcile_levels(coupe, project)
+    assert len(rec.missing_in_project) == 3
+    assert len([a for a in rec.suggested_actions if a["action"] == "create_level"]) == 3
+
+
+def test_reconcile_via_tool_projet4_empty_kg(kg_factory_via_lambda=None):
+    """Tool roundtrip : projet vide, Coupe 1 → 3 create_level."""
+    if not PROJET4_COUPE1.exists():
+        pytest.skip("Projet4 absent")
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "levels_reconcile_with_dxf",
+        {"coupe_path": str(PROJET4_COUPE1)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["coupe_levels_count"] == 3
+    assert payload["project_levels_count"] == 0
+    assert len(payload["missing_in_project"]) == 3
+    assert payload["alignment_complete"] is False
+    creates = [a for a in payload["suggested_actions"] if a["action"] == "create_level"]
+    assert len(creates) == 3
+    # Élévations attendues : 0/3/6m.
+    elevs = sorted(a["elevation_m"] for a in creates)
+    assert elevs == [0.0, 3.0, 6.0]
+
+
+def test_reconcile_via_tool_aligned_when_match(kg_factory_via_lambda=None):
+    """Tool roundtrip : projet déjà aligné → alignment_complete=True."""
+    if not PROJET4_COUPE1.exists():
+        pytest.skip("Projet4 absent")
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    # Seed le KG avec les 3 niveaux Projet4.
+    kg.add_node("Level", {"name": "Niveau 0", "elevation": 0.0})
+    kg.add_node("Level", {"name": "Niveau 1", "elevation": 3.0})
+    kg.add_node("Level", {"name": "Niveau 2", "elevation": 6.0})
+    result = llm_protocol.dispatch_tool_use(
+        "levels_reconcile_with_dxf",
+        {"coupe_path": str(PROJET4_COUPE1)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["alignment_complete"] is True
+    assert len(payload["matches"]) == 3
+    assert not payload["suggested_actions"]
 
 
 # ----- identify_source --------------------------------------------------

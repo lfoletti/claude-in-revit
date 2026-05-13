@@ -216,6 +216,94 @@ def create(
     }
 
 
+@tool(name="levels_reconcile_with_dxf", tier=2)
+def reconcile_with_dxf(
+    kg: ProjectKG,
+    coupe_path: str,
+    elevation_tol_m: float = 0.01,
+) -> Dict[str, Any]:
+    """Reconcile niveaux extraits d'une coupe DXF avec ceux du projet KG.
+
+    Étape 5 de la Phase 1 import projet. **Read-only** — ne mute rien.
+    Le caller (LLM ou user) consulte les `suggested_actions` et applique
+    via les tools existants (`levels_create_many`, `levels_set_elevation`,
+    `levels_set_name`) après confirmation user.
+
+    Algo : 3 passes (match exact nom+elev, match nom seul, match elev
+    seul). Le reste est missing/extra.
+
+    Concepts: niveau, level, dxf, coupe, reconcile, diff, projet,
+              phase 1, import, alignement
+    Phrases: "compare les niveaux", "reconcile levels with dxf",
+             "quels niveaux manquent", "level diff"
+    Similar: levels_create_many, levels_set_elevation,
+             dwg_inspect_sections, catalog_list_levels
+
+    Args:
+        coupe_path: chemin du DXF coupe d'où extraire les niveaux
+            (layer `A-FLOR-LEVL`).
+        elevation_tol_m: tolérance pour considérer 2 élévations égales
+            (défaut 0.01m = 1cm).
+
+    Returns:
+        {"ok": bool, "coupe_levels_count": int, "project_levels_count": int,
+         "matches": list, "name_only_matches": list, "elev_only_matches": list,
+         "missing_in_project": list, "extra_in_project": list,
+         "suggested_actions": list, "alignment_complete": bool}
+        `alignment_complete=True` ssi tout est `matches` (rien à faire).
+    """
+    from pathlib import Path
+    from .. import dwg_reader, dwg_section_reader
+
+    path = Path(coupe_path)
+    if not path.exists():
+        raise FileNotFoundError("Coupe file not found: {}".format(path))
+
+    entities, _ = dwg_reader.parse(path)
+    coupe_levels = dwg_section_reader.read_levels(entities)
+    if not coupe_levels:
+        raise ValueError(
+            "No levels found in {} (layer A-FLOR-LEVL absent or empty). "
+            "Is this really a coupe DXF ? Use `dwg_inspect_sections` to "
+            "verify kind.".format(path.name)
+        )
+
+    project_levels: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("Level"):
+        attrs = kg.get_node(nid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        project_levels.append({
+            "llm_id": nid,
+            "name": attrs.get("name"),
+            "elevation": attrs.get("elevation"),
+        })
+
+    rec = dwg_section_reader.reconcile_levels(
+        coupe_levels, project_levels, elevation_tol_m=elevation_tol_m,
+    )
+
+    alignment_complete = (
+        not rec.missing_in_project
+        and not rec.name_only_matches
+        and not rec.elev_only_matches
+    )
+
+    return {
+        "ok": True,
+        "coupe_path": str(path),
+        "coupe_levels_count": len(coupe_levels),
+        "project_levels_count": len(project_levels),
+        "matches": list(rec.matches),
+        "name_only_matches": list(rec.name_only_matches),
+        "elev_only_matches": list(rec.elev_only_matches),
+        "missing_in_project": list(rec.missing_in_project),
+        "extra_in_project": list(rec.extra_in_project),
+        "suggested_actions": list(rec.suggested_actions),
+        "alignment_complete": alignment_complete,
+    }
+
+
 @tool(name="levels_create_floor_plan", tier=1)
 def create_floor_plan(
     kg: ProjectKG,

@@ -90,6 +90,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "levels_create",
         "levels_create_many",
         "levels_create_floor_plan",
+        "levels_reconcile_with_dxf",
         "levels_set_elevation",
         "levels_set_name",
         "walls_set_height_many",
