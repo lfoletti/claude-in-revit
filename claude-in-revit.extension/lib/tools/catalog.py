@@ -13,27 +13,68 @@ from ..project_kg import ProjectKG
 
 
 @tool(name="catalog_list_levels", tier=1)
-def list_levels(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+def list_levels(kg: ProjectKG, doc: Any = None) -> Dict[str, List[Dict[str, Any]]]:
     """Liste tous les niveaux du projet avec leur llm_id, nom et altitude (m).
 
-    Concepts: niveau, level, étage, plan d'étage, inventaire
+    Si appelé avec un `doc` Revit (cas runtime), ajoute aussi
+    `floor_plan_view_revit_id` pour chaque niveau — l'`ElementId` de la
+    vue Plan d'étage associée. Utile pour `views_link_cad` qui exige
+    une vue cible. Si pas de plan d'étage associé (cas rare), le
+    champ est None.
+
+    Concepts: niveau, level, étage, plan d'étage, inventaire, vue plan
     Phrases: "quels niveaux", "liste les niveaux", "list levels"
-    Similar: catalog_list_wall_types
+    Similar: catalog_list_wall_types, views_link_cad
 
     Args:
         (aucun)
 
     Returns:
-        {"levels": [{llm_id, name, elevation}, ...]}
+        {"levels": [{llm_id, name, elevation,
+                     floor_plan_view_revit_id?}, ...]}
     """
     out: List[Dict[str, Any]] = []
+
+    # Pré-calcul du mapping level_revit_id → floor_plan_view_revit_id
+    # si on est en Revit (sinon, on skip — KG-only path).
+    level_to_plan_view: Dict[int, int] = {}
+    if doc is not None:
+        try:
+            from Autodesk.Revit.DB import (
+                FilteredElementCollector, ViewPlan, ViewType,
+            )
+            for v in FilteredElementCollector(doc).OfClass(ViewPlan):
+                # On ne veut que les VRAIS plans d'étage, pas les RCP /
+                # area plans / structural plans.
+                if v.ViewType != ViewType.FloorPlan:
+                    continue
+                # GenLevel est le Level associé. Peut être None pour
+                # certains plans d'étage sans level (rare).
+                gen_level = getattr(v, "GenLevel", None)
+                if gen_level is None:
+                    continue
+                level_to_plan_view[int(gen_level.Id.Value)] = int(v.Id.Value)
+        except Exception:  # noqa: BLE001
+            # En cas de problème runtime (template exotique, etc.), on
+            # dégrade gracieusement à la liste sans floor_plan_view_revit_id.
+            level_to_plan_view = {}
+
     for nid in kg.find_by_type("Level"):
         attrs = kg.get_node(nid)
-        out.append({
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        entry: Dict[str, Any] = {
             "llm_id": nid,
             "name": attrs.get("name"),
             "elevation": attrs.get("elevation"),
-        })
+        }
+        if doc is not None:
+            level_revit_id = attrs.get("_revit_id")
+            if level_revit_id is not None:
+                entry["floor_plan_view_revit_id"] = level_to_plan_view.get(
+                    int(level_revit_id),
+                )
+        out.append(entry)
     return {"levels": out}
 
 

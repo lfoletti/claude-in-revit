@@ -37,14 +37,15 @@ def test_horizontal_section_view_down():
     BasisX = horizontal in view. Viewer face -Y → world +X is on left.
     BasisX devrait pointer vers le right-in-view = world -X.
     BasisZ pointe vers viewer = +Y.
-    Origin = midpoint horizontal + Z au CENTRE de la plage d'élévation.
+    Origin Z = bottom_elev_m pour que DXF lié en OrientToView aligne
+    son y=0 sur world Z=0 (= Niveau 0).
     """
     r = compute_section_view_bounds(
         [-1.8, -6.0], [11.9, -6.0], "down",
         bottom_elev_m=0.0, top_elev_m=6.0, height_buffer_m=1.0,
     )
-    # Origin = midpoint horizontal + center of (bottom=0 → top+buffer=7) = 3.5
-    assert r.origin_m == pytest.approx(((-1.8 + 11.9) / 2, -6.0, 3.5))
+    # Origin = midpoint horizontal + bottom_elev_m en Z.
+    assert r.origin_m == pytest.approx(((-1.8 + 11.9) / 2, -6.0, 0.0))
     # BasisZ = -look = -(0, -1, 0) = (0, +1, 0) → vers le viewer (au +Y).
     assert r.basis_z == pytest.approx((0.0, 1.0, 0.0))
     # BasisY = world up.
@@ -83,11 +84,11 @@ def test_vertical_section_view_left():
 
 
 def test_bbox_dimensions_match_section_length_and_height():
-    """BBox symétrique en X/Y autour d'Origin, Max.Z=0 (cut plane).
+    """X symétrique autour d'Origin, Y asymétrique [0, height] depuis
+    Origin.Z = bottom_elev, Z = [-far_clip, 0] (cut plane à Max.Z).
 
-    Total height = top - bottom + buffer = 7m → half = 3.5m.
-    Origin.Z = bottom + half = 0 + 3.5 = 3.5 (centre vertical).
-    Z range : [-far_clip, 0] = [-20, 0] (pas de near_clip côté viewer).
+    Origin.Z = bottom_elev = 0 → DXF y=0 lié au view aligne avec
+    Niveau 0 Revit (world Z=0).
     """
     r = compute_section_view_bounds(
         [0, 0], [10, 0], "down",
@@ -97,14 +98,14 @@ def test_bbox_dimensions_match_section_length_and_height():
     # X span = section length 10m → half-length each side.
     assert r.bbox_min_m[0] == pytest.approx(-5.0)
     assert r.bbox_max_m[0] == pytest.approx(5.0)
-    # Y span symétrique : ±3.5.
-    assert r.bbox_min_m[1] == pytest.approx(-3.5)
-    assert r.bbox_max_m[1] == pytest.approx(3.5)
+    # Y span asymétrique : 0 à full_height = 7m (= 6 + buffer 1).
+    assert r.bbox_min_m[1] == pytest.approx(0.0)
+    assert r.bbox_max_m[1] == pytest.approx(7.0)
     # Z span = [-far_clip, 0] : cut plane à Max.Z=0, fond à Min.Z=-20.
     assert r.bbox_min_m[2] == pytest.approx(-20.0)
     assert r.bbox_max_m[2] == pytest.approx(0.0)
-    # Origin.Z = centre vertical (3.5m above ground).
-    assert r.origin_m[2] == pytest.approx(3.5)
+    # Origin.Z = bottom_elev_m (= 0 pour alignement DXF).
+    assert r.origin_m[2] == pytest.approx(0.0)
 
 
 def test_max_z_is_cut_plane_at_zero():
@@ -124,14 +125,13 @@ def test_section_length_computed():
     assert r.section_length_m == pytest.approx(5.0)  # 3-4-5 triangle
 
 
-def test_origin_at_midpoint_with_center_elev_z():
-    """Origin Z = centre vertical de la vue (bottom + half_height)."""
+def test_origin_at_midpoint_with_bottom_elev_z():
+    """Origin Z = bottom_elev_m (et pas le centre)."""
     r = compute_section_view_bounds(
         [0, 0], [10, 0], "down",
         bottom_elev_m=2.5, top_elev_m=5.5, height_buffer_m=0.0,
     )
-    # half_height = (5.5 - 2.5 + 0) / 2 = 1.5 → Origin.Z = 2.5 + 1.5 = 4.0
-    assert r.origin_m == pytest.approx((5.0, 0.0, 4.0))
+    assert r.origin_m == pytest.approx((5.0, 0.0, 2.5))
 
 
 # ----- Basis vectors are orthonormal -----------------------------------

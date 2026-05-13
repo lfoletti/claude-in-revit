@@ -130,17 +130,19 @@ def compute_section_view_bounds(
     if section_length < 1e-6:
         raise ValueError("Section line has zero length (p1 == p2)")
 
-    # Origin = CENTER de la vue dans le monde, pas le coin bas. La
-    # convention Revit (Building Coder, RevitAPI docs) veut un BBox
-    # symétrique autour d'Origin, donc Origin est au centre horizontal
-    # ET vertical du futur cadrage. Le Z origin = milieu de la plage
-    # d'élévation (bottom_elev → top_elev + buffer).
-    half_height = (top_elev_m - bottom_elev_m + height_buffer_m) / 2.0
-    center_z = bottom_elev_m + half_height  # = (bottom + top + buffer) / 2
+    # Origin Z = bottom_elev_m (PAS au centre). Raison : avec
+    # OrientToView=True sur les liens CAD, Revit aligne DXF (0,0) sur
+    # le local (0,0) de la vue, qui est sous-tendu par Origin en world.
+    # Si Origin.Z = 0 (bottom), DXF y=0 (= Niveau 0) → world Z = 0
+    # = bon alignement avec Niveau 0 Revit. Si Origin.Z = center (3.5m),
+    # le DXF est shifté de +3.5m → bug runtime 2026-05-13 (niveaux
+    # DXF/Revit non alignés). Le BBox Y est asymétrique en conséquence :
+    # de 0 (bottom) à full_height (haut). X reste symétrique autour du
+    # midpoint horizontal de la section line.
     origin = (
         (p1[0] + p2[0]) / 2.0,
         (p1[1] + p2[1]) / 2.0,
-        center_z,
+        bottom_elev_m,
     )
 
     # Look vector (toward where viewer is looking).
@@ -153,15 +155,17 @@ def compute_section_view_bounds(
     basis_x = _cross(basis_y, basis_z)
     basis_x = _normalize(basis_x)
 
-    # BBox en repère LOCAL, symétrique en X/Y autour d'Origin :
-    # X: ±half-section-length (le long de la section line).
-    # Y: ±half_height (vertical, centré sur center_z = milieu élévation).
+    # BBox en repère LOCAL :
+    # X: ±half-section-length (symétrique le long de la section line).
+    # Y: [0, full_height] (asymétrique : Origin.Z = bottom_elev, donc
+    #    Y=0 local = bottom_elev en world, Y=full_height local = top + buffer).
     # Z: [-far_clip_m, 0] où Max.Z = 0 = plan de coupe (= trait dans le
     #    plan), et Min.Z = -far_clip_m = fond de la vue (profondeur dans
     #    le sens du regard, dans la direction opposée à BasisZ).
     half_len = section_length / 2.0
-    bbox_min = (-half_len, -half_height, -far_clip_m)
-    bbox_max = (half_len, half_height, 0.0)
+    full_height = top_elev_m - bottom_elev_m + height_buffer_m
+    bbox_min = (-half_len, 0.0, -far_clip_m)
+    bbox_max = (half_len, full_height, 0.0)
 
     return SectionViewBounds(
         origin_m=origin,
