@@ -2183,7 +2183,9 @@ def import_walls_typed(
     }
 
 
-@tool(name="dwg_import_walls_typed_many", tier=2)
+# Tool DEPRECATED tier=3 — remplacé par `dwg_create_continuous_walls_many`
+# (Phase 2a) qui inclut fusion via vote élévation + score 3D suspects.
+@tool(name="dwg_import_walls_typed_many", tier=3)
 def import_walls_typed_many(
     kg: ProjectKG,
     doc: Any,
@@ -2887,7 +2889,12 @@ def _collect_coupe_openings_world(
     return list(seen.values())
 
 
-@tool(name="dwg_import_walls_and_openings_typed_many", tier=2)
+# Tool DEPRECATED (tier=3 = pas exposé au LLM par défaut) — remplacé
+# par le pipeline décomposé `dwg_create_continuous_walls_many` (Phase 2a)
+# + `dwg_add_openings_to_walls_many` (Phase 2b). Runtime P7 a montré
+# que l'agent l'utilisait à tort APRÈS Phase 2a, recréant 25 murs
+# doublons → chaos visuel.
+@tool(name="dwg_import_walls_and_openings_typed_many", tier=3)
 def import_walls_and_openings_typed_many(
     kg: ProjectKG,
     doc: Any,
