@@ -278,6 +278,11 @@ def vote_wall_visible_in_elevation(
                     if min(dist_from_min, dist_from_max) >= edge_dist_m:
                         v_lines_centered += 1
 
+    # V3.11 : `zero_lines` = aucune ligne A-WALL du tout dans la zone
+    # projetée (= « rien du tout »). User : « 1 seul trait = pas un
+    # mur ». A fortiori, 0 traits = certainement pas un mur. Ce flag
+    # permet au filter d'identifier les zones vides sans ambiguïté.
+    zero_lines = (v_lines_count == 0 and h_lines_count == 0)
     evidence = {
         "wall_x_range": [round(x_min_w, 3), round(x_max_w, 3)],
         "wall_y_range": [round(y_min_w, 3), round(y_max_w, 3)],
@@ -287,6 +292,7 @@ def vote_wall_visible_in_elevation(
         "overlap_h_m": round(overlap_h, 3),
         "overlap_v_m": round(overlap_v, 3),
         "profile_view": profile_view,
+        "zero_lines": zero_lines,
     }
 
     # Critère V3.8 final permissif (overlap quelconque suffit) car les

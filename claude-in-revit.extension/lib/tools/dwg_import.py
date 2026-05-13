@@ -3226,12 +3226,29 @@ def create_continuous_walls_many(
         total_fusion_events += len(events)
         fusion_events_detail.extend(events)
 
-    # --- 3bis. Filter auto DÉSACTIVÉ (final après 11 tentatives) ------
-    # Voir commit final V3.8 : pas de critère discriminant fiable sans
-    # multi-signaux (cohérence multi-niveaux, etc.). Suspects flagués
-    # via score 3D consensus plus bas.
+    # --- 3bis. Filter V3.12 : zero_lines + multi-niveaux + skip fusions
+    # User : « 1 seul trait = pas un mur », « un mur a un début et une
+    # fin ». Critère : filter si UNE élévation a `zero_lines` (= 0
+    # lignes A-WALL dans la zone projetée) ET pas d'équivalent à un
+    # autre niveau (sauvegarde les vrais murs intérieurs cachés en
+    # élévation mais cohérents N0↔N1). Skip fusions immunes.
     total_walls_filtered = 0
     filtered_walls_detail: List[Dict[str, Any]] = []
+    for pr in plan_records:
+        level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
+        height_m = float(pr["item"].get("height_m") or 3.0)
+        # Collecte les walls des autres niveaux pour check multi-niveaux.
+        other_walls = [
+            w for other in plan_records if other is not pr
+            for w in other["walls"]
+        ]
+        kept, removed = dwg_plan_openings.filter_walls_via_elevation_vote(
+            pr["walls"], elevations, level_elev, height_m,
+            walls_at_other_levels=other_walls,
+        )
+        pr["walls"] = kept
+        total_walls_filtered += len(removed)
+        filtered_walls_detail.extend(removed)
 
     # --- 4. Dédup thicknesses + get_or_create types ---------------------
     seen_buckets: Set[int] = set()

@@ -852,6 +852,7 @@ def filter_walls_via_elevation_vote(
     height_m: float,
     *,
     min_yes_confidence: float = 0.4,
+    walls_at_other_levels: Optional[List[Any]] = None,
 ) -> Tuple[List[Any], List[Dict[str, Any]]]:
     """Filtre les `WallCandidate` faux positifs : paires parallèles que
     le classifier détecte mais qui ne correspondent pas à un vrai mur
@@ -902,21 +903,35 @@ def filter_walls_via_elevation_vote(
             )
             votes.append(v)
 
-        # Critère V3.9 : `no_count >= 1` parmi les 4 élévations →
-        # faux positif. **Exemption** : les murs fusionnés via vote
-        # élévation (= `source_indices` ≥ 2) sont immunes au filter —
-        # ils ont déjà été validés par vote pour la fusion, ce serait
-        # incohérent de les supprimer ensuite.
+        # Critère V3.11 (user 2026-05-13 : « 1 seul trait ≠ mur, donc
+        # 0 traits = certainement pas un mur ») : filter si au moins
+        # UNE élévation a `zero_lines == True` (= zone projetée
+        # complètement vide). Plus strict que `no_count >= 1` mais
+        # ne génère pas les régressions des critères « 1 seul trait »
+        # (V3.7-V3.10) car les vrais murs intérieurs ont typiquement
+        # au moins 1 ligne dans toutes les élévations.
+        # Exemption : les murs fusionnés via vote élévation sont immunes.
         if hasattr(w, "source_indices") and len(getattr(w, "source_indices", [])) > 1:
             kept.append(w)
             continue
-        no_count = sum(1 for v in votes if v.answer is False)
-        if no_count >= 1:
+        no_strict_count = sum(
+            1 for v in votes
+            if v.answer is False and v.evidence.get("zero_lines")
+        )
+        if no_strict_count >= 1:
+            # V3.12 : check multi-niveaux — si un wall équivalent existe
+            # à un autre niveau, c'est probablement un vrai mur intérieur
+            # (masqué en élévation mais cohérent multi-niveaux). Garde.
+            if walls_at_other_levels and has_equivalent_wall_at_other_level(
+                w, walls_at_other_levels,
+            ):
+                kept.append(w)
+                continue
             removed.append({
                 "wall_p1": list(w.p1),
                 "wall_p2": list(w.p2),
                 "thickness_m": round(w.thickness, 4),
-                "no_count": no_count,
+                "no_strict_count": no_strict_count,
                 "votes": [
                     {"source": v.source, "answer": v.answer,
                      "confidence": round(v.confidence, 3)}
