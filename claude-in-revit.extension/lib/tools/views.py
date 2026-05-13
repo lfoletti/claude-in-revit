@@ -221,7 +221,6 @@ def link_cad(
     from Autodesk.Revit.DB import (
         DWGImportOptions, ElementId, ImportColorMode, ImportPlacement,
     )
-    import clr
 
     placement_map = {
         "origin": ImportPlacement.Origin,
@@ -239,10 +238,6 @@ def link_cad(
 
     # Resolve target view.
     if view_revit_id is None:
-        # Default to active view.
-        uidoc = getattr(doc, "Application", None)
-        # We can't reliably get UIDocument from Document — caller must
-        # pass view_revit_id explicitly when not using ActiveView pattern.
         raise ValueError(
             "view_revit_id required (no automatic ActiveView fallback "
             "in V0). Pass the revit_id of the target view."
@@ -261,18 +256,33 @@ def link_cad(
     options.ColorMode = color_map[color_mode]
     options.OrientToView = True
 
-    out_id = clr.Reference[ElementId]()
-
     link_revit_id: Optional[int] = None
     with rp.transaction(doc, "views.link_cad"):
-        ok = doc.Link(str(path), options, view, out_id)
-        if not ok or out_id.Value is None:
+        # PythonNet 3.x convention pour les `out` params .NET :
+        # appeler la méthode sans pré-créer le placeholder, et
+        # recevoir un tuple (bool, out_value). Bug initial 2026-05-13 :
+        # j'utilisais `clr.Reference[ElementId]()` qui n'existe plus
+        # dans PythonNet 3.x (qui ship avec pyRevit Master).
+        result = doc.Link(str(path), options, view)
+        # `result` peut être :
+        #   - tuple (bool, ElementId)         — modern PythonNet 3.x
+        #   - bool seul si l'overload signature diffère
+        if isinstance(result, tuple):
+            ok, out_id = result[0], result[1] if len(result) > 1 else None
+        else:
+            ok, out_id = bool(result), None
+        if not ok:
             raise RuntimeError(
-                "doc.Link returned False for {}. The file may be "
-                "corrupted, the view may not accept CAD links, or "
-                "Revit refused for an unspecified reason.".format(path.name)
+                "doc.Link returned False for {}. Le fichier peut être "
+                "corrompu, la vue peut refuser les liens CAD, ou Revit "
+                "a refusé pour une raison non précisée.".format(path.name)
             )
-        link_revit_id = int(out_id.Value.Value)
+        if out_id is not None:
+            try:
+                link_revit_id = int(out_id.Value)
+            except AttributeError:
+                # Si out_id n'est pas un ElementId mais déjà un int.
+                link_revit_id = int(out_id)
 
     return {
         "ok": True,
@@ -281,4 +291,11 @@ def link_cad(
         "link_revit_id": link_revit_id,
         "placement": placement,
         "color_mode": color_mode,
+        "note": (
+            "Lien CAD posé. `link_revit_id` peut être None si la version "
+            "PythonNet ne supporte pas le tuple-return — le lien existe "
+            "côté Revit mais son id n'a pas été capturé. Ré-import par "
+            "Refresh KG si besoin."
+            if link_revit_id is None else None
+        ),
     }
