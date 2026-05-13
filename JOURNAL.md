@@ -14,6 +14,110 @@
 
 ---
 
+## 2026-05-13 (session t) — V2 vote multi-sources complet : élévation + récupération orphans
+
+### Contexte & objectif
+
+Runtime P7 session s (V1) : 11 openings détectés, 0 hostées, 0 fusions
+malgré le fix resolver de position. Cause : 4 openings tombent dans
+des zones où le classifier walls plan n'a pas détecté de fragments
+encadrants (murs extérieurs non classifiés, gaps trop grands).
+
+User : « il faut passer direct à la validation par élévation et au
+système de vote » + « les votes des coupes sont également pris en
+compte n'est-ce pas ? ».
+
+### Architecture vote multi-sources (V2)
+
+**4 votants livrés** :
+
+- `dwg_voting.aggregate_votes(votes, min_voters, threshold)` : somme
+  pondérée par confidence, majorité gagne au-dessus du seuil.
+- `dwg_elevation_reader.vote_wall_visible_in_elevation` : project mur
+  plan → zone élévation (conv. cardinale P7), cherche A-WALL lines.
+- `dwg_elevation_reader.vote_opening_visible_in_elevation` : cherche
+  linteau (head_elev_y) + allège (sill_elev_y).
+- `dwg_plan_openings.vote_wall_visible_in_section` : projection mur
+  sur trait → x_cut → cherche section_wall correspondant.
+- `dwg_plan_openings.vote_opening_visible_in_section` : matching
+  block_id + proximité du trait.
+
+**Convention élévation P7 calibrée** :
+- Nord : x_elev = -X_world ; Sud : x_elev = +X_world
+- Est : x_elev = +Y_world ; Ouest : x_elev = -Y_world
+- Y_elev = Z_world (élévation absolue).
+
+### Pipeline V2 intégré au tool
+
+`dwg_import_walls_and_openings_typed_many` :
+
+1. `_load_elevations_from_kg(kg)` : charge les 4 élévations depuis
+   `linked_views` (filtrage par mots-clés filename).
+2. Pipeline V1 existant : classify walls, merge_fragments via opening.
+3. **Si host_idx=None après V1** → `_try_recover_orphan_via_vote` :
+   construit mur virtuel via `build_virtual_wall_hypothesis`
+   (perpendiculaire au trait, longueur 6m, épaisseur 20cm défaut),
+   vote via 4 élévations, accept si majorité yes avec conf ≥ 0.5.
+4. Nouveau champ retour : `openings_recovered_via_vote`,
+   `elevations_loaded`.
+
+### Validation runtime simulée sur P7 (offline)
+
+Sur les section_lines + plans + coupes + élévations P7 :
+
+```
+Coupe openings detected: 11
+Walls N0: 15, N1: 11
+RECOVERED: op (-5.74, 5.83) lvl=3.0 via 2 yes votes conf=0.67
+RECOVERED: op (-15.60, 1.36) lvl=0.0 via 4 yes votes conf=1.00
+RECOVERED: op (-6.49, 1.36) lvl=0.0 via 2 yes votes conf=0.67
+RECOVERED: op (-6.49, 1.36) lvl=3.0 via 2 yes votes conf=0.67
+
+hosted_normal=7  via_vote=4  orphan_final=0
+```
+
+Toutes les openings hostées. Aucun orphan résiduel.
+
+### Phases livrées
+
+**Commit `cfa888a` — V2 step 1** : `dwg_voting.py` + `dwg_elevation_reader.py`
+(parse + projection cardinale + `vote_wall_visible_in_elevation`).
+17 tests.
+
+**Commit `136d759` — V2 step 1bis** : votes coupes
+(`vote_wall_visible_in_section`, `vote_opening_visible_in_section`) +
+vote opening élévation. Architecture vote multi-sources complète.
+6 tests.
+
+**Commit ce commit — V2 step 2** : intégration au tool
+(`_load_elevations_from_kg`, `_VirtualWall`, `_try_recover_orphan_via_vote`).
+Pipeline complet avec récupération orphans.
+
+### Validation cumulée
+
+**597 tests verts** (574 → 597, +23). Pas de régression.
+
+### À valider runtime sur P7
+
+User supprime à nouveau les murs DXF + types côté Revit, re-prompt
+« importe ce projet ». Attentes :
+- `walls_merged_count` ≥ 0 (idéalement > 0, mais P7 ne semble pas
+  avoir de fusions classiques).
+- `openings_recovered_via_vote` ≈ 4 (cf. simulation offline).
+- `openings_orphan_count` ≈ 0.
+- 3D doit montrer les murs continus + fenêtres aux bonnes positions.
+
+### Reste à faire
+
+- Élargir le vote au filtre des faux positifs murs (paires parallèles
+  = changement de matériau, pas mur réel). Cf. mémoire user 2026-05-13.
+- Validation des fusions douteuses par élévation (downgrade fusions
+  plan-only sans confirmation visuelle).
+- Vote ouverture en élévation utilisé directement (pas juste pour mur
+  virtuel) — confirmer porte vs fenêtre via linteau/allège.
+
+---
+
 ## 2026-05-13 (session s) — V1 vote multi-sources : openings depuis coupe = source primaire
 
 ### Contexte & objectif

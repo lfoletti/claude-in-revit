@@ -28,9 +28,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .. import (
     dwg_classifier,
     dwg_coherence,
+    dwg_elevation_reader,
     dwg_plan_openings,
     dwg_reader,
     dwg_section_reader,
+    dwg_voting,
 )
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
@@ -2383,6 +2385,148 @@ def _find_default_family_type(
     return None
 
 
+class _VirtualWall:
+    """Adapter qui imite l'API de `WallCandidate` (p1, p2, thickness,
+    layer, confidence) à partir d'un dict d'hypothèse. Utilisé pour
+    insérer un mur virtuel dans `walls_current` lors d'une récupération
+    d'orphan par vote.
+    """
+    def __init__(self, hypo: Dict[str, Any]) -> None:
+        self.p1 = hypo["p1"]
+        self.p2 = hypo["p2"]
+        self.thickness = float(hypo["thickness"])
+        self.layer = hypo["layer"]
+        self.confidence = float(hypo["confidence"])
+        self.source_indices: List[int] = []  # virtual = no source fragments
+
+
+def _try_recover_orphan_via_vote(
+    co: Dict[str, Any],
+    plan_record: Dict[str, Any],
+    elevations: Dict[str, "dwg_elevation_reader.ElevationView"],
+    section_lines: List[Dict[str, Any]],
+    *,
+    min_decision_confidence: float = 0.5,
+    height_m_default: float = 3.0,
+) -> bool:
+    """Essai de récupération d'une opening orphan par construction d'un
+    mur virtuel + vote élévations (V2 step 2).
+
+    Algorithme :
+    1. Identifie la section_line correspondante.
+    2. Construit un mur virtuel passant par l'opening, perpendiculaire
+       au trait.
+    3. Vote via les 4 élévations (si présentes).
+    4. Si `aggregate_votes` retourne yes avec confidence ≥
+       `min_decision_confidence`, ajoute le mur virtuel à
+       `plan_record["walls_current"]` et host l'opening.
+
+    Returns:
+        True si récupération réussie, False sinon.
+    """
+    if not elevations:
+        return False
+    sl = next(
+        (x for x in section_lines if x.get("coupe_path") == co.get("coupe_path")),
+        None,
+    )
+    if sl is None:
+        return False
+    sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
+    sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
+    opening_xy = (co["x_world"], co["y_world"])
+    hypo = dwg_plan_openings.build_virtual_wall_hypothesis(opening_xy, sp1, sp2)
+
+    votes = []
+    for direction, ev in elevations.items():
+        v = dwg_elevation_reader.vote_wall_visible_in_elevation(
+            hypo["p1"], hypo["p2"],
+            co["level_elevation_m"], height_m_default, ev,
+        )
+        votes.append(v)
+    if not votes:
+        return False
+    decision = dwg_voting.aggregate_votes(votes, min_voters=1, threshold=0.5)
+    if decision.answer is not True:
+        return False
+    if decision.confidence_score < min_decision_confidence:
+        return False
+
+    # Accept : append virtual wall to walls_current and host opening.
+    virtual = _VirtualWall(hypo)
+    plan_record["walls_current"].append(virtual)
+    new_idx = len(plan_record["walls_current"]) - 1
+    plan_record["openings_assigned"].append({
+        "coupe_opening": co,
+        "host_idx": new_idx,
+        "virtual_wall": True,
+        "vote_decision_confidence": decision.confidence_score,
+    })
+    return True
+
+
+def _load_elevations_from_kg(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+) -> Dict[str, "dwg_elevation_reader.ElevationView"]:
+    """Charge les élévations depuis le `DxfImportContext.linked_views`.
+
+    Filtre par mots-clés filename / view_name pour détecter les
+    élévations (l'agent passe parfois `view_kind='section'` au lieu de
+    `'elevation'` — bug séparé tracking).
+
+    Returns:
+        Dict `{direction: ElevationView}` avec `direction` ∈ {Nord, Sud,
+        Est, Ouest}. Au plus 1 élévation par direction (la dernière vue
+        gagne).
+    """
+    elevations: Dict[str, "dwg_elevation_reader.ElevationView"] = {}
+    from .dxf_context import _find_live_context
+    nid = _find_live_context(kg)
+    if nid is None:
+        return elevations
+    ctx = kg.get_node(nid)
+    linked = ctx.get("linked_views", [])
+    seen_paths: Set[str] = set()
+    for lv in linked:
+        fp = lv.get("file_path", "")
+        if not fp or fp in seen_paths:
+            continue
+        seen_paths.add(fp)
+        name_low = (lv.get("view_name") or "").lower()
+        path_low = fp.lower()
+        is_elev = any(
+            kw in name_low or kw in path_low
+            for kw in ("élévation", "elévation", "elevation")
+        )
+        if not is_elev:
+            continue
+        direction: Optional[str] = None
+        # Ordre important : Ouest avant Est (subset substring).
+        for d, aliases in (
+            ("Ouest", ("ouest", "west")),
+            ("Nord", ("nord", "north")),
+            ("Sud", ("sud", "south")),
+            ("Est", ("est", "east")),
+        ):
+            if any(a in name_low or a in path_low for a in aliases):
+                direction = d
+                break
+        if direction is None:
+            continue
+        cp = Path(fp)
+        if not cp.exists():
+            continue
+        try:
+            ents, _ = dwg_reader.parse(cp, scale_override=scale_override)
+            elevations[direction] = dwg_elevation_reader.parse_elevation(
+                ents, direction,
+            )
+        except Exception:  # noqa: BLE001 — élévation illisible n'arrête pas l'import.
+            continue
+    return elevations
+
+
 def _collect_coupe_openings_world(
     kg: ProjectKG,
     section_lines: List[Dict[str, Any]],
@@ -2627,8 +2771,12 @@ def import_walls_and_openings_typed_many(
         kg, section_lines, scale_override, level_elev_by_ref,
     )
 
+    # --- V2 : charger élévations pour vote multi-sources ----------------
+    elevations = _load_elevations_from_kg(kg, scale_override=scale_override)
+
     # --- Distribuer chaque coupe_opening sur son plan + fusion fragments --
     openings_orphan_count = 0
+    openings_recovered_via_vote = 0
     for co in coupe_openings:
         # Trouve le(s) plan(s) dont level matche l'élévation de l'opening.
         # En P7 typique : 1 plan par niveau, donc 0 ou 1 match.
@@ -2654,6 +2802,13 @@ def import_walls_and_openings_typed_many(
         )
         pr["walls_current"] = new_walls
         if host_idx is None:
+            # V2 fallback : essai mur virtuel + vote élévations.
+            recovered = _try_recover_orphan_via_vote(
+                co, pr, elevations, section_lines,
+            )
+            if recovered:
+                openings_recovered_via_vote += 1
+                continue
             openings_orphan_count += 1
             continue
         pr["openings_assigned"].append({"coupe_opening": co, "host_idx": host_idx})
@@ -2840,6 +2995,8 @@ def import_walls_and_openings_typed_many(
         "openings_windows_created": len(window_items),
         "openings_unmatched_count": openings_unmatched_count,
         "openings_orphan_count": openings_orphan_count,
+        "openings_recovered_via_vote": openings_recovered_via_vote,
+        "elevations_loaded": list(elevations.keys()),
         "thickness_distribution_global": {
             "{}cm".format(cm): count
             for cm, count in sorted(thickness_dist.items())

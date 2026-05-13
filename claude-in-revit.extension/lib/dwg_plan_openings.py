@@ -637,6 +637,52 @@ def merge_fragments_around_opening(
     return walls, None
 
 
+# ----- V2 — Construction hypothèses mur pour récupération orphans ------
+
+
+def build_virtual_wall_hypothesis(
+    opening_world: Tuple[float, float],
+    section_line_p1: Tuple[float, float],
+    section_line_p2: Tuple[float, float],
+    *,
+    default_thickness_m: float = 0.20,
+    span_m: float = 6.0,
+) -> Dict[str, Any]:
+    """Construit un mur virtuel passant par l'opening, perpendiculaire
+    au trait de coupe.
+
+    Si trait vertical (cut along world Y) → opening est sur un mur
+    HORIZONTAL au plan (les murs perpendiculaires au cut sont ceux qu'on
+    voit en coupe transversale).
+    Si trait horizontal (cut along world X) → opening sur mur VERTICAL.
+
+    `span_m` est la longueur arbitraire du mur hypothétique (centrée sur
+    l'opening). Le vote élévation valide ou invalide.
+
+    Returns:
+        Dict `{p1, p2, thickness, layer, confidence}` consommable comme
+        un WallCandidate (duck-typing).
+    """
+    trait_dx = section_line_p2[0] - section_line_p1[0]
+    trait_dy = section_line_p2[1] - section_line_p1[1]
+    half = span_m / 2.0
+    if abs(trait_dx) < abs(trait_dy):
+        # Trait vertical → mur perpendiculaire = horizontal.
+        p1 = (opening_world[0] - half, opening_world[1])
+        p2 = (opening_world[0] + half, opening_world[1])
+    else:
+        # Trait horizontal → mur vertical.
+        p1 = (opening_world[0], opening_world[1] - half)
+        p2 = (opening_world[0], opening_world[1] + half)
+    return {
+        "p1": p1, "p2": p2,
+        "thickness": default_thickness_m,
+        "layer": "A-WALL",
+        "confidence": 0.5,
+        "_virtual": True,
+    }
+
+
 # ----- V2 — Votes coupe pour mur / opening (multi-sources) ------------
 
 
