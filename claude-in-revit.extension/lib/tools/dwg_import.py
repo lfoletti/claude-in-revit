@@ -2242,6 +2242,15 @@ def import_walls_typed_many(
     if layer_mapping is None:
         layer_mapping = {"A-WALL": "wall"}
 
+    # V3.3 : ensure shared param `claude-in-revit:llm_id` est bound
+    # avant les créations (cf. `dwg_create_continuous_walls_many`).
+    if doc is not None:
+        try:
+            from .. import revit_primitives as rp
+            rp.ensure_shared_param_binding(doc)
+        except Exception:  # noqa: BLE001
+            pass
+
     # --- 1. Pre-validate items + parse + classify each plan -------------
     parsed_per_file: List[Tuple[Dict[str, Any], List[Any]]] = []
     for i, it in enumerate(items):
@@ -2711,6 +2720,15 @@ def import_walls_and_openings_typed_many(
     if layer_mapping is None:
         layer_mapping = {"A-WALL": "wall"}
 
+    # V3.3 : ensure shared param `claude-in-revit:llm_id` est bound
+    # avant les créations (cf. `dwg_create_continuous_walls_many`).
+    if doc is not None:
+        try:
+            from .. import revit_primitives as rp
+            rp.ensure_shared_param_binding(doc)
+        except Exception:  # noqa: BLE001
+            pass
+
     # --- Build section_lines (paramètre explicite ou KG) --------------
     if section_lines is None:
         section_lines = []
@@ -3113,6 +3131,18 @@ def create_continuous_walls_many(
         raise ValueError("items must be a non-empty list")
     if layer_mapping is None:
         layer_mapping = {"A-WALL": "wall"}
+
+    # V3.3 : ensure shared param `claude-in-revit:llm_id` est bound
+    # AVANT toute création (bug runtime P7 : murs créés sans llm_id
+    # côté Revit → user ne peut pas identifier individuellement).
+    # Ouvre sa propre Tx Revit donc obligatoire de l'appeler hors des
+    # Tx des sous-tools.
+    if doc is not None:
+        try:
+            from .. import revit_primitives as rp
+            rp.ensure_shared_param_binding(doc)
+        except Exception:  # noqa: BLE001 — UX surface, jamais fatal.
+            pass
 
     # --- 1. Pré-validation + classify per plan -------------------------
     plan_records: List[Dict[str, Any]] = []
