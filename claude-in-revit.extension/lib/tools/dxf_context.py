@@ -288,3 +288,84 @@ def register_section_line(
         "section_line_index": len(section_lines) - 1,
         "total_section_lines": len(section_lines),
     }
+
+
+# ----- dxf_context_register_linked_view --------------------------------
+
+
+@tool(name="dxf_context_register_linked_view", tier=1)
+def register_linked_view(
+    kg: ProjectKG,
+    file_path: str,
+    link_revit_id: int,
+    view_revit_id: int,
+    view_kind: str,
+    view_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Enregistre dans le KG un DXF qui a été linké dans une vue Revit.
+
+    Use case : après `views_link_cad` réussi, l'agent persiste le
+    mapping (file → link_revit_id, view_revit_id) pour pouvoir retrouver
+    le lien plus tard (purge, mise à jour, etc.).
+
+    **Append-only** : appels répétés ajoutent une entry. Permet de
+    linker le même DXF dans plusieurs vues sans collision.
+
+    Concepts: dxf, link, lien, view, vue, cad, persistance, kg, contexte
+    Phrases: "enregistre le lien", "save the link", "store linked view"
+    Similar: views_link_cad, dxf_context_get,
+             dxf_context_register_section_line
+
+    Args:
+        file_path: chemin du DXF linké.
+        link_revit_id: revit_id de l'ImportInstance (retourné par
+            views_link_cad).
+        view_revit_id: revit_id de la vue cible.
+        view_kind: `"plan"` ou `"section"` (pour aider l'agent à
+            naviguer plus tard).
+        view_name: nom de la vue (facultatif, redondant avec view_revit_id
+            mais utile pour la lisibilité agent).
+
+    Returns:
+        {"ok": bool, "context_llm_id": str, "linked_view_index": int,
+         "total_linked_views": int}
+    """
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("file_path required (str)")
+    if not isinstance(link_revit_id, int) or link_revit_id <= 0:
+        raise ValueError("link_revit_id required (positive int)")
+    if not isinstance(view_revit_id, int) or view_revit_id <= 0:
+        raise ValueError("view_revit_id required (positive int)")
+    if view_kind not in ("plan", "section"):
+        raise ValueError(
+            "view_kind must be 'plan' or 'section' (got {!r})".format(view_kind)
+        )
+
+    nid = _find_live_context(kg)
+    if nid is None:
+        nid = kg.add_node(_NODE_TYPE, {
+            "directory": "",
+            "files": [],
+            "section_lines": [],
+            "linked_views": [],
+        })
+
+    node = kg.get_node(nid)
+    linked = list(node.get("linked_views", []))
+    entry = {
+        "file_path": file_path,
+        "link_revit_id": link_revit_id,
+        "view_revit_id": view_revit_id,
+        "view_kind": view_kind,
+    }
+    if view_name is not None:
+        entry["view_name"] = view_name
+    linked.append(entry)
+    kg.modify_node(nid, {"linked_views": linked})
+
+    return {
+        "ok": True,
+        "context_llm_id": nid,
+        "linked_view_index": len(linked) - 1,
+        "total_linked_views": len(linked),
+    }
