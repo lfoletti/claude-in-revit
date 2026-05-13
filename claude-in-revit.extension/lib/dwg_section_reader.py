@@ -29,6 +29,7 @@ out via ODA. Le présent module ne sait que lire la structure normalisée.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -187,6 +188,7 @@ def identify_source(layers_meta: List[Dict[str, Any]]) -> Dict[str, Any]:
 LAYER_LEVELS = "A-FLOR-LEVL"
 LAYER_GLAZING = "A-GLAZ"
 LAYER_AREA_LABELS = "A-AREA-IDEN"
+LAYER_WALLS = "A-WALL"
 
 
 # ----- Classification plan vs coupe -------------------------------------
@@ -796,6 +798,117 @@ def read_section_openings(entities: List[DwgEntity]) -> List[SectionOpening]:
         dims = parse_block_dimensions(block_name)
         if dims is not None:
             out[-1].width_m, out[-1].height_m = dims
+    return out
+
+
+# ----- Walls observés en coupe (Phase 2 Étape 1) ------------------------
+#
+# Une coupe DXF révèle les épaisseurs de murs vues "de côté" : pour
+# chaque mur traversé par le trait de coupe, on observe une paire de
+# segments verticaux parallèles sur le layer A-WALL (les deux faces du
+# mur). La distance perpendiculaire entre ces deux faces = épaisseur ;
+# l'abscisse X du DXF coupe = position le long du cut (cf. mémoire
+# `project-dxf-section-anchor-investigation`).
+#
+# Algo : on délègue la détection paires-parallèles à
+# `dwg_classifier.detect_wall_segments` (qui fait déjà ce travail
+# robustement pour les plans), puis on filtre les paires verticales
+# (angle ≈ π/2). Chaque paire devient un `SectionWall`.
+
+
+@dataclass
+class SectionWall:
+    """Un mur observé dans un DXF de coupe.
+
+    Convention DXF coupe : X = position le long du cut (m), Y =
+    élévation (m). Donc un mur coupé est une paire de segments
+    parallèles à Y (verticaux).
+
+    Champs :
+    - `x_cut_m` : abscisse du centerline (les deux faces ont x ≈ égal).
+      Sert de clé pour matcher au plan via la convention DXF anchor.
+    - `thickness_m` : distance perpendiculaire entre les 2 faces.
+    - `y_bottom_m` / `y_top_m` : extension verticale visible du mur.
+      Utile pour distinguer un mur plein d'un linteau ou d'une allège
+      (cas N→1 dans le recoupement).
+    - `layer` : layer source (typiquement `A-WALL`).
+    - `confidence` : héritée du classifier (overlap ratio de la paire).
+    """
+    x_cut_m: float
+    thickness_m: float
+    y_bottom_m: float
+    y_top_m: float
+    layer: str
+    confidence: float
+
+
+def read_section_walls(
+    entities: List[DwgEntity],
+    *,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    vertical_tol_rad: float = math.radians(5.0),
+) -> List[SectionWall]:
+    """Extrait les murs visibles dans un DXF de coupe.
+
+    Réutilise `dwg_classifier.detect_wall_segments()` sur les segments
+    A-WALL et filtre les paires verticales (centerline parallèle à Y).
+    Les paires horizontales (dalles, plafonds, allèges) sont écartées.
+
+    `max_thickness_m=0.60` (vs 0.50 dans le plan) : en coupe on voit
+    aussi des murs porteurs extérieurs épais et des doubles cloisons.
+
+    Args:
+        entities: les `DwgEntity` parsées du DXF coupe.
+        min_thickness_m / max_thickness_m: bornes d'épaisseur (m).
+        vertical_tol_rad: tolérance d'angle pour « vertical » (défaut
+            5°, large pour absorber le bruit numérique en coupe).
+
+    Returns:
+        Liste de `SectionWall`, triée par `x_cut_m` croissant.
+    """
+    # Import local pour casser le cycle théorique (classifier n'importe
+    # pas section_reader, mais autant garder une dépendance dirigée).
+    from . import dwg_classifier as _cls
+
+    segments = _cls.extract_straight_segments(
+        entities, layer_filter=[LAYER_WALLS],
+    )
+    walls, _rejected = _cls.detect_wall_segments(
+        segments,
+        min_thickness_m=min_thickness_m,
+        max_thickness_m=max_thickness_m,
+    )
+
+    out: List[SectionWall] = []
+    for w in walls:
+        # Angle du centerline (mod π, dans [0, π)).
+        dx = w.p2[0] - w.p1[0]
+        dy = w.p2[1] - w.p1[1]
+        angle = math.atan2(dy, dx)
+        if angle < 0:
+            angle += math.pi
+        if angle >= math.pi:
+            angle -= math.pi
+        # Distance angulaire à π/2 (vertical) — distance circulaire mod π.
+        delta = abs(angle - math.pi / 2.0)
+        delta = min(delta, math.pi - delta)
+        if delta > vertical_tol_rad:
+            continue
+
+        x_cut = (w.p1[0] + w.p2[0]) / 2.0
+        y_bottom = min(w.p1[1], w.p2[1])
+        y_top = max(w.p1[1], w.p2[1])
+        out.append(SectionWall(
+            x_cut_m=round(x_cut, 6),
+            thickness_m=round(w.thickness, 6),
+            y_bottom_m=round(y_bottom, 6),
+            y_top_m=round(y_top, 6),
+            layer=w.layer,
+            confidence=round(w.confidence, 3),
+        ))
+
+    out.sort(key=lambda sw: sw.x_cut_m)
     return out
 
 

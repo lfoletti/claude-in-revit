@@ -182,7 +182,16 @@ _TIER2_KEYWORDS = (
     # ici). « section » seul est trop ambigu en FR — on exige
     # contextualisation par dxf/dwg ou par le verbe « inspecter ».
     r"\bcoupes?\b|"
-    r"inspect(?:er|e|es|ent|é)?\s+(?:les\s+|la\s+|une\s+|mes\s+|le\s+|ce\s+)?(?:section|coupe|fichier|plan|projet|dossier)"
+    r"inspect(?:er|e|es|ent|é)?\s+(?:les\s+|la\s+|une\s+|mes\s+|le\s+|ce\s+)?(?:section|coupe|fichier|plan|projet|dossier)|"
+    # Phase 2 import — recoupement plan↔coupes, cohérence 3D du dossier,
+    # audit d'intégrité du plan set (gate avant modif modèle).
+    r"\brecoup(?:e|er|es|ons|ez|ent|é|ement)\b|"
+    r"\bcoh[ée]rence\b|"
+    r"\bphase\s*2\b|"
+    r"\baudit\b|"
+    r"\bint[ée]grit[ée]\b|"
+    r"\bintegrity\b|"
+    r"\bplan\s*set\b"
 )
 
 _TIER2_RE = re.compile(_TIER2_KEYWORDS, re.IGNORECASE)

@@ -14,6 +14,215 @@
 
 ---
 
+## 2026-05-13 (session o) — Phase 2 étape 1 + Audit d'intégrité du plan set
+
+### Contexte & objectif
+
+Démarrage Phase 2 après Phase 1 production-ready. User : « nouvelle
+session pour la phase 2 ». Spec Phase 2 spec'd dans la mémoire
+`project-phase2-custom-types` (7 micro-étapes). Étape 1 = recoupement
+murs plan ↔ coupes.
+
+**Pivot en cours de session** : user a re-cadré : « un "audit
+d'intégrité" du plan set est livré en 1, avant de proposer des
+changements dans le modèle, notamment les niveaux ». Donc le sous-
+produit `check_planset_coherence` (initialement futur) devient
+**`check_planset_integrity`** livré dans la même session, comme **étape
+1 du flow d'import**. Le recoupement walls (Phase 2.1) devient une
+brique de cet audit.
+
+Cadrage user complet :
+
+- Test runtime sur P7 (asymétrique, déjà calibré).
+- Mismatch walls : **présenter à l'user** pour décision.
+- Intersection : **stricte segment↔segment**.
+- Audit scope : tout (source, scale, levels coupes, walls, openings).
+- Audit gate : **hard gate** (errors → `ok=False`, agent doit stopper).
+- Dossier incomplet : si seulement plan ou plan+1 coupe → audit
+  dégradé (warnings, pas errors), continuer possible.
+- Fichiers `unknown` : ignorer silencieusement (pas de warning).
+
+### Décisions
+
+- **Architecture en 2 modules purs** :
+  - `dwg_section_reader.read_section_walls()` réutilise le classifier
+    existant (paires parallèles) et filtre les paires verticales sur
+    A-WALL → `SectionWall(x_cut_m, thickness_m, y_bottom_m, y_top_m)`.
+    Pas besoin d'écrire un nouveau détecteur — `detect_wall_segments`
+    marche tel quel en coupe.
+  - **Nouveau `lib/dwg_coherence.py`** : `reconcile_plan_section_walls()`
+    sans I/O, sans Revit. Conçu pour héberger les futurs reconciles
+    cross-vue (plan↔élévation, levels↔coupes, etc.).
+- **Tool wrapper unique tier-2** : `dwg_reconcile_plan_section_walls`
+  orchestre parse plan + parse coupes + appel module pur. Read-only.
+- **Statuses du report** : `ok`, `thickness_mismatch`,
+  `no_section_wall_at_x`, `ambiguous_multiple_candidates`. Le tool
+  agrège `needs_user_decision` pour qu'un seul check suffise à l'agent.
+- **Pas de bulk variant `_many`** pour ce tool : un appel = 1 dossier
+  projet = 1 plan, pas une orchestration multi-projets. Cohérent avec
+  la coding policy (le bulk s'applique aux ops susceptibles d'être
+  appelées en boucle dans une orchestration).
+
+### Phases livrées
+
+**Phase 1 du flow d'import : audit d'intégrité du plan set** (nouveau,
+ajouté pendant la session après pivot user).
+
+- **`lib/dwg_coherence.py`** étendu avec 5 helpers purs :
+  - `check_source_consistency` : layers AIA/ISO uniformes ?
+  - `check_levels_consistency_between_coupes` : jeu de niveaux uniforme
+    entre coupes ? Subset → warning ; conflit d'élévation pour même
+    nom → error.
+  - `check_openings_matching` : openings plan↔coupes matchés ?
+  - `check_scale_drift` : drift d'échelle plan↔coupes (≥25% → warning,
+    ≥50% → error).
+  - `walls_reconciliation_to_check` : convertit le `WallsReconciliation`
+    de Phase 2.1 en `IntegrityCheck` (mismatch ≥10cm → error, sinon
+    warning).
+  - `aggregate_planset_integrity` : combine N `IntegrityCheck` en
+    rapport global avec severity max et gate_status
+    (`pass`/`needs_user`/`abort`).
+
+- **Tool `check_planset_integrity`** (tier-2, `tools/dwg_import.py`).
+  Orchestre : glob `*.dxf` → classify + identify_source par fichier →
+  setup checks (manques structurels) → recalcul ou lecture KG des
+  section_lines → scale + levels + walls + openings → agrégation. Hard
+  gate : `ok=False` si severity=errors.
+
+- **État dégradé géré** (user : « par état dégradé il faut entendre
+  tout manque en termes de plans/coupes/élévations ») :
+  - 0 plan → error (abort, rien à valider).
+  - 0 coupe → warning (`no_section_detected`).
+  - 1 coupe seule → warning (`single_section_only`, cohérence
+    inter-coupes non vérifiable).
+  - 0 élévation → warning (`no_elevation_detected`).
+  - Élévations incomplètes (< 4 cardinales) → warning
+    (`incomplete_elevations`, expose `directions_present` et
+    `directions_missing`).
+  - Fichiers `unknown` (ni plan/section/élévation) → **ignorés
+    silencieusement** (user : « ignore unknown files »).
+
+- **Routing keywords élargis** (`preprocess.py`) : `audit`, `intégrité`,
+  `integrity`, `plan set` (en plus de `recoupement`, `cohérence`,
+  `phase 2`).
+
+**Phase 2 étape 1 (recoupement walls plan↔coupes)** — devient une
+brique de l'audit ci-dessus, mais reste exposée comme tool indépendant
+(`dwg_reconcile_plan_section_walls`) pour un appel ciblé en Phase 2 si
+besoin.
+
+**Étape 1.A — `read_section_walls`** (`dwg_section_reader.py`).
+Délégation à `dwg_classifier.extract_straight_segments` +
+`detect_wall_segments` sur le layer A-WALL, puis filtre paires
+verticales par tolérance d'angle (5° à π/2). Sortie triée par
+`x_cut_m`. `max_thickness_m=0.60` (vs 0.50 plan) pour absorber les
+murs porteurs extérieurs épais et les doubles cloisons visibles en
+coupe.
+
+**Étape 1.B — `lib/dwg_coherence.py`** (nouveau module pur). Contient :
+
+- `_segment_intersection_2d` : intersection stricte segment↔segment 2D.
+- `WallSectionMatch` + `WallsReconciliation` (dataclasses).
+- `reconcile_plan_section_walls(plan_walls, section_lines,
+  section_walls_by_coupe, …)` : croise les murs plan avec ceux
+  observés en coupe via la convention DXF anchor (`x_cut_attendu = iy`
+  pour trait vertical, `ix` pour trait horizontal — cf. mémoire
+  `project-dxf-section-anchor-investigation`).
+
+**Étape 1.C — Tool `dwg_reconcile_plan_section_walls`**
+(`tools/dwg_import.py`). Tier-2. Lit `DxfImportContext.section_lines`
+depuis le KG (ou accepte un override explicite `section_lines=...`).
+Parse plan + chaque coupe distincte référencée, délègue au module pur,
+sérialise un payload structuré par sévérité (matches_ok tronqué à 200,
+mismatches/ambiguous/no_section_wall full).
+
+**Étape 1.D — Routing tier-2 enrichi** (`preprocess.py`). Keywords
+ajoutés : `\brecoup(?:e|er|es|…)\b`, `\bcoh[ée]rence\b`, `\bphase\s*2\b`.
+« coupe » déjà présent suffisait techniquement mais les nouveaux
+keywords solidifient l'intent et préparent le futur
+`check_planset_coherence`.
+
+### Tests
+
+**Nouveau `tests/test_dwg_coherence.py`** — 35 tests. Couverture :
+
+- `read_section_walls` (4) : paire verticale, filtrage horizontales,
+  ignore non-A-WALL, tri par x_cut.
+- `_segment_intersection_2d` (3) : crossing nominal, parallèles, hors
+  bornes.
+- `reconcile_plan_section_walls` (7) : perfect match, thickness
+  mismatch, no_section_wall_at_x, walls plan non croisés, section
+  walls unmatched, ambiguous (primary = extension verticale max),
+  trait vertical → x_cut = Y world.
+- Tool `dwg_reconcile_plan_section_walls` smoke (3) : roundtrip via
+  `dispatch_tool_use` avec DXF ezdxf-générés, mismatch →
+  `needs_user_decision=True`, erreur remontée quand pas de KG context.
+- Helpers audit purs (13) : source_consistency (3), levels_consistency
+  (4), scale_drift (3), openings_matching (2), aggregate (1).
+- Tool `check_planset_integrity` smoke (5) : clean passes,
+  mismatch_severe → abort, dossier vide → error, plan-seul → warnings
+  + needs_user, pas-de-plan → abort.
+
+### Validation
+
+**547 tests verts** (512 → 547, +35). Pas de régression sur les tests
+existants. Tool registry intact.
+
+### État final & reste à faire
+
+**Audit d'intégrité + Phase 2 étape 1 livrés** :
+
+- `check_planset_integrity` (tier-2) : audit holistique du dossier
+  DXF avec hard gate, géré pour les dossiers complets et dégradés.
+- `dwg_reconcile_plan_section_walls` (tier-2) : recoupement walls
+  exposé comme tool indépendant.
+
+**Nouveau flow d'import attendu (à valider runtime sur P7)** :
+
+1. `check_planset_integrity(directory=...)` ← gate
+2. Si `abort` → présenter errors à l'user, stopper.
+3. Si `needs_user` → présenter warnings via `ui_confirm_choices`.
+4. Si `pass` ou user confirmé → enchaîner Phase 1 traditionnelle
+   (`dwg_inspect_sections`, `dwg_find_section_markers`, persistance KG,
+   `levels_reconcile_with_dxf`, `views_create_section_many`,
+   `views_link_cad_many`, etc.).
+5. **Phase 2** seulement après gate vert : détection épaisseurs
+   uniques → création types custom → création murs.
+
+**Étapes restantes Phase 2** (cf. mémoire `project-phase2-custom-types`) :
+2. Détection épaisseurs uniques observées.
+3. Création `WallType` custom `DXF_WALL_<cm>cm`.
+4. Création murs (avec `walls_create_many` existant).
+5. Ouvertures sill/head.
+6. Sols custom + `floors_create_many`.
+7. Vue 3D de validation.
+
+**Sous-produit `check_planset_coherence` livré sous le nom
+`check_planset_integrity`** — la mémoire `project-planset-coherence-
+byproduct` est à actualiser pour refléter que la brique annoncée
+« future » a été livrée dans la même session.
+
+### Méta : leçons de session
+
+1. **Réutiliser avant d'écrire** : `dwg_classifier.detect_wall_segments`
+   détectait déjà les paires verticales en coupe — pas besoin d'un
+   nouveau détecteur. L'audit Phase 1 a évité ~150 lignes de code
+   redondant. Toujours faire l'audit avant de coder.
+
+2. **Logique pure vs tool wrapper** : séparer dès le départ permet à
+   un futur tool plus large (`check_planset_coherence`) de composer
+   sans refactor. Coût marginal aujourd'hui : ~30 lignes
+   supplémentaires (module dédié + import). Bénéfice attendu : pas
+   de réécriture quand la brique sert ailleurs.
+
+3. **User-decision policy explicite** : `needs_user_decision: bool`
+   dans le payload évite à l'agent d'avoir à compter les mismatches
+   pour décider quoi faire. Pattern à réutiliser pour les futurs
+   tools de check (cf. `all_inferred_confidently` introduit en
+   session m pour `dwg_find_section_markers`).
+
+---
+
 ## 2026-05-13 (session n) — Phase 1 extensions : élévations + bulks _many + coding policy
 
 ### Contexte & objectif

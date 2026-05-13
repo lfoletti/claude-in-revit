@@ -25,7 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .. import dwg_classifier, dwg_reader, dwg_section_reader
+from .. import dwg_classifier, dwg_coherence, dwg_reader, dwg_section_reader
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 
@@ -1107,3 +1107,738 @@ def assign_coupes_to_traits(
             "et `views_link_cad`, pas l'ordre alphabétique des fichiers."
         ),
     }
+
+
+# ----- 8. Reconcile plan ↔ coupes walls (Phase 2 Étape 1) ----------------
+
+
+def _section_wall_to_dict(sw: dwg_section_reader.SectionWall) -> Dict[str, Any]:
+    return {
+        "x_cut_m": round(sw.x_cut_m, 4),
+        "thickness_m": round(sw.thickness_m, 4),
+        "y_bottom_m": round(sw.y_bottom_m, 4),
+        "y_top_m": round(sw.y_top_m, 4),
+        "layer": sw.layer,
+        "confidence": round(sw.confidence, 3),
+    }
+
+
+def _match_to_dict(m: dwg_coherence.WallSectionMatch) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "plan_wall_index": m.plan_wall_index,
+        "plan_thickness_m": round(m.plan_thickness_m, 4),
+        "section_line_index": m.section_line_index,
+        "section_line_name": m.section_line_name,
+        "coupe_path": m.coupe_path,
+        "x_cut_expected_m": m.x_cut_expected_m,
+        "status": m.status,
+    }
+    if m.section_wall_index is not None:
+        out["section_wall_index"] = m.section_wall_index
+    if m.section_thickness_m is not None:
+        out["section_thickness_m"] = round(m.section_thickness_m, 4)
+    if m.thickness_drift_m is not None:
+        out["thickness_drift_m"] = m.thickness_drift_m
+    if m.candidate_indices:
+        out["candidate_indices"] = m.candidate_indices
+    return out
+
+
+@tool(name="dwg_reconcile_plan_section_walls", tier=2)
+def reconcile_plan_section_walls(
+    kg: ProjectKG,
+    plan_path: str,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    thickness_tol_m: float = 0.02,
+    x_cut_tol_m: float = 0.10,
+    min_thickness_m: float = 0.05,
+    max_thickness_m: float = 0.60,
+    include_centerline: bool = True,
+) -> Dict[str, Any]:
+    """Recoupe les murs du plan avec ceux observés dans chaque coupe (Phase 2.1).
+
+    Première étape de la Phase 2 (création BIM depuis les DXF). Vérifie
+    la cohérence d'épaisseur plan↔coupe avant tout commit Revit :
+
+    1. Parse le plan → murs via le classifier (paires parallèles +
+       centerline fallback). Output : `WallCandidate(p1, p2, thickness)`.
+    2. Lit le `DxfImportContext` du KG (ou utilise `section_lines` passé
+       en argument) → traits de coupe avec leur DXF coupe associé.
+    3. Pour chaque DXF coupe référencé → parse + `read_section_walls`
+       (paires verticales sur A-WALL → `(x_cut_m, thickness_m)`).
+    4. Délègue à `dwg_coherence.reconcile_plan_section_walls` qui croise
+       les deux via la convention DXF anchor (cf. mémoire
+       `project-dxf-section-anchor-investigation`).
+
+    **Read-only** : aucun écrit Revit, aucun écrit KG. Le caller décide
+    quoi faire des mismatches (typiquement : présenter à l'user via
+    `ui_confirm_choices` avant de continuer Phase 2).
+
+    Concepts: dxf, dwg, recoupement, cohérence, walls, plan, coupe,
+              section, épaisseur, thickness, mismatch, validation,
+              phase 2, audit, vérification
+    Phrases: "recoupe les plans et les coupes", "vérifie la cohérence
+             des murs", "phase 2 étape 1", "audit walls plan coupe",
+             "check plan section consistency"
+    Similar: dwg_inspect_sections, dwg_classify, dxf_context_get
+
+    Args:
+        plan_path: chemin du DXF plan à analyser.
+        layer_mapping: `{layer_name: role}`. Défaut `{"A-WALL": "wall"}`
+            (convention AIA/Revit standard). À surcharger pour ISO ou
+            ArchiCAD.
+        scale_override: facteur m-par-unité-DXF (cf. `dwg_inspect`).
+        section_lines: liste de section_lines explicite (cf. format de
+            `DxfImportContext.section_lines`). Si absent, lue depuis le
+            KG. Permet de passer un sous-ensemble (ex : 1 seul trait à
+            vérifier) sans toucher au KG.
+        thickness_tol_m: tolérance d'épaisseur pour valider un match
+            (défaut 2 cm).
+        x_cut_tol_m: tolérance de position le long du cut (défaut 10 cm).
+        min_thickness_m / max_thickness_m: bornes d'épaisseur (m).
+        include_centerline: active la passe centerline du classifier
+            plan (cloisons simple-trait). Défaut True.
+
+    Returns:
+        {"ok": bool, "plan_walls_count": int, "section_lines_count": int,
+         "section_walls_count_by_coupe": {path: int},
+         "summary": {matches_ok, thickness_mismatches, no_section_wall_at_x,
+                     ambiguous, plan_walls_total, plan_walls_not_crossed,
+                     section_walls_unmatched, section_lines_count},
+         "matches": [...],  # tronqué si > 200 (matches_ok uniquement)
+         "thickness_mismatches": [...],  # tous
+         "ambiguous": [...],  # tous
+         "no_section_wall_at_x": [...],  # tous
+         "section_walls_unmatched": [...],  # tous
+         "walls_plan_not_crossed_indices": [...],  # tronqué si > 50
+         "needs_user_decision": bool,
+         "note": str}
+    """
+    path = Path(plan_path)
+    if not path.exists():
+        raise FileNotFoundError("Plan file not found: {}".format(path))
+
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+
+    # --- 1. Parse plan + classify walls ---------------------------------
+    plan_entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    plan_classified = dwg_classifier.classify(
+        plan_entities, layer_mapping,
+        min_thickness_m=min_thickness_m,
+        max_thickness_m=max_thickness_m,
+        include_centerline=include_centerline,
+    )
+    plan_walls_dict = [_wall_candidate_to_dict(w) for w in plan_classified.walls]
+
+    # --- 2. Récupérer les section_lines ---------------------------------
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext vivant dans le KG et `section_lines` "
+                "non fourni. Lance d'abord Phase 1 (dwg_inspect_sections + "
+                "dxf_context_register_section_line[_many]) ou passe explicite-"
+                "ment `section_lines`."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines enregistrées. "
+                "Lance Phase 1 étape 2 d'abord (dxf_context_register_section_"
+                "line[_many]).",
+            )
+
+    # --- 3. Parse chaque coupe référencée → section walls ---------------
+    section_walls_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    distinct_coupe_paths = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for coupe_path in distinct_coupe_paths:
+        cp_path = Path(coupe_path)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF référencé par section_lines introuvable : {}".format(
+                    cp_path,
+                )
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        section_walls = dwg_section_reader.read_section_walls(
+            coupe_entities,
+            min_thickness_m=min_thickness_m,
+            max_thickness_m=max_thickness_m,
+        )
+        section_walls_by_coupe[coupe_path] = [
+            _section_wall_to_dict(sw) for sw in section_walls
+        ]
+
+    # --- 4. Reconcile (module pur) --------------------------------------
+    report = dwg_coherence.reconcile_plan_section_walls(
+        plan_walls=plan_walls_dict,
+        section_lines=section_lines,
+        section_walls_by_coupe=section_walls_by_coupe,
+        thickness_tol_m=thickness_tol_m,
+        x_cut_tol_m=x_cut_tol_m,
+    )
+
+    # --- 5. Sérialiser + filtrer par sévérité ---------------------------
+    matches_ok = [_match_to_dict(m) for m in report.matches if m.status == "ok"]
+    thickness_mismatches = [
+        _match_to_dict(m) for m in report.matches if m.status == "thickness_mismatch"
+    ]
+    ambiguous = [
+        _match_to_dict(m) for m in report.matches
+        if m.status == "ambiguous_multiple_candidates"
+    ]
+    no_section_wall = [
+        _match_to_dict(m) for m in report.matches
+        if m.status == "no_section_wall_at_x"
+    ]
+
+    # matches_ok peut être très volumineux ; tronquer à 200.
+    if len(matches_ok) > 200:
+        matches_ok_payload = matches_ok[:200]
+        matches_ok_truncated = True
+    else:
+        matches_ok_payload = matches_ok
+        matches_ok_truncated = False
+
+    walls_not_crossed = report.walls_plan_not_crossed
+    if len(walls_not_crossed) > 50:
+        walls_not_crossed_payload = walls_not_crossed[:50]
+        walls_not_crossed_truncated = True
+    else:
+        walls_not_crossed_payload = list(walls_not_crossed)
+        walls_not_crossed_truncated = False
+
+    needs_user_decision = bool(
+        thickness_mismatches or ambiguous or no_section_wall
+        or report.section_walls_unmatched
+    )
+
+    if not needs_user_decision:
+        note = (
+            "**Recoupement OK** : tous les murs plan croisés par un trait "
+            "matchent une épaisseur cohérente en coupe (tol={:.0f}mm). Pas de "
+            "section wall orphelin. Phase 2.2 (détection épaisseurs uniques) "
+            "peut démarrer sans intervention user.".format(thickness_tol_m * 1000)
+        )
+    else:
+        problems: List[str] = []
+        if thickness_mismatches:
+            problems.append("{} mismatch(es) d'épaisseur".format(
+                len(thickness_mismatches)
+            ))
+        if ambiguous:
+            problems.append("{} cas ambigu(s) (plusieurs candidats coupe)".format(
+                len(ambiguous)
+            ))
+        if no_section_wall:
+            problems.append(
+                "{} mur(s) plan croisé(s) sans mur correspondant en coupe".format(
+                    len(no_section_wall),
+                )
+            )
+        if report.section_walls_unmatched:
+            problems.append(
+                "{} mur(s) en coupe sans pendant au plan".format(
+                    len(report.section_walls_unmatched),
+                )
+            )
+        note = (
+            "**Recoupement INCOMPLET** — {}. Présenter à l'user via "
+            "`ui_confirm_choices` pour décider plan vs coupe sur chaque cas, "
+            "ou identifier une erreur d'export DXF à corriger avant Phase 2.2."
+            .format(" + ".join(problems))
+        )
+
+    return {
+        "ok": True,
+        "plan_walls_count": len(plan_walls_dict),
+        "section_lines_count": len(section_lines),
+        "section_walls_count_by_coupe": {
+            p: len(ws) for p, ws in section_walls_by_coupe.items()
+        },
+        "summary": report.summary,
+        "matches_ok": matches_ok_payload,
+        "matches_ok_truncated": matches_ok_truncated,
+        "thickness_mismatches": thickness_mismatches,
+        "ambiguous": ambiguous,
+        "no_section_wall_at_x": no_section_wall,
+        "section_walls_unmatched": report.section_walls_unmatched,
+        "walls_plan_not_crossed_indices": walls_not_crossed_payload,
+        "walls_plan_not_crossed_truncated": walls_not_crossed_truncated,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 9. Audit d'intégrité du plan set (gate Phase 1 / Phase 2) --------
+#
+# Tool d'audit holistique du dossier DXF. Vit en **étape 1 du flow
+# d'import**, AVANT toute proposition de modif au modèle Revit
+# (création de niveaux, de murs, etc.). User 2026-05-13 : « un audit
+# d'intégrité du plan set est livré en 1, avant de proposer des
+# changements dans le modèle, notamment les niveaux ».
+#
+# 4 checks agrégés :
+# - source_consistency : tous les fichiers ont la même convention layers ?
+# - scale_drift : drift d'échelle plan↔coupes par trait assigné
+# - levels_consistency : les coupes déclarent-elles le même jeu de niveaux ?
+# - walls_reconciliation : épaisseurs cohérentes plan↔coupes ?
+# - openings_matching : ouvertures matchées plan↔coupes ?
+#
+# Hard gate : si severity=errors, `ok=False`. L'agent ne doit PAS
+# enchaîner avec un tool qui mute le modèle (levels_create_many,
+# walls_create_many, etc.) tant que les erreurs ne sont pas résolues.
+
+
+def _level_to_dict_short(lv: dwg_section_reader.Level) -> Dict[str, Any]:
+    return {"name": lv.name, "elevation_m": round(lv.elevation_m, 4)}
+
+
+@tool(name="check_planset_integrity", tier=2)
+def check_planset_integrity(
+    kg: ProjectKG,
+    directory: str,
+    scale_override: Optional[float] = None,
+    layer_mapping: Optional[Dict[str, str]] = None,
+    thickness_tol_m: float = 0.02,
+    x_cut_tol_m: float = 0.10,
+    elevation_tol_m: float = 0.01,
+) -> Dict[str, Any]:
+    """Audit holistique d'intégrité d'un dossier DXF (plans/coupes/élévations).
+
+    **Étape 1 du flow d'import** — à appeler AVANT toute proposition de
+    modif au modèle Revit (`levels_create_many`, `walls_create_many`,
+    `views_create_section_many`, etc.). Si `gate_status == "abort"`,
+    l'agent doit stopper et présenter les errors à l'user pour
+    résolution (export DXF à corriger, swap de coupes, etc.).
+
+    Checks agrégés :
+
+    1. **source_consistency** : tous les fichiers utilisent-ils la même
+       convention layers (AIA / ISO / other) ?
+    2. **scale_drift** : pour chaque coupe assignée à un trait, drift
+       entre longueur du trait et extent A-WALL de la coupe.
+    3. **levels_consistency** : les coupes déclarent-elles le même
+       jeu de niveaux (élévations cohérentes à `elevation_tol_m` près) ?
+    4. **walls_reconciliation** : recoupement épaisseurs plan↔coupes
+       (utilise `dwg_coherence.reconcile_plan_section_walls`).
+    5. **openings_matching** : ouvertures matchées plan↔coupes via
+       block_id partagé.
+
+    Severity hierarchy : `clean` < `warnings` < `errors`. Gate :
+    - `pass` (clean) : enchaîner sans réserve.
+    - `needs_user` (warnings) : présenter à l'user via
+      `ui_confirm_choices` avant de continuer.
+    - `abort` (errors) : `ok=False`, stopper et présenter les errors.
+
+    Concepts: audit, intégrité, integrity, cohérence, coherence, plan set,
+              dossier, projet, gate, vérification, phase 1, phase 2,
+              source, échelle, scale, drift, niveaux, levels, walls,
+              ouvertures, openings
+    Phrases: "audit du dossier", "vérifie l'intégrité du projet",
+             "check planset", "is the plan set consistent",
+             "phase 2 audit"
+    Similar: dwg_inspect_sections, dwg_reconcile_plan_section_walls,
+             dwg_identify_source, dwg_verify_section_scale,
+             dwg_find_section_markers
+
+    Args:
+        directory: chemin du dossier contenant les `.dxf` du projet.
+        scale_override: facteur m-per-dxf-unit additionnel (cf.
+            `dwg_inspect`).
+        layer_mapping: pour le classify walls plan. Défaut
+            `{"A-WALL": "wall"}`.
+        thickness_tol_m: tolérance d'épaisseur pour match (défaut 2cm).
+        x_cut_tol_m: tolérance de position le long du cut (défaut 10cm).
+        elevation_tol_m: tolérance pour levels_consistency (défaut 1cm).
+
+    Returns:
+        {"ok": bool, "severity": "clean"|"warnings"|"errors",
+         "gate_status": "pass"|"needs_user"|"abort",
+         "files_summary": {plan_count, section_count, elevation_count,
+                            unknown_count, files: [{path, name, kind,
+                            source}, …]},
+         "checks": {check_name: {severity, summary, issues}, ...},
+         "errors": [...], "warnings": [...], "note": str}
+    """
+    dir_path = Path(directory)
+    if not dir_path.exists() or not dir_path.is_dir():
+        raise FileNotFoundError("Directory not found: {}".format(dir_path))
+
+    dxf_files = sorted(dir_path.glob("*.dxf"))
+    if not dxf_files:
+        raise ValueError("No .dxf files in directory {}".format(dir_path))
+
+    if layer_mapping is None:
+        layer_mapping = {"A-WALL": "wall"}
+
+    # --- 1. Parse + classify + identify_source pour chaque fichier ------
+    parsed: Dict[str, Dict[str, Any]] = {}
+    plan_paths: List[str] = []
+    section_paths: List[str] = []
+    elevation_paths: List[str] = []
+    unknown_paths: List[str] = []
+    source_per_file: Dict[str, str] = {}
+
+    for fp in dxf_files:
+        entities, meta = dwg_reader.parse(fp, scale_override=scale_override)
+        kind, evidence = dwg_section_reader.classify_dxf(
+            meta["layers"], file_name=fp.name,
+        )
+        src = dwg_section_reader.identify_source(meta["layers"])
+        path_str = str(fp)
+        parsed[path_str] = {
+            "entities": entities,
+            "meta": meta,
+            "kind": kind,
+            "evidence": evidence,
+            "name": fp.name,
+            "source": src["source"],
+            "source_confidence": src["confidence"],
+        }
+        source_per_file[path_str] = src["source"]
+        if kind == "plan":
+            plan_paths.append(path_str)
+        elif kind == "section":
+            section_paths.append(path_str)
+        elif kind == "elevation":
+            elevation_paths.append(path_str)
+        else:
+            unknown_paths.append(path_str)
+
+    files_summary: Dict[str, Any] = {
+        "plan_count": len(plan_paths),
+        "section_count": len(section_paths),
+        "elevation_count": len(elevation_paths),
+        "unknown_count": len(unknown_paths),
+        "files": [
+            {
+                "path": p,
+                "name": parsed[p]["name"],
+                "kind": parsed[p]["kind"],
+                "source": parsed[p]["source"],
+            }
+            for p in (
+                plan_paths + section_paths + elevation_paths + unknown_paths
+            )
+        ],
+    }
+
+    # Setup : pas de plan = erreur bloquante (rien à valider). Pas de
+    # coupe = warning (l'utilisateur peut continuer sans cross-check
+    # plan↔coupes, c'est dégradé mais pas bloquant). Unknown files =
+    # warning (à signaler mais non bloquant).
+    setup_errors: List[Dict[str, Any]] = []
+    setup_warnings: List[Dict[str, Any]] = []
+    if not plan_paths:
+        setup_errors.append({
+            "kind": "no_plan_detected",
+            "message": (
+                "Aucun fichier DXF classé `plan` dans le dossier. Un "
+                "audit de plan set nécessite au moins 1 plan d'étage "
+                "pour proposer une création de modèle."
+            ),
+        })
+    if not section_paths:
+        setup_warnings.append({
+            "kind": "no_section_detected",
+            "message": (
+                "Aucun fichier DXF classé `section` dans le dossier. "
+                "Audit dégradé : pas de cross-check plan↔coupes "
+                "(épaisseurs, niveaux, ouvertures depuis coupes). La "
+                "création modèle reste possible depuis le plan seul "
+                "mais sans validation des hauteurs / sill-head."
+            ),
+        })
+    elif len(section_paths) == 1:
+        setup_warnings.append({
+            "kind": "single_section_only",
+            "message": (
+                "1 seule coupe disponible. Cohérence inter-coupes (jeu "
+                "de niveaux uniforme) non vérifiable. Recoupement walls "
+                "et openings limités à cette coupe."
+            ),
+        })
+
+    # Élévations : tout manque par rapport à la situation idéale (4
+    # façades cardinales) est un état dégradé → warning. User 2026-05-13.
+    if not elevation_paths:
+        setup_warnings.append({
+            "kind": "no_elevation_detected",
+            "message": (
+                "Aucune élévation détectée. Vue 3D possible depuis "
+                "plans+coupes uniquement, mais la cross-validation des "
+                "façades (positions et hauteurs d'ouvertures vues de "
+                "l'extérieur) ne sera pas faite."
+            ),
+        })
+    else:
+        # Cardinaux observés (Nord/Sud/Est/Ouest) — extraits de l'evidence
+        # de classify_dxf.
+        directions_seen = {
+            parsed[p]["evidence"].get("direction")
+            for p in elevation_paths
+        }
+        directions_seen.discard(None)
+        missing = sorted(
+            {"Nord", "Sud", "Est", "Ouest"} - directions_seen
+        )
+        if missing:
+            setup_warnings.append({
+                "kind": "incomplete_elevations",
+                "directions_present": sorted(directions_seen),
+                "directions_missing": missing,
+                "message": (
+                    "Élévations incomplètes : {} présente(s), {} "
+                    "manquante(s). Cross-validation des façades partielle.".format(
+                        sorted(directions_seen), missing,
+                    )
+                ),
+            })
+
+    # Fichiers `unknown` (ni plan, ni section, ni élévation) : ignorés
+    # silencieusement de l'audit, juste comptés dans `files_summary`. Pas
+    # de warning — user 2026-05-13 : « ignore unknown files ».
+
+    # Pas de plan = abort sans tenter le reste.
+    if not plan_paths:
+        return {
+            "ok": False,
+            "severity": "errors",
+            "gate_status": "abort",
+            "files_summary": files_summary,
+            "checks": {},
+            "errors": [{"check": "setup", **e} for e in setup_errors],
+            "warnings": [{"check": "setup", **w} for w in setup_warnings],
+            "note": (
+                "Audit interrompu : aucun plan d'étage détecté. Sans "
+                "plan, impossible de proposer une création de modèle. "
+                "Vérifier le dossier et ré-exporter au besoin."
+            ),
+        }
+
+    # --- 2. Check source consistency ------------------------------------
+    source_check = dwg_coherence.check_source_consistency(source_per_file)
+
+    # --- 3. Récupérer ou recalculer les section_lines -------------------
+    from .dxf_context import _find_live_context
+    section_lines: List[Dict[str, Any]] = []
+    nid = _find_live_context(kg)
+    if nid is not None:
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+
+    # Si pas de section_lines en KG, les calculer pour pouvoir checker
+    # scale + walls. On utilise le 1er plan détecté.
+    primary_plan = plan_paths[0]
+    if not section_lines:
+        plan_entities = parsed[primary_plan]["entities"]
+        markers = dwg_section_reader.find_section_markers(plan_entities)
+        section_markers_only = [m for m in markers if m.kind == "section"]
+        # Match coupes ↔ traits (brute force).
+        if section_markers_only and len(section_markers_only) == len(section_paths):
+            import itertools
+            coupe_extents: List[Tuple[str, float]] = []
+            for cp in section_paths:
+                ents = parsed[cp]["entities"]
+                xs = [
+                    pt[0] for e in ents
+                    if e.layer == "A-WALL" and e.kind == "LINE"
+                    for pt in e.coords
+                ]
+                ext = (max(xs) - min(xs)) if xs else 0.0
+                coupe_extents.append((cp, ext))
+            best_perm = None
+            best_drift = float("inf")
+            for perm in itertools.permutations(range(len(section_markers_only))):
+                total = sum(
+                    abs(coupe_extents[ci][1] - section_markers_only[mi].length_m)
+                    for ci, mi in enumerate(perm)
+                )
+                if total < best_drift:
+                    best_drift = total
+                    best_perm = perm
+            if best_perm is not None:
+                for ci, mi in enumerate(best_perm):
+                    mk = section_markers_only[mi]
+                    view_dir = mk.inferred_view_dir or (
+                        mk.view_dir_candidates[0]
+                        if mk.view_dir_candidates else "up"
+                    )
+                    section_lines.append({
+                        "coupe_path": coupe_extents[ci][0],
+                        "plan_p1": list(mk.p1_m),
+                        "plan_p2": list(mk.p2_m),
+                        "view_dir": view_dir,
+                        "name": parsed[coupe_extents[ci][0]]["name"],
+                    })
+
+    # --- 4. Scale drift par trait↔coupe ---------------------------------
+    scale_per_coupe: List[Dict[str, Any]] = []
+    for sl in section_lines:
+        coupe_path = sl.get("coupe_path")
+        if not coupe_path or coupe_path not in parsed:
+            continue
+        p1 = sl.get("plan_p1") or [0, 0]
+        p2 = sl.get("plan_p2") or [0, 0]
+        marker_length = (
+            (p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2
+        ) ** 0.5
+        ents = parsed[coupe_path]["entities"]
+        xs = [
+            pt[0] for e in ents
+            if e.layer == "A-WALL" and e.kind == "LINE"
+            for pt in e.coords
+        ]
+        extent = (max(xs) - min(xs)) if xs else 0.0
+        drift_m = abs(marker_length - extent)
+        denom = max(marker_length, extent, 1e-6)
+        drift_pct = 100.0 * drift_m / denom
+        scale_per_coupe.append({
+            "coupe_path": coupe_path,
+            "section_line_name": sl.get("name"),
+            "marker_length_m": round(marker_length, 4),
+            "coupe_extent_m": round(extent, 4),
+            "drift_pct": round(drift_pct, 2),
+            "drift_m": round(drift_m, 4),
+        })
+
+    scale_check = dwg_coherence.check_scale_drift(scale_per_coupe)
+
+    # --- 5. Levels consistency entre coupes -----------------------------
+    levels_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    section_openings_by_coupe: Dict[str, List[dwg_section_reader.SectionOpening]] = {}
+    section_walls_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    for cp in section_paths:
+        ents = parsed[cp]["entities"]
+        levels = dwg_section_reader.read_levels(ents)
+        levels_by_coupe[cp] = [_level_to_dict_short(lv) for lv in levels]
+        section_openings_by_coupe[cp] = dwg_section_reader.read_section_openings(ents)
+        sec_walls = dwg_section_reader.read_section_walls(ents)
+        section_walls_by_coupe[cp] = [
+            _section_wall_to_dict(sw) for sw in sec_walls
+        ]
+
+    levels_check = dwg_coherence.check_levels_consistency_between_coupes(
+        levels_by_coupe, elevation_tol_m=elevation_tol_m,
+    )
+
+    # --- 6. Walls reconciliation (plan ↔ coupes) ------------------------
+    plan_entities = parsed[primary_plan]["entities"]
+    plan_classified = dwg_classifier.classify(
+        plan_entities, layer_mapping,
+    )
+    plan_walls_dict = [_wall_candidate_to_dict(w) for w in plan_classified.walls]
+
+    walls_reconcil = dwg_coherence.reconcile_plan_section_walls(
+        plan_walls=plan_walls_dict,
+        section_lines=section_lines,
+        section_walls_by_coupe=section_walls_by_coupe,
+        thickness_tol_m=thickness_tol_m,
+        x_cut_tol_m=x_cut_tol_m,
+    )
+    walls_check = dwg_coherence.walls_reconciliation_to_check(
+        walls_reconcil, thickness_tol_m=thickness_tol_m,
+    )
+
+    # --- 7. Openings matching plan ↔ coupes -----------------------------
+    plan_openings_objs = dwg_section_reader.read_section_openings(plan_entities)
+    openings_reports: List[Dict[str, Any]] = []
+    for cp in section_paths:
+        sec_openings = section_openings_by_coupe[cp]
+        matches, unmatched_sec, unmatched_plan = (
+            dwg_section_reader.match_openings(plan_openings_objs, sec_openings)
+        )
+        openings_reports.append({
+            "section_path": cp,
+            "section_name": parsed[cp]["name"],
+            "match_count": len(matches),
+            "unmatched_section_count": len(unmatched_sec),
+            "unmatched_plan_count": len(unmatched_plan),
+        })
+
+    openings_check = dwg_coherence.check_openings_matching(openings_reports)
+
+    # --- 8. Agrégation + gate -------------------------------------------
+    # Setup check : remonte les warnings de structure (pas de coupe,
+    # 1 seule coupe, unknown files). Severity = warnings si non vide.
+    setup_check = dwg_coherence.IntegrityCheck(
+        name="setup",
+        severity="warnings" if setup_warnings else "clean",
+        summary={
+            "warnings_count": len(setup_warnings),
+            "plan_count": len(plan_paths),
+            "section_count": len(section_paths),
+            "elevation_count": len(elevation_paths),
+            "unknown_count": len(unknown_paths),
+        },
+        issues=list(setup_warnings),
+    )
+    checks = [
+        setup_check, source_check, scale_check, levels_check,
+        walls_check, openings_check,
+    ]
+    report = dwg_coherence.aggregate_planset_integrity(
+        checks, files_summary,
+    )
+
+    note = _build_planset_integrity_note(report)
+
+    # Serialise checks (dataclass → dict).
+    checks_serialized: Dict[str, Any] = {}
+    for c in checks:
+        checks_serialized[c.name] = {
+            "severity": c.severity,
+            "summary": c.summary,
+            "issues": c.issues,
+        }
+
+    return {
+        "ok": report.ok,
+        "severity": report.severity,
+        "gate_status": report.gate_status,
+        "files_summary": report.files_summary,
+        "checks": checks_serialized,
+        "errors": report.errors,
+        "warnings": report.warnings,
+        "note": note,
+    }
+
+
+def _build_planset_integrity_note(
+    report: dwg_coherence.PlansetIntegrityReport,
+) -> str:
+    """Génère une note actionnable pour l'agent à partir du report."""
+    if report.gate_status == "pass":
+        return (
+            "**Audit OK** : tous les checks sont clean. Le dossier DXF est "
+            "auto-cohérent. Tu peux enchaîner avec `levels_reconcile_with_dxf` "
+            "et la suite du flow d'import sans réserve."
+        )
+    if report.gate_status == "needs_user":
+        return (
+            "**Audit avec avertissements** ({} warning(s)). Présenter à "
+            "l'user via `ui_confirm_choices` pour décider si on continue. "
+            "Les warnings ne bloquent PAS la création modèle mais doivent "
+            "être traçables pour la suite (typiquement : openings "
+            "unmatched, drift d'échelle modéré, niveaux manquants dans "
+            "certaines coupes)."
+        ).format(len(report.warnings))
+    # abort
+    return (
+        "**AUDIT ÉCHOUÉ** ({} erreur(s)). N'enchaîne PAS `levels_create_many` "
+        "/ `walls_create_many` / `views_create_*` : présente les erreurs à "
+        "l'user pour résolution. Causes typiques : sources de layers "
+        "mixtes (re-exporter avec convention uniforme), drift d'échelle "
+        "majeur (mauvais matching trait↔coupe), conflit d'élévation pour "
+        "un même niveau entre coupes, ou mismatch d'épaisseur > 10cm."
+    ).format(len(report.errors))
