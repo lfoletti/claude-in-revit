@@ -84,6 +84,17 @@ def test_create_section_rejects_zero_length(kg_fresh):
 # ----- views_link_cad --------------------------------------------------
 
 
+def test_open_3d_kg_only_returns_placeholder(kg_fresh):
+    """Branche doc=None → activated=False avec note explicative."""
+    result = llm_protocol.dispatch_tool_use(
+        "views_open_3d", {}, "t1", kg_fresh,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["activated"] is False
+    assert "doc is None" in payload["note"]
+
+
 def test_link_cad_kg_only_returns_placeholder(kg_fresh, tmp_path):
     dxf = tmp_path / "fake.dxf"
     dxf.write_text("0\nSECTION\n2\nENDSEC\n0\nEOF\n")

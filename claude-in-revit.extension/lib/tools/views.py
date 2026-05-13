@@ -159,6 +159,100 @@ def create_section(
 # ----- views_link_cad --------------------------------------------------
 
 
+@tool(name="views_open_3d", tier=1)
+def open_3d(kg: ProjectKG, doc: Any) -> Dict[str, Any]:
+    """Active la vue 3D par défaut du projet (pour vérification visuelle).
+
+    Use case canonique : fin de Phase 1 import projet. Après avoir
+    créé les sections + linké les DXF, l'agent active la vue 3D pour
+    que l'user constate immédiatement que tout est positionné
+    correctement avant Phase 2.
+
+    Stratégie :
+    1. Cherche un `View3D` nommé `"{3D}"`, `"3D View"`, `"Vue 3D"` (les
+       defaults Revit selon la langue du template).
+    2. Si pas trouvé : prend le premier View3D non-template, non-perspective.
+    3. Active via `UIDocument.ActiveView = view` (PythonNet pyrevit).
+
+    Concepts: vue, view, 3d, default, activate, verification, visuel,
+              phase 1
+    Phrases: "ouvre la vue 3D", "passe en 3D", "switch to 3D view",
+             "montre la vue 3D"
+    Similar: views_create_section, levels_create_floor_plan
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"ok": bool, "activated": bool, "view_revit_id": int | None,
+         "view_name": str | None, "note": str | None}
+    """
+    if doc is None:
+        return {
+            "ok": True,
+            "activated": False,
+            "view_revit_id": None,
+            "view_name": None,
+            "note": "doc is None — pas de Revit, vue 3D non activée.",
+        }
+
+    from Autodesk.Revit.DB import FilteredElementCollector, View3D
+
+    default_names = {"{3D}", "{3d}", "3D View", "Vue 3D", "Vue3D"}
+    target = None
+    candidates: List[Any] = []
+    for v in FilteredElementCollector(doc).OfClass(View3D):
+        if v.IsTemplate or v.IsPerspective:
+            continue
+        candidates.append(v)
+        if v.Name in default_names:
+            target = v
+            break
+    if target is None and candidates:
+        target = candidates[0]
+
+    if target is None:
+        return {
+            "ok": False,
+            "activated": False,
+            "view_revit_id": None,
+            "view_name": None,
+            "note": (
+                "Aucune vue 3D disponible dans le projet. Le template "
+                "n'en a pas créé automatiquement. User peut en créer "
+                "une via Revit UI (Vue → 3D → Default 3D View)."
+            ),
+        }
+
+    # Activate via UIDocument. uidoc accessible via pyrevit HOST_APP.
+    try:
+        from pyrevit import HOST_APP
+        uidoc = HOST_APP.uidoc
+        uidoc.ActiveView = target
+    except Exception as e:  # noqa: BLE001
+        # Si HOST_APP.uidoc indispo (cas exotique), on échoue mais on
+        # retourne tout de même le revit_id pour que l'user puisse
+        # activer manuellement.
+        return {
+            "ok": True,
+            "activated": False,
+            "view_revit_id": int(target.Id.Value),
+            "view_name": target.Name,
+            "note": (
+                "Vue 3D trouvée ({}) mais activation a échoué : {}. "
+                "L'user peut l'ouvrir manuellement via Project Browser."
+                .format(target.Name, str(e))
+            ),
+        }
+
+    return {
+        "ok": True,
+        "activated": True,
+        "view_revit_id": int(target.Id.Value),
+        "view_name": target.Name,
+    }
+
+
 @tool(name="views_link_cad", tier=2)
 def link_cad(
     kg: ProjectKG,
