@@ -1111,6 +1111,10 @@ def _find_dxf_wall_type_in_kg(
 ) -> Optional[str]:
     """Cherche un WallType vivant nommé `target_name` dans le KG.
     Retourne son llm_id ou None.
+
+    **Ne vérifie pas la validité du binding Revit** — c'est l'affaire de
+    `_validate_or_drop_stale_wall_type_binding` qui doit être appelé
+    avant réutilisation en Revit-backed path.
     """
     for nid in kg.find_by_type("WallType"):
         node = kg.get_node(nid)
@@ -1119,6 +1123,61 @@ def _find_dxf_wall_type_in_kg(
         if node.get("name") == target_name:
             return nid
     return None
+
+
+def _validate_or_drop_stale_wall_type_binding(
+    kg: ProjectKG, doc: Any, llm_id: str,
+) -> bool:
+    """Vérifie que le revit_id stocké pour un node WallType correspond
+    encore à un WallType valide en Revit. Si stale (élément supprimé
+    manuellement ou perdu), soft-delete le node KG et retourne False
+    pour que le caller recrée un fresh type.
+
+    **Pattern critique** (bug runtime 2026-05-13 P7 session r) : sans
+    cette validation, `walls_get_or_create_dxf_type[_many]` réutilisait
+    un node KG existant pointant sur un revit_id supprimé, puis
+    `Wall.Create(wallTypeId=ElementId(stale_id))` levait `ArgumentException:
+    No WallType` côté Revit. L'agent retentait sans pouvoir résoudre.
+
+    Args:
+        kg / doc : contexte standard.
+        llm_id : node WallType en KG à valider.
+
+    Returns:
+        True si le binding est valide (l'agent peut réutiliser).
+        False si stale → node soft-deleted, caller doit recréer.
+    """
+    if doc is None:
+        return True  # KG-only path : pas de Revit à vérifier
+    revit_id_raw = kg.get_revit_id(llm_id)
+    if revit_id_raw is None:
+        # KG-only node créé avant Revit → soft-delete et recréer.
+        kg.soft_delete(llm_id)
+        return False
+    from Autodesk.Revit.DB import ElementId, WallType
+    elem = doc.GetElement(ElementId(revit_id_raw))
+    if elem is None:
+        kg.soft_delete(llm_id)
+        return False
+    # Cast check — pyRevit/PythonNet retourne typiquement le bon type
+    # concret, mais on défensif sur le cast.
+    try:
+        if not isinstance(elem, WallType):
+            kg.soft_delete(llm_id)
+            return False
+    except TypeError:
+        # IronPython/PythonNet edge case : `isinstance` peut lever sur
+        # certains types managés. Tenter `.Category` comme proxy de
+        # validation : WallType expose `Category.Id` ≈ -2000011 (Walls).
+        try:
+            cat_id = elem.Category.Id.Value
+            if int(cat_id) != -2000011:
+                kg.soft_delete(llm_id)
+                return False
+        except Exception:  # noqa: BLE001
+            kg.soft_delete(llm_id)
+            return False
+    return True
 
 
 def _create_dxf_wall_type_kg_only(
@@ -1272,15 +1331,18 @@ def get_or_create_dxf_type(
 
     existing = _find_dxf_wall_type_in_kg(kg, target_name)
     if existing is not None:
-        node = kg.get_node(existing)
-        return {
-            "ok": True,
-            "llm_id": existing,
-            "name": target_name,
-            "thickness_m": float(node.get("total_thickness", bucketed_m)),
-            "created": False,
-            "revit_id": kg.get_revit_id(existing),
-        }
+        # Valider que le binding Revit est encore vivant — bug 2026-05-13 P7.
+        if _validate_or_drop_stale_wall_type_binding(kg, doc, existing):
+            node = kg.get_node(existing)
+            return {
+                "ok": True,
+                "llm_id": existing,
+                "name": target_name,
+                "thickness_m": float(node.get("total_thickness", bucketed_m)),
+                "created": False,
+                "revit_id": kg.get_revit_id(existing),
+            }
+        # Stale binding : on tombe dans la branche de création fraîche.
 
     if doc is None:
         llm_id = _create_dxf_wall_type_kg_only(kg, target_name, bucketed_m)
@@ -1392,7 +1454,13 @@ def get_or_create_dxf_type_many(
         for tm in unique_buckets_m:
             name = _dxf_wall_type_name(tm, bucket_cm=bucket_cm)
             existing = _find_dxf_wall_type_in_kg(kg, name)
-            if existing is not None:
+            # KG-only path : validate_or_drop ne fait rien (doc=None),
+            # mais on appelle quand même par cohérence — il drop les
+            # nodes orphan-de-Revit qui pourraient être dans le KG
+            # (cas : ancien KG persistant après suppression Revit).
+            if existing is not None and _validate_or_drop_stale_wall_type_binding(
+                kg, doc, existing,
+            ):
                 node = kg.get_node(existing)
                 types_payload.append({
                     "thickness_m": float(node.get("total_thickness", tm)),
@@ -1446,7 +1514,14 @@ def get_or_create_dxf_type_many(
         for tm in unique_buckets_m:
             name = _dxf_wall_type_name(tm, bucket_cm=bucket_cm)
             existing = _find_dxf_wall_type_in_kg(kg, name)
-            if existing is not None:
+            # Valider que le binding Revit du node existant pointe sur
+            # un WallType vivant — bug 2026-05-13 P7 session r : un
+            # WallType supprimé manuellement dans Revit laissait un node
+            # KG avec revit_id stale, et Wall.Create plus tard levait
+            # `ArgumentException: No WallType`.
+            if existing is not None and _validate_or_drop_stale_wall_type_binding(
+                kg, doc, existing,
+            ):
                 node = kg.get_node(existing)
                 types_payload.append({
                     "thickness_m": float(node.get("total_thickness", tm)),
