@@ -14,6 +14,185 @@
 
 ---
 
+## 2026-05-13 (session n) — Phase 1 extensions : élévations + bulks _many + coding policy
+
+### Contexte & objectif
+
+Continuation de session m après validation runtime de Phase 1 sur P7
+(projet asymétrique). User a soulevé deux extensions :
+
+1. « je me demande si nous devrions tout de suite compléter la phase
+   1 avec les élévations, pour avoir la panoplie complète » — ajouter
+   les vues élévation (façades N/S/E/W) au flow Phase 1.
+2. « est-ce que ça pourrait être moins coûteux en termes de tokens ?
+   dxf_context_register_many_linked_view et autres améliorations ? »
+   — réduire les 16+ appels lockstep observés en runtime P7 via bulk
+   variants `_many`.
+
+Plus une coding policy formalisée en réaction à la 2e remarque.
+
+### Phase 1 — Étape 7 (bonus) : élévations livrées
+
+**Commit `8281606`** (`ADD Phase 1 élévations`).
+
+- `classify_dxf` étendu avec arg optionnel `file_name` :
+  - Détecte `kind='elevation'` quand filename contient « élévation » /
+    « elevation » + signature A-FLOR-LEVL (sinon ces fichiers seraient
+    classés section, signature layers identique).
+  - Parse `direction` ∈ {Est, Nord, Sud, Ouest} avec ORDRE IMPORTANT :
+    Ouest avant Est car « est » substring « ouest ».
+  - Détecte aussi `kind='plan'` via filename (« Plan », « Niveau »)
+    pour les plans sans `A-AREA-IDEN` (cas P7 sans Pièce labels).
+
+- `dwg_inspect_sections` étendu pour traiter `kind='elevation'` :
+  extraction levels + openings (même logique que section), expose
+  `direction` dans le rapport.
+
+- **Nouveau tool `catalog_list_elevation_views`** tier-1 :
+  - `FilteredElementCollector(doc).OfClass(View).OfType(Elevation)`.
+  - Priorité au **nom de la vue** (« Élévation Est », « Élévation
+    Nord », etc.) pour le matching de direction — plus fiable que
+    `view.ViewDirection` dont la convention de signe est ambiguë.
+  - Fallback : dot product avec les 4 vecteurs cardinaux.
+
+- **Convention élévation DXF validée P7** : A-WALL bbox de chaque
+  élévation matche EXACTEMENT le plan A-WALL (X ou Y, avec sign flip
+  selon viewer direction). La logique existante `views_link_cad`
+  marche pour ViewElevation (hérite de ViewSection).
+
+### Bug fix : `SectionOpening` non sérialisable (commit `1d9ae5b`)
+
+User runtime P7 : « erreur de sérialisation JSON interne
+(SectionOpening non sérialisable) ». Cause : avec 2 plans (N0 + N1),
+seul le premier voyait son `_openings_internal` poppé avant return.
+Les autres plans gardaient des SectionOpening objects → crash JSON.
+
+Fix : itérer TOUS les records après matching et pop `_openings_internal`
+inconditionnellement.
+
+### Bug fix : inversion Est ↔ Ouest élévations (commit `60bcc52`)
+
+User runtime P7 : « inversion Est - Ouest ». Cause : `direction_map`
+basée sur `view.ViewDirection` (doc Revit ambiguë : look-direction vs
+toward-viewer). Fix : prioriser le NAME de la vue (« Élévation Est »
+contient explicitement la direction), vecteur en fallback.
+
+### Bulk variants _many (commit `bfc8c80`)
+
+User mesure du runtime P7 : « 16 appels lockstep ». Concrètement :
+`views_link_cad × 8` + `dxf_context_register_linked_view × 8` =
+2 × overhead × 8 = ~1600 tokens + 8 round-trips API séquentiels.
+
+**4 nouveaux tools bulk** livrés :
+
+1. **`views_link_cad_many(links, placement?, color_mode?, restore_pinned?)`**.
+   Helper privé `_link_cad_to_view` extrait — réutilisé par le tool
+   unitaire (qui wrap avec transaction) ET le bulk (qui wrap N appels
+   dans une seule transaction). Validation pre-loop : tout est validé
+   avant le moindre commit.
+
+2. **`views_create_section_many(items, bottom_elev?, top_elev?, ...)`**.
+   Section ViewFamilyType cherchée 1× au lieu de N. Validation noms
+   uniques intra-batch.
+
+3. **`dxf_context_register_linked_view_many(entries)`** : N enregistre-
+   ments en 1 modification du DxfImportContext (1 `modify_node` vs N).
+
+4. **`dxf_context_register_section_line_many(section_lines)`** : pareil
+   pour les traits de coupe.
+
+### Coding policy formalisée (commit `3c018af`)
+
+User : « c'est à placer dans notre coding policy : en règle générale,
+si une fonction est susceptible d'être sollicitée en bulk dans une
+orchestration, son équivalent bulk doit être créé ».
+
+Règle formalisée à 3 niveaux :
+- **`CLAUDE.md`** nouvelle section « Coding policies » avec pattern
+  d'impl (helper privé + unitaire/bulk wrappers + Tx unique).
+- **Mémoire feedback** `feedback-bulk-tool-variant-policy` : règle
+  complète + liste des bulks existants + manquants potentiels à
+  examiner (`rooms_create_many`,
+  `levels_create_floor_plan_many`, etc.).
+- **MEMORY.md** index mis à jour.
+
+Cette policy s'applique en amont des futures additions de tools (pas
+juste réactive).
+
+### Validation runtime P7 (3e + 4e itérations)
+
+3e (avant bulks) : « ça me semble correct » — Phase 1 fonctionnelle
+avec élévations.
+
+4e (avec bulks) — comparaison mêmes import P7 :
+
+| Métrique | Avant bulks | Après bulks | Δ |
+|---|---|---|---|
+| in tokens | 51 216 | 26 600 | **−48%** |
+| out tokens | 5 462 | 4 193 | −23% |
+| Tool calls totaux | 28 | 13 | −54% |
+
+Tool log final agent (13 appels seulement) :
+```
+dwg_inspect_sections, levels_reconcile_with_dxf,
+dwg_find_section_markers, catalog_list_levels,
+catalog_list_elevation_views, dxf_assign_coupes_to_traits,
+ui_confirm_yes_no, dxf_context_register_inspection,
+views_create_section_many, dxf_context_register_section_line_many,
+views_link_cad_many, dxf_context_register_linked_view_many,
+views_open_3d
+```
+
+### Validation cumulée
+
+**512 tests verts** (session m fin : 503 → +9 pour bulks + élévations).
+
+Suite couvre :
+- 9 nouveaux : 4 views (link_cad_many, create_section_many) + 4
+  dxf_context (register_linked_view_many, register_section_line_many) +
+  classify_dxf élévation parametrized.
+
+### État final & reste à faire
+
+**Phase 1 PRODUCTION-READY + token-efficient** : 8 outils livrés
+(coupes + plans + élévations + vue 3D auto) + 4 bulks. Workflow runtime
+stable et économe (~26K tokens par import).
+
+**Phase 2 spec figé** (cf. mémoire `project-phase2-custom-types`) :
+création de types custom DXF_WALL_xxcm / DXF_FLOOR_xxcm sans matching
+des types existants. 7 micro-étapes prévues. Pas encore codé.
+
+**Dettes ouvertes** :
+- Orientation fenêtre dans le mur (task #10) — Phase 2 sujet.
+- Convention DXF Projet4 (offset Y -8000mm vs P7 zero-offset) — pas
+  ré-investigué, V1+.
+- Bulks manquants potentiels (rooms_create_many, etc.) — examiner si
+  besoin runtime.
+
+### Méta : leçons de session
+
+1. **Asymetric test data > heuristics** : P7 a tranché en 5 minutes
+   les ambiguïtés de Projet4 (DXF anchor) et de elevation direction
+   conventions. À retenir : pour calibrer une convention API
+   sous-documentée, demander à l'user un cas asymétrique.
+
+2. **Le bulk variant doit être proactif** : la coding policy en
+   `CLAUDE.md` impose désormais le `_many` dès la conception. Économie
+   moyenne ~50% des tokens d'orchestration.
+
+3. **NAME > vecteur pour discrimination** : pour `catalog_list_elevation
+   _views`, le nom de la vue était plus fiable que `ViewDirection`
+   dont la convention de signe est ambiguë. Quand un attribut a
+   plusieurs interprétations possibles, préférer la donnée la plus
+   contrainte (= name explicit).
+
+4. **Cleanup data leakage** : le bug `_openings_internal` non poppé
+   sur les N-ème plans rappelle que tout state interne doit être
+   nettoyé inconditionnellement (pas seulement sur le chemin
+   « heureux »).
+
+---
+
 ## 2026-05-13 (session m) — UC1 Phase 1 import projet : 6 étapes livrées + 11 fixes runtime + Floor type + UI dialogs
 
 ### Contexte & objectif
