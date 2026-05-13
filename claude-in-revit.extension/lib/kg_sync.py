@@ -487,6 +487,94 @@ def _room_to_attrs(
     }
 
 
+def _floor_type_to_attrs(ft: Any) -> Dict[str, Any]:
+    """Extract FloorType attrs : `name` + `total_thickness` (m).
+
+    `total_thickness` est sommée depuis la `CompoundStructure` du FloorType
+    (somme des `Width` des layers, déjà en feet → convertis ici). Si le
+    type n'expose pas de CompoundStructure (rare sur stock Revit), on
+    retombe à `0.0` plutôt que d'échouer.
+    """
+    from . import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter
+
+    name_param = ft.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_NAME)
+    name = name_param.AsString() if name_param else getattr(ft, "Name", "FloorType")
+    total_thickness_ft = 0.0
+    try:
+        cs = ft.GetCompoundStructure()
+        if cs is not None:
+            for layer in cs.GetLayers():
+                total_thickness_ft += float(layer.Width)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "name": name,
+        "total_thickness": _r(rp.internal_to_meters(total_thickness_ft)),
+    }
+
+
+def _floor_to_attrs(
+    floor: Any,
+    *,
+    level_ref: str,
+    type_ref: str,
+) -> Dict[str, Any]:
+    """Extract Floor attrs : boundary + area_m2.
+
+    Le contour est extrait via `Floor.GetBoundarySegments` (méthode
+    moderne 2023+, équivalent à `Sketch.GetAllElements` du legacy). Le
+    1er CurveLoop est traité comme l'extérieur du sol ; les autres
+    (trous, openings) sont ignorés en V0. La conversion segment → sommets
+    récupère uniquement les `GetEndPoint(0)` (le 2nd point d'un segment
+    est le 1er du suivant), donc on a N sommets pour N segments.
+
+    `area_m2` vient de `HOST_AREA_COMPUTED` (autorité Revit), pas du
+    shoelace côté KG — Revit a déjà fait le calcul.
+    """
+    from . import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter, SpatialElementBoundaryOptions
+
+    boundary: List[List[float]] = []
+    try:
+        # Floor n'a pas `GetBoundarySegments` direct ; on passe par
+        # `Floor.GetGeometry` et le 1er Solid pour récupérer une face
+        # top. Plus robuste : `Floor.SketchId` → Sketch → CurveLoops.
+        sketch_id = getattr(floor, "SketchId", None)
+        if sketch_id is not None and sketch_id.Value > 0:
+            from Autodesk.Revit.DB import Sketch
+            sketch_elem = floor.Document.GetElement(sketch_id)
+            if isinstance(sketch_elem, Sketch):
+                # `Sketch.Profile` → IList<CurveArray> (legacy) ou
+                # GetAllElements pour les segments. V0 : utilise Profile
+                # qui est stable.
+                profile = sketch_elem.Profile
+                if profile is not None and profile.Size > 0:
+                    curve_array = profile.get_Item(0)  # 1er loop = extérieur
+                    for i in range(curve_array.Size):
+                        curve = curve_array.get_Item(i)
+                        p = curve.GetEndPoint(0)
+                        boundary.append([
+                            _r(rp.internal_to_meters(p.X)),
+                            _r(rp.internal_to_meters(p.Y)),
+                        ])
+    except Exception:  # noqa: BLE001
+        pass
+
+    area_param = floor.get_Parameter(BuiltInParameter.HOST_AREA_COMPUTED)
+    if area_param is not None:
+        area_m2 = _r(rp.internal_to_sqm(area_param.AsDouble()))
+    else:
+        area_m2 = 0.0
+
+    return {
+        "type_ref": type_ref,
+        "level_ref": level_ref,
+        "boundary": boundary,
+        "area_m2": area_m2,
+    }
+
+
 def _wall_to_attrs(
     wall: Any,
     *,
@@ -575,6 +663,8 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
         "doors": 0,
         "windows": 0,
         "rooms": 0,
+        "floor_types": 0,
+        "floors": 0,
     }
 
     # Snapshot `revit_id → llm_id` BEFORE clearing — drives id stability.
@@ -827,6 +917,46 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             except Exception:  # noqa: BLE001
                 skipped["windows"] += 1
 
+        # 10b. FloorTypes — no inbound refs. Scanned before Floor
+        # instances so floors can resolve their type_ref.
+        floor_types_fn = getattr(rp, "floor_types", None)
+        if floor_types_fn is not None:
+            for ft in floor_types_fn(doc):
+                try:
+                    nid = kg.add_node(
+                        "FloorType",
+                        _floor_type_to_attrs(ft),
+                        llm_id=_preserved_id(ft),
+                        _emit_log=False,
+                    )
+                    bind(kg, nid, ft)
+                    _stamp(ft, nid)
+                except Exception:  # noqa: BLE001
+                    skipped["floor_types"] += 1
+
+        # 10c. Floors — depend on Levels + FloorTypes already bound.
+        floors_fn = getattr(rp, "floors", None)
+        if floors_fn is not None:
+            for fl in floors_fn(doc):
+                try:
+                    level_ref = llm_id_of(kg, fl.LevelId)
+                    type_ref = llm_id_of(kg, fl.GetTypeId())
+                    if level_ref is None or type_ref is None:
+                        skipped["floors"] += 1
+                        continue
+                    attrs = _floor_to_attrs(
+                        fl, level_ref=level_ref, type_ref=type_ref,
+                    )
+                    nid = kg.add_node(
+                        "Floor", attrs, llm_id=_preserved_id(fl), _emit_log=False,
+                    )
+                    bind(kg, nid, fl)
+                    _stamp(fl, nid)
+                    kg.add_edge(nid, level_ref, "at_level")
+                    kg.add_edge(nid, type_ref, "is_type")
+                except Exception:  # noqa: BLE001
+                    skipped["floors"] += 1
+
         # 11. Rooms — depend on Levels already bound. Unplaced rooms (no
         # location, area=0) are still ingested: they keep an action_log
         # presence and can be picked up by `kg.refresh()` once the user
@@ -871,6 +1001,8 @@ def full_rescan(doc: Any, kg: ProjectKG) -> Dict[str, Any]:
             "window_types": family_types_by_cat.get("Windows", 0),
             "doors": kg.count_by_type("Door"),
             "windows": kg.count_by_type("Window"),
+            "floor_types": kg.count_by_type("FloorType"),
+            "floors": kg.count_by_type("Floor"),
             "rooms": kg.count_by_type("Room"),
             "skipped": dict(skipped),
             "preserved_llm_ids": reused,
@@ -901,10 +1033,12 @@ _REFRESH_FIELDS: Dict[str, Tuple[str, ...]] = {
     "Column": ("position", "height"),
     "Door": ("position", "sill_height", "head_height"),
     "Window": ("position", "sill_height", "head_height"),
+    "Floor": ("boundary", "area_m2"),
     "ModelLine": ("p1", "p2", "length"),
     "DetailLine": ("p1", "p2", "length"),
     "Level": ("name", "elevation"),
     "WallType": ("name", "total_thickness"),
+    "FloorType": ("name", "total_thickness"),
     "ColumnType": ("family_name", "type_name", "kind"),
     "FamilyType": ("family_name", "type_name", "dimensions"),
     # Room area is computed by Revit from the boundary loops. The
@@ -976,6 +1110,14 @@ def refresh_node_from_revit(
         fresh = _level_to_attrs(element)
     elif node_type == "WallType":
         fresh = _wall_type_to_attrs(element)
+    elif node_type == "FloorType":
+        fresh = _floor_type_to_attrs(element)
+    elif node_type == "Floor":
+        fresh = _floor_to_attrs(
+            element,
+            level_ref=node.get("level_ref", ""),
+            type_ref=node.get("type_ref", ""),
+        )
     elif node_type == "ColumnType":
         fresh = _column_type_to_attrs(element)
     elif node_type == "FamilyType":

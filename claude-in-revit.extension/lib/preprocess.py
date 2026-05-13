@@ -54,11 +54,18 @@ _COLLECTION_MAP: List[Tuple[str, str, str]] = [
     (r"types?\s+de\s+poteau\w*|column\s+types?", "catalog_list_column_types", "column_types"),
     (r"types?\s+de\s+porte\w*|door\s+types?", "catalog_list_door_types", "door_types"),
     (r"types?\s+de\s+fen[êe]tre\w*|window\s+types?", "catalog_list_window_types", "window_types"),
+    (r"types?\s+de\s+(?:sol\w*|dalle\w*|plancher\w*)|floor\s+types?|slab\s+types?",
+        "catalog_list_floor_types", "floor_types"),
     # Instance catalogs.
     (r"murs?\b|walls?\b", "catalog_list_walls", "walls"),
     (r"fen[êe]tres?\b|windows?\b", "catalog_list_windows", "windows"),
     (r"portes?\b|doors?\b", "catalog_list_doors", "doors"),
     (r"poteaux?\b|colonnes?\b|columns?\b", "catalog_list_columns", "columns"),
+    # Floors avant le pattern level/floors (qui couvre l'anglais `floors`
+    # ambigu : « étages » plutôt que « dalles »). On préfère traiter
+    # `sols`/`dalles` (FR sans ambiguïté) comme Floor instances, et
+    # laisser `floors?` matché plus bas en niveau (legacy).
+    (r"sols?\b|dalles?\b|planchers?\b|slabs?\b", "catalog_list_floors", "floors"),
     (r"niveaux?\b|[ée]tages?\b|levels?\b|floors?\b", "catalog_list_levels", "levels"),
     (r"lignes?\b|lines?\b", "catalog_list_lines", "lines"),
 ]

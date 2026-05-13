@@ -48,6 +48,22 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
         "required": {"name", "total_thickness"},
         "optional": {"layers_summary"},
     },
+    # Floor (sol / dalle) — surface horizontale au niveau `level_ref`.
+    # `boundary` est une polyligne fermée (le 1er sommet est implicitement
+    # ré-connecté au dernier) en mètres dans le plan du level. `area_m2`
+    # est calculée (shoelace côté KG) ou lue depuis Revit
+    # (`HOST_AREA_COMPUTED`).
+    "Floor": {
+        "required": {"type_ref", "level_ref", "boundary", "area_m2"},
+        "optional": set(),
+    },
+    # FloorType — un FloorType Revit. `total_thickness` est en mètres,
+    # parallèle à WallType. Différencié de WallType pour que
+    # `catalog_list_*` ne mélange pas les catalogues côté LLM.
+    "FloorType": {
+        "required": {"name", "total_thickness"},
+        "optional": {"layers_summary"},
+    },
     # Architectural OR structural column (distinguished by `kind`).
     # `position` is `[x, y]` in metres in the level plane; vertical
     # placement is handled by the base level + a top offset = `height`.

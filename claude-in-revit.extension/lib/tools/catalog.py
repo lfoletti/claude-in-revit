@@ -212,6 +212,66 @@ def list_windows(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     return {"windows": out}
 
 
+@tool(name="catalog_list_floor_types", tier=1)
+def list_floor_types(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste tous les types de sol / dalle (FloorType) avec llm_id, nom et
+    épaisseur en mètres.
+
+    Concepts: type de sol, type de dalle, floor type, slab type, catalogue
+    Phrases: "quels types de sol", "list floor types", "catalogue dalles",
+             "types de plancher"
+    Similar: catalog_list_floors, catalog_list_wall_types
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"floor_types": [{llm_id, name, total_thickness}, ...]}
+    """
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("FloorType"):
+        attrs = kg.get_node(nid)
+        out.append({
+            "llm_id": nid,
+            "name": attrs.get("name"),
+            "total_thickness": attrs.get("total_thickness"),
+        })
+    return {"floor_types": out}
+
+
+@tool(name="catalog_list_floors", tier=1)
+def list_floors(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste tous les sols vivants du projet (Floor) avec contour et aire.
+
+    Concepts: sol, dalle, floor, slab, plancher, inventaire, contour, aire
+    Phrases: "liste les sols", "quels sols", "all floors", "toutes les dalles",
+             "donne-moi les sols", "where are the slabs"
+    Similar: catalog_list_floor_types, catalog_list_levels, catalog_list_walls
+
+    Args:
+        (aucun)
+
+    Returns:
+        {"floors": [{llm_id, level_ref, type_ref, area_m2,
+                     vertex_count, boundary}, ...]}
+        `boundary` est la polyligne `[[x, y], ...]` en mètres, polygone
+        fermé implicite (1er sommet pas répété en fin).
+    """
+    out: List[Dict[str, Any]] = []
+    for nid in kg.find_by_type("Floor"):
+        attrs = kg.get_node(nid)
+        boundary = attrs.get("boundary", [])
+        out.append({
+            "llm_id": nid,
+            "level_ref": attrs.get("level_ref"),
+            "type_ref": attrs.get("type_ref"),
+            "area_m2": round(float(attrs.get("area_m2", 0.0)), 3),
+            "vertex_count": len(boundary),
+            "boundary": boundary,
+        })
+    return {"floors": out}
+
+
 @tool(name="catalog_list_rooms", tier=1)
 def list_rooms(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     """Liste toutes les pièces (Rooms) vivantes du projet avec leur aire et niveau.

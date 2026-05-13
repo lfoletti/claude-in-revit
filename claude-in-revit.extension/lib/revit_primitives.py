@@ -235,6 +235,16 @@ def column_types(doc):
     return arch + struct
 
 
+def floors(doc):
+    """All `Floor` (sol / dalle) instances. Excludes FloorType definitions."""
+    return collect_by_category(doc, BuiltInCategory.OST_Floors)
+
+
+def floor_types(doc):
+    """All `FloorType` definitions in the model."""
+    return collect_types_by_category(doc, BuiltInCategory.OST_Floors)
+
+
 def rooms(doc):
     """All `Room` instances (`OST_Rooms`).
 
