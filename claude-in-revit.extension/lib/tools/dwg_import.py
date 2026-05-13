@@ -600,11 +600,11 @@ def inspect_sections(
     # Matching section ↔ plan.
     section_to_plan_matches: List[Dict[str, Any]] = []
     if plan_index is not None:
-        plan_openings = parsed[plan_index].pop("_openings_internal")
+        plan_openings = parsed[plan_index].get("_openings_internal", [])
         for i, rec in enumerate(parsed):
             if rec.get("kind") != "section":
                 continue
-            sec_openings = rec.pop("_openings_internal")
+            sec_openings = rec.get("_openings_internal", [])
             matches, unmatched_sec, unmatched_plan = (
                 dwg_section_reader.match_openings(plan_openings, sec_openings)
             )
@@ -617,10 +617,14 @@ def inspect_sections(
                 "unmatched_plan_count": len(unmatched_plan),
                 "distinct_block_ids": distinct_ids,
             })
-    else:
-        # No plan found — drop any internal data we may have stored.
-        for rec in parsed:
-            rec.pop("_openings_internal", None)
+
+    # **Cleanup _openings_internal de TOUS les records** (pas seulement
+    # plan_index + sections). Fix runtime 2026-05-13 : avec plusieurs
+    # plans (N0 + N1), seul le 1er voyait son `_openings_internal`
+    # poppé → JSON serialization crash sur les `SectionOpening` du 2e
+    # plan.
+    for rec in parsed:
+        rec.pop("_openings_internal", None)
 
     return {
         "ok": True,
