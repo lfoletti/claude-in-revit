@@ -211,6 +211,45 @@ def test_classify_dxf_plan_via_area_iden(tmp_path):
     assert evidence["mtext_count"] >= 1
 
 
+def test_classify_dxf_elevation_via_filename(tmp_path):
+    """DXF avec signature A-FLOR-LEVL + filename 'Elévation Est' → 'elevation'."""
+    path = _make_section_dxf(tmp_path)  # has A-FLOR-LEVL
+    # Renomme pour simuler élévation
+    new_path = tmp_path / "Projet8 - Elévation - Elévation Est.dxf"
+    path.rename(new_path)
+    _, meta = dwg_reader.parse(new_path)
+    kind, evidence = classify_dxf(meta["layers"], file_name=new_path.name)
+    assert kind == "elevation"
+    assert evidence["direction"] == "Est"
+
+
+def test_classify_dxf_falls_back_to_section_when_no_filename(tmp_path):
+    """Sans file_name, le DXF élévation est classé 'section' (signature
+    layers identique)."""
+    path = _make_section_dxf(tmp_path)
+    _, meta = dwg_reader.parse(path)
+    kind, _ = classify_dxf(meta["layers"])
+    assert kind == "section"
+
+
+def test_classify_dxf_elevation_all_directions(tmp_path):
+    """Test parsing de toutes les directions cardinales."""
+    for label, alias in (
+        ("Est", "Elévation Est"),
+        ("Nord", "Elévation Nord"),
+        ("Sud", "Elévation Sud"),
+        ("Ouest", "Elévation Ouest"),
+    ):
+        path = _make_section_dxf(tmp_path)
+        new_path = tmp_path / f"Projet8 - Elévation - {alias}.dxf"
+        path.rename(new_path)
+        _, meta = dwg_reader.parse(new_path)
+        kind, evidence = classify_dxf(meta["layers"], file_name=new_path.name)
+        assert kind == "elevation"
+        assert evidence["direction"] == label
+        new_path.unlink()
+
+
 def test_classify_dxf_unknown_when_no_signature(tmp_path):
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 4

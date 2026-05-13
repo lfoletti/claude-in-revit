@@ -509,7 +509,9 @@ def inspect_sections(
             raise FileNotFoundError("File not found: {}".format(path))
 
         entities, meta = dwg_reader.parse(path, scale_override=scale_override)
-        kind, evidence = dwg_section_reader.classify_dxf(meta["layers"])
+        kind, evidence = dwg_section_reader.classify_dxf(
+            meta["layers"], file_name=path.name,
+        )
 
         file_record: Dict[str, Any] = {
             "path": str(path),
@@ -519,6 +521,29 @@ def inspect_sections(
             "units_factor_to_m": meta["units_factor_to_m"],
             "total_entities": meta["total_entities"],
         }
+
+        if kind == "elevation":
+            # Elevations partagent la signature des sections (A-FLOR-LEVL +
+            # A-GLAZ + A-WALL). Extraction identique. La direction
+            # (Est/Nord/Sud/Ouest) est dans `evidence["direction"]`.
+            levels = dwg_section_reader.read_levels(entities)
+            openings = dwg_section_reader.read_section_openings(entities)
+            file_record["levels"] = [_level_to_dict(lv) for lv in levels]
+            file_record["openings_count"] = len(openings)
+            file_record["openings_with_id_count"] = sum(
+                1 for o in openings if o.block_id is not None
+            )
+            file_record["openings"] = [
+                _opening_to_dict(o) for o in openings[:opening_preview_limit]
+            ]
+            if len(openings) > opening_preview_limit:
+                file_record["openings_truncated"] = True
+            by_id: Dict[str, int] = {}
+            for o in openings:
+                key = o.block_id or "<unknown>"
+                by_id[key] = by_id.get(key, 0) + 1
+            file_record["openings_by_block_id"] = by_id
+            file_record["direction"] = evidence.get("direction")
 
         if kind == "section":
             levels = dwg_section_reader.read_levels(entities)

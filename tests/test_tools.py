@@ -127,6 +127,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "floors_delete_many",
         "catalog_list_floors",
         "catalog_list_floor_types",
+        "catalog_list_elevation_views",
         "query_find_by_name",
         "query_get_node",
         "aggregations_count",

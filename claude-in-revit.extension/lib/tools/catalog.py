@@ -253,6 +253,98 @@ def list_windows(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     return {"windows": out}
 
 
+@tool(name="catalog_list_elevation_views", tier=1)
+def list_elevation_views(kg: ProjectKG, doc: Any = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Liste les vues élévation Revit (typiquement Nord/Sud/Est/Ouest) avec
+    leur direction de vue.
+
+    Use case canonique : après `dwg_inspect_sections` qui a détecté des
+    DXF élévation (kind='elevation', direction='Est'/'Nord'/...), l'agent
+    appelle ce tool pour trouver les revit_id des vues élévation Revit
+    correspondantes (créées par défaut dans le template Revit), puis
+    appelle `views_link_cad` pour linker chaque DXF dans sa vue.
+
+    **Matching direction** : la convention Revit pour `ViewDirection` :
+    - Sud → (0, +1, 0) (viewer south, looking north)
+    - Nord → (0, -1, 0) (viewer north, looking south)
+    - Est → (-1, 0, 0) (viewer east, looking west)
+    - Ouest → (+1, 0, 0) (viewer west, looking east)
+
+    Concepts: vue, élévation, elevation, façade, cardinal, nord, sud,
+              est, ouest, view, revit_id, phase 1
+    Phrases: "liste les élévations", "find elevation views",
+             "vues façade", "quelles élévations dans le projet"
+    Similar: catalog_list_levels, views_link_cad,
+             dwg_inspect_sections
+
+    Args:
+        (aucun — runtime Revit)
+
+    Returns:
+        {"elevation_views": [{revit_id, name, direction,
+                              view_direction_xyz}, ...]}
+        - `direction` : 'Est'/'Nord'/'Sud'/'Ouest' inféré de
+          ViewDirection ou du nom de la vue.
+        - `view_direction_xyz` : [x, y, z] de la direction de regard.
+    """
+    out: List[Dict[str, Any]] = []
+    if doc is None:
+        return {"elevation_views": []}
+
+    from Autodesk.Revit.DB import (
+        FilteredElementCollector, View, ViewType,
+    )
+
+    # Map direction vector → cardinal label (closest match).
+    direction_map = [
+        ("Sud", (0.0, 1.0, 0.0)),
+        ("Nord", (0.0, -1.0, 0.0)),
+        ("Est", (-1.0, 0.0, 0.0)),
+        ("Ouest", (1.0, 0.0, 0.0)),
+    ]
+
+    def closest_direction(vd_x: float, vd_y: float, vd_z: float) -> Optional[str]:
+        # Find the cardinal direction whose unit vector best matches.
+        best = None
+        best_dot = -2.0
+        for label, vec in direction_map:
+            dot = vd_x * vec[0] + vd_y * vec[1] + vd_z * vec[2]
+            if dot > best_dot:
+                best_dot = dot
+                best = label
+        # Reject if even the best match is barely positive (non-cardinal).
+        return best if best_dot > 0.7 else None
+
+    for v in FilteredElementCollector(doc).OfClass(View):
+        if v.IsTemplate:
+            continue
+        if v.ViewType != ViewType.Elevation:
+            continue
+        vd = v.ViewDirection
+        cardinal = closest_direction(vd.X, vd.Y, vd.Z)
+        # Fallback : try parsing from view name.
+        if cardinal is None:
+            name_lower = (v.Name or "").lower()
+            for d, aliases in (
+                ("Sud", ("sud", "south")),
+                ("Nord", ("nord", "north")),
+                ("Est", ("est", "east")),
+                ("Ouest", ("ouest", "west")),
+            ):
+                if any(a in name_lower for a in aliases):
+                    cardinal = d
+                    break
+        out.append({
+            "revit_id": int(v.Id.Value),
+            "name": v.Name,
+            "direction": cardinal,
+            "view_direction_xyz": [
+                round(vd.X, 4), round(vd.Y, 4), round(vd.Z, 4),
+            ],
+        })
+    return {"elevation_views": out}
+
+
 @tool(name="catalog_list_floor_types", tier=1)
 def list_floor_types(kg: ProjectKG) -> Dict[str, List[Dict[str, Any]]]:
     """Liste tous les types de sol / dalle (FloorType) avec llm_id, nom et

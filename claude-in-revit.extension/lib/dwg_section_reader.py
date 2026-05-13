@@ -192,36 +192,99 @@ LAYER_AREA_LABELS = "A-AREA-IDEN"
 # ----- Classification plan vs coupe -------------------------------------
 
 
-def classify_dxf(layers_meta: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
-    """Classifie un DXF en `"plan"`, `"section"` ou `"unknown"` à partir du
-    métadata des layers retourné par `dwg_reader.parse()`.
+def classify_dxf(
+    layers_meta: List[Dict[str, Any]],
+    file_name: Optional[str] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Classifie un DXF en `"plan"`, `"section"`, `"elevation"` ou
+    `"unknown"`.
 
-    Heuristique :
-    - Présence de `A-FLOR-LEVL` avec ≥ 1 LINE → coupe (signature niveaux).
-    - Sinon présence de `A-AREA-IDEN` avec ≥ 1 MTEXT → plan (labels pièces).
-    - Sinon : `unknown`. Caller peut forcer via paramètre dédié.
+    Heuristique (priorité descendante) :
+    1. Si `file_name` contient « élévation » / « elevation » AND le
+       DXF a des layers section-like (A-FLOR-LEVL) → `"elevation"`.
+       Distinction nécessaire car élévations et coupes ont la même
+       signature de layers — c'est le filename qui les discrimine.
+    2. Présence de `A-AREA-IDEN` avec ≥ 1 MTEXT → `"plan"` (labels
+       pièces, uniquement présents dans les plans).
+    3. Présence de `A-FLOR-LEVL` avec ≥ 1 LINE → `"section"`.
+    4. Sinon : `"unknown"`.
 
     Args:
-        layers_meta: la valeur de `meta["layers"]` retournée par `parse`.
+        layers_meta: la valeur de `meta["layers"]` retournée par
+            `dwg_reader.parse()`.
+        file_name: nom du fichier (sans path) ou path complet. Utilisé
+            pour la détection élévation. Optionnel — sans, l'élévation
+            est classée comme `"section"` (signature layers identique).
 
     Returns:
         `(kind, evidence)` où `evidence` détaille ce qui a déclenché la
-        classification (utile au LLM pour expliquer son choix).
+        classification.
     """
     levels_layer = next((l for l in layers_meta if l["name"] == LAYER_LEVELS), None)
     area_layer = next((l for l in layers_meta if l["name"] == LAYER_AREA_LABELS), None)
 
-    if levels_layer and levels_layer["kinds"].get("LINE", 0) >= 1:
+    has_levels_signature = (
+        levels_layer is not None
+        and levels_layer["kinds"].get("LINE", 0) >= 1
+    )
+    has_plan_signature = (
+        area_layer is not None
+        and area_layer["kinds"].get("MTEXT", 0) >= 1
+    )
+
+    file_lower = (file_name or "").lower()
+
+    # 1. Elevation : filename indique élévation + signature de section.
+    if has_levels_signature and file_name:
+        lname = file_lower
+        if any(kw in lname for kw in ("élévation", "elevation", "elévation")):
+            # Direction parsing : ORDRE IMPORTANT — Ouest avant Est
+            # (sinon "est" matche en substring "ouest").
+            direction = None
+            for d, aliases in (
+                ("Ouest", ("ouest", "west")),
+                ("Nord", ("nord", "north")),
+                ("Sud", ("sud", "south")),
+                ("Est", ("est", "east")),
+            ):
+                if any(a in lname for a in aliases):
+                    direction = d
+                    break
+            return "elevation", {
+                "trigger": "filename contains 'elevation' + A-FLOR-LEVL signature",
+                "direction": direction,
+                "lines_count": levels_layer["kinds"].get("LINE", 0),
+                "mtext_count": levels_layer["kinds"].get("MTEXT", 0),
+            }
+
+    # 2. Plan : labels pièces présents OU filename indique "Plan"/"Niveau"
+    # sans signature levels (les plans n'ont pas A-FLOR-LEVL en général).
+    if has_plan_signature:
+        return "plan", {
+            "trigger": "A-AREA-IDEN with MTEXT labels",
+            "mtext_count": area_layer["kinds"].get("MTEXT", 0),
+        }
+    if file_name and not has_levels_signature:
+        if any(kw in file_lower for kw in (
+            "plan d'étage", "plan d'etage", "plan floor", "floor plan",
+            "niveau", "level", "rdc", "etage", "étage",
+        )):
+            return "plan", {
+                "trigger": "filename suggests plan + no A-FLOR-LEVL signature",
+                "file_keyword": next(
+                    (k for k in ("plan", "niveau", "level", "rdc")
+                     if k in file_lower), None,
+                ),
+            }
+
+    # 3. Section.
+    if has_levels_signature:
         return "section", {
             "trigger": "A-FLOR-LEVL with horizontal lines",
             "lines_count": levels_layer["kinds"].get("LINE", 0),
             "mtext_count": levels_layer["kinds"].get("MTEXT", 0),
         }
-    if area_layer and area_layer["kinds"].get("MTEXT", 0) >= 1:
-        return "plan", {
-            "trigger": "A-AREA-IDEN with MTEXT labels",
-            "mtext_count": area_layer["kinds"].get("MTEXT", 0),
-        }
+
     return "unknown", {
         "trigger": "no recognized signature",
         "available_layers": [l["name"] for l in layers_meta],
