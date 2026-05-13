@@ -3226,24 +3226,16 @@ def create_continuous_walls_many(
         total_fusion_events += len(events)
         fusion_events_detail.extend(events)
 
-    # --- 3bis. Filtre faux positifs via vote élévation (V3.1) ----------
-    # User runtime P7 : « l'élévation n'indique aucun mur, alors que
-    # trois murs ont été modélisés ». Le classifier détecte des paires
-    # parallèles qui ne sont pas des vrais murs (joints, hachures,
-    # changements de matériau). On les filtre si les élévations les
-    # voient mais votent no — i.e. le DXF élévation est cohérent et
-    # contredit la présence du mur.
+    # --- 3bis. Filtre auto DÉSACTIVÉ V3.8 -------------------------------
+    # Tentatives V3.1 → V3.7 de filter automatique ont toutes produit
+    # des régressions sur P7 (vrais murs supprimés à tort). Le signal
+    # élévation seul ne distingue pas faux positif d'un vrai mur
+    # intérieur ou d'un mur extérieur vu depuis l'arrière. Le filter
+    # auto est désactivé ; on utilise uniquement le **score 3D** plus
+    # bas pour signaler les suspects au user qui décide via llm_id
+    # visible Revit.
     total_walls_filtered = 0
     filtered_walls_detail: List[Dict[str, Any]] = []
-    for pr in plan_records:
-        level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
-        height_m = float(pr["item"].get("height_m") or 3.0)
-        kept, removed = dwg_plan_openings.filter_walls_via_elevation_vote(
-            pr["walls"], elevations, level_elev, height_m,
-        )
-        pr["walls"] = kept
-        total_walls_filtered += len(removed)
-        filtered_walls_detail.extend(removed)
 
     # --- 4. Dédup thicknesses + get_or_create types ---------------------
     seen_buckets: Set[int] = set()

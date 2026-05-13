@@ -205,18 +205,10 @@ def vote_wall_visible_in_elevation(
     y_min_w = level_elevation_m
     y_max_w = level_elevation_m + height_m
 
-    # V3.6 : un mur a une épaisseur, donc il est aussi visible DE PROFIL
-    # depuis l'élévation latérale (= comme une bande étroite de largeur
-    # ≈ thickness). User 2026-05-13 : « un mur a une épaisseur et est
-    # par conséquent visible dans l'autre direction, pas seulement de
-    # face ». En vue de profil, la projection des 2 endpoints donne le
-    # même x_elev → bande de largeur 0. On l'élargit par thickness pour
-    # couvrir l'épaisseur réelle.
-    profile_view = (x_max_w - x_min_w) < wall_thickness_m * 0.5
-    if profile_view:
-        x_center = (x_min_w + x_max_w) / 2.0
-        x_min_w = x_center - wall_thickness_m / 2.0
-        x_max_w = x_center + wall_thickness_m / 2.0
+    # V3.7 : pas d'extension thickness en profil (cf. note précédente).
+    # On garde wall_thickness_m en paramètre pour future utilisation
+    # mais on n'élargit plus le x_range. Le perp_tol_m du critère
+    # overlap_v capture déjà une bande raisonnable autour de x_elev.
 
     # Si la projection est COMPLÈTEMENT en dehors de la bbox A-WALL de
     # l'élévation, le mur n'est pas visible dans cette vue.
@@ -235,12 +227,13 @@ def vote_wall_visible_in_elevation(
     # élévations voter** (suppression de la restriction V3.2 par
     # orientation). Une élévation qui voit le mur de profil émet quand
     # même un vote — typiquement no s'il n'y a pas de matière dans la
-    # zone projetée (= ligne aplatie à x_elev=constante). Le signal
-    # discriminant principal est : **au moins 1 élévation vote no**
-    # pour un mur projeté dans sa bbox → faux positif probable.
-    wall_dx_world = wall_p2[0] - wall_p1[0]
-    wall_dy_world = wall_p2[1] - wall_p1[1]
-    wall_is_ew = abs(wall_dx_world) > abs(wall_dy_world)
+    # zone projetée (= ligne aplatie à x_elev=constante).
+
+    # V3.7 rollback : pas d'extension thickness en profil (causait
+    # régression pipeline : murs intérieurs en profil → 0 overlap dans
+    # bande étroite → no_count élevé → filter à tort). Critère simple
+    # overlap_h ou overlap_v >= min_overlap_m via perp_tol_m suffit.
+    profile_view = False  # pas utilisé, conservé pour compat evidence
 
     # Cherche des A-WALL lines dans la zone projetée. **Exclure** les
     # lignes horizontales alignées avec les niveaux (= dalles).
@@ -285,16 +278,16 @@ def vote_wall_visible_in_elevation(
         "profile_view": profile_view,
     }
 
-    # V3.6 : critère unifié (face + profil), avec extension thickness
-    # du x_range en profil (déjà fait plus haut). Le critère existant
-    # détecte automatiquement les présences :
-    # - Vue de face : silhouette large → overlap_h ou overlap_v ≥ seuil.
-    # - Vue de profil : thickness extension capture la bande étroite →
-    #   si verticale(s) présente(s) à l'épaisseur du mur → overlap_v
-    #   positif → yes. Sinon (zone strictement vide) → no.
-    # Tested sur P7 : wall_161/162/166 (FP) vu de profil → 0 verticales
-    # dans la bande → no. Vrais murs vu de profil → ≥ 1 verticale du
-    # coin extérieur → yes.
+    # V3.6 critère unifié (face + profil), extension thickness en profil
+    # déjà appliquée plus haut. **Tentative V3.7 d'exiger v_lines >= 2
+    # en face rejected** : régression massive sur P7 (6/10 N0 + 5/9 N1
+    # supprimés à tort — les vrais murs sans linteau ont souvent v=1
+    # depuis l'élévation arrière du bâtiment). Le critère simple
+    # `overlap_h ou overlap_v ≥ min_overlap_m` est plus prudent et
+    # discriminera 2/3 FP automatiquement (no_count >= 1 sur wall_161
+    # via Est/Ouest profile + wall_162 via Nord/Sud profile).
+    # wall_166-like reste un edge case à supprimer manuellement via
+    # llm_id visible Revit.
     if overlap_h >= min_overlap_m or overlap_v >= min_overlap_m:
         # Confidence proportional to combined overlap, capped at 1.0.
         wall_length = math.sqrt(
