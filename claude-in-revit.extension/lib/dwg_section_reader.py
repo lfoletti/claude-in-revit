@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .dwg_reader import DwgEntity
 
@@ -295,6 +295,212 @@ class SectionOpening:
     rotation_deg: float
     width_m: Optional[float]
     height_m: Optional[float]
+
+
+# ----- Section markers in plan (Étape 2 Phase 1) ------------------------
+#
+# Convention observée Projet4 (export Revit AIA) — layer `G-ANNO-SYMB` :
+# - LINEs longues : les traits de coupe et lignes d'élévation.
+# - INSERTs aux extrémités : blocs symbole. Le NOM du bloc discrimine :
+#   - `Coupe - Marque de la ligne de coupe - *`  → trait de coupe.
+#   - `Coupe - Extrémité de la ligne de coupe - *`  → tête de coupe.
+#   - `Elévation - Flèche *`  → marqueur d'élévation (façade view), pas
+#     une coupe.
+# - Le reste (MTEXT minimalistes, etc.) est ignoré.
+#
+# Autres conventions à anticiper : `G-ANNO-SECT*` (AIA pur), variations
+# ArchiCAD (à découvrir).
+
+# Layer prefixes habituels pour les annotations de coupe.
+SECTION_LAYER_HINTS = ("G-ANNO-SYMB", "G-ANNO-SECT", "G-ANNO")
+
+# Mots-clés FR + EN qui qualifient un bloc d'annotation de coupe.
+SECTION_BLOCK_KEYWORDS = ("coupe", "section")
+ELEVATION_BLOCK_KEYWORDS = ("elevation", "elévation", "élévation")
+
+# Tolérance pour considérer qu'un INSERT est « au bout » d'une LINE
+# (mètres). Sur Projet4 les marqueurs sont posés EXACTEMENT sur les
+# endpoints, donc tolérance fine suffit ; on prend 0.5m pour absorber
+# d'éventuelles approximations.
+_MARKER_ENDPOINT_TOL_M = 0.5
+
+# Longueur min d'une LINE pour qu'elle soit considérée comme trait de
+# coupe (mètres). Filtre les petites lignes décoratives.
+_MIN_SECTION_LINE_LENGTH_M = 2.0
+
+
+@dataclass
+class SectionMarker:
+    """Un trait de coupe ou d'élévation détecté dans un plan.
+
+    `kind` : "section" (vrai trait de coupe traversant le bâtiment) ou
+    "elevation" (marqueur de façade — vue élévation Revit). Le caller
+    veut typiquement filtrer sur `kind == "section"`.
+
+    `is_vertical` / `is_horizontal` posés par tolérance (1° d'écart) :
+    facilite l'inférence de la direction de vue (perpendiculaire au
+    trait).
+
+    `view_dir_candidates` : 2 options possibles (l'orientation de vue
+    n'est pas unique avec un trait + un marqueur unique : Revit peut
+    regarder à gauche OU à droite du trait). L'agent doit confirmer
+    avec l'utilisateur.
+
+    `associated_blocks` : INSERTs qui ont déclenché la classification —
+    utile pour debug et pour que l'agent puisse expliquer son choix.
+    """
+    kind: str
+    p1_m: Tuple[float, float]
+    p2_m: Tuple[float, float]
+    length_m: float
+    is_vertical: bool
+    is_horizontal: bool
+    view_dir_candidates: List[str]
+    associated_blocks: List[Dict[str, Any]]
+    source_layer: str
+
+
+def _line_is_horizontal(p1: Tuple[float, float], p2: Tuple[float, float], tol: float = 0.01) -> bool:
+    return abs(p2[1] - p1[1]) < tol
+
+
+def _line_is_vertical(p1: Tuple[float, float], p2: Tuple[float, float], tol: float = 0.01) -> bool:
+    return abs(p2[0] - p1[0]) < tol
+
+
+def _block_name_matches(name: str, keywords: Tuple[str, ...]) -> bool:
+    """Case-insensitive substring match contre une liste de keywords."""
+    lname = name.lower()
+    return any(kw in lname for kw in keywords)
+
+
+def _layer_matches_hints(layer: str, hints: Tuple[str, ...]) -> bool:
+    """Layer match prefix-style ou contains pour les hints à wildcard."""
+    upper = layer.upper()
+    for h in hints:
+        if h.upper() in upper:
+            return True
+    return False
+
+
+def find_section_markers(
+    entities: List[DwgEntity],
+    *,
+    layer_hints: Optional[Tuple[str, ...]] = None,
+    section_keywords: Optional[Tuple[str, ...]] = None,
+    elevation_keywords: Optional[Tuple[str, ...]] = None,
+    min_length_m: float = _MIN_SECTION_LINE_LENGTH_M,
+    endpoint_tol_m: float = _MARKER_ENDPOINT_TOL_M,
+) -> List[SectionMarker]:
+    """Identifie les traits de coupe (et marqueurs d'élévation) dans un plan.
+
+    Algo :
+    1. Collecte les LINEs sur les layers matching `layer_hints` (défaut
+       `G-ANNO-SYMB / G-ANNO-SECT / G-ANNO`).
+    2. Collecte les INSERTs sur les mêmes layers, indexés par position.
+    3. Pour chaque LINE de longueur > `min_length_m` :
+       a. Cherche les INSERTs à ≤ `endpoint_tol_m` de chaque endpoint.
+       b. Classifie chaque INSERT : block name contient un section_keyword
+          → "section" ; contient un elevation_keyword → "elevation".
+       c. Si au moins 1 INSERT section trouvé → kind="section".
+          Sinon si au moins 1 INSERT elevation trouvé → kind="elevation".
+          Sinon : LINE non qualifiée, skip.
+    4. Calcule l'orientation (vertical/horizontal) et propose les 2
+       candidats de direction de vue.
+
+    Retourne la liste triée par longueur décroissante (les vraies coupes
+    sont typiquement les plus longues).
+    """
+    hints = layer_hints if layer_hints is not None else SECTION_LAYER_HINTS
+    sect_kws = section_keywords if section_keywords is not None else SECTION_BLOCK_KEYWORDS
+    elev_kws = elevation_keywords if elevation_keywords is not None else ELEVATION_BLOCK_KEYWORDS
+
+    lines: List[DwgEntity] = []
+    inserts: List[DwgEntity] = []
+    for e in entities:
+        if not _layer_matches_hints(e.layer, hints):
+            continue
+        if e.kind == "LINE":
+            lines.append(e)
+        elif e.kind == "INSERT":
+            inserts.append(e)
+
+    markers: List[SectionMarker] = []
+    for line in lines:
+        (x1, y1, _), (x2, y2, _) = line.coords
+        p1 = (round(x1, 4), round(y1, 4))
+        p2 = (round(x2, 4), round(y2, 4))
+        length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        if length < min_length_m:
+            continue
+
+        # Search INSERTs near endpoints.
+        nearby: List[Tuple[DwgEntity, float, str]] = []  # (insert, distance, which_endpoint)
+        for ins in inserts:
+            ix, iy, _ = ins.coords[0]
+            d1 = ((ix - x1) ** 2 + (iy - y1) ** 2) ** 0.5
+            d2 = ((ix - x2) ** 2 + (iy - y2) ** 2) ** 0.5
+            if d1 <= endpoint_tol_m:
+                nearby.append((ins, d1, "p1"))
+            elif d2 <= endpoint_tol_m:
+                nearby.append((ins, d2, "p2"))
+
+        # Classify by block name keywords.
+        kind: Optional[str] = None
+        associated: List[Dict[str, Any]] = []
+        for ins, dist, which in nearby:
+            block_name = ins.attrs.get("block_name", "")
+            if _block_name_matches(block_name, sect_kws):
+                kind = "section"  # priority to section over elevation
+                associated.append({
+                    "block_name": block_name,
+                    "x_m": round(ins.coords[0][0], 4),
+                    "y_m": round(ins.coords[0][1], 4),
+                    "rotation_deg": float(ins.attrs.get("rotation_deg", 0.0)),
+                    "endpoint": which,
+                    "kind_detected": "section",
+                })
+            elif _block_name_matches(block_name, elev_kws):
+                if kind is None:
+                    kind = "elevation"
+                associated.append({
+                    "block_name": block_name,
+                    "x_m": round(ins.coords[0][0], 4),
+                    "y_m": round(ins.coords[0][1], 4),
+                    "rotation_deg": float(ins.attrs.get("rotation_deg", 0.0)),
+                    "endpoint": which,
+                    "kind_detected": "elevation",
+                })
+
+        if kind is None:
+            continue  # LINE not qualified
+
+        is_vert = _line_is_vertical(p1, p2)
+        is_horiz = _line_is_horizontal(p1, p2)
+        if is_vert:
+            candidates = ["left", "right"]
+        elif is_horiz:
+            candidates = ["up", "down"]
+        else:
+            candidates = ["left", "right", "up", "down"]  # oblique — ambigu
+
+        source_layer = line.layer
+
+        markers.append(SectionMarker(
+            kind=kind,
+            p1_m=p1,
+            p2_m=p2,
+            length_m=round(length, 4),
+            is_vertical=is_vert,
+            is_horizontal=is_horiz,
+            view_dir_candidates=candidates,
+            associated_blocks=associated,
+            source_layer=source_layer,
+        ))
+
+    # Sort by length desc (longest = most likely real section).
+    markers.sort(key=lambda m: -m.length_m)
+    return markers
 
 
 def read_section_openings(entities: List[DwgEntity]) -> List[SectionOpening]:

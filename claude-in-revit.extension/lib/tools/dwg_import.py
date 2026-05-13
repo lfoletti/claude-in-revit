@@ -608,3 +608,245 @@ def inspect_sections(
             "axe_plan) reste à demander à l'utilisateur."
         ),
     }
+
+
+# ----- 5. Find section markers (Phase 1 Étape 2) ------------------------
+
+
+def _section_marker_to_dict(m: dwg_section_reader.SectionMarker) -> Dict[str, Any]:
+    return {
+        "kind": m.kind,
+        "p1_m": list(m.p1_m),
+        "p2_m": list(m.p2_m),
+        "length_m": round(m.length_m, 4),
+        "is_vertical": m.is_vertical,
+        "is_horizontal": m.is_horizontal,
+        "view_dir_candidates": list(m.view_dir_candidates),
+        "associated_blocks": list(m.associated_blocks),
+        "source_layer": m.source_layer,
+    }
+
+
+@tool(name="dwg_find_section_markers", tier=2)
+def find_section_markers(
+    kg: ProjectKG,
+    file_path: str,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Détecte les traits de coupe (et marqueurs d'élévation) dans un plan DXF.
+
+    Étape 2 de la Phase 1 import projet (cf. spec 2026-05-13). Sort un
+    rapport ordonné par longueur décroissante. Le caller (LLM ou user)
+    confirme ensuite le mapping coupe ↔ trait, puis appelle
+    `dxf_context_register_section_line` pour persister.
+
+    **Algo** : layers `G-ANNO-SYMB` / `G-ANNO-SECT` (Revit AIA export) ;
+    LINEs longues + INSERTs aux extrémités. Le nom du bloc INSERT
+    distingue coupe (`Coupe - ...`) vs élévation (`Elévation - ...`).
+    Les vraies coupes sont les premières dans la liste retournée
+    (`kind == "section"`).
+
+    **Ambiguïté direction de vue** : chaque trait expose 2 candidats
+    (`view_dir_candidates`) car la rotation du marqueur n'identifie
+    pas universellement le sens — l'agent demande à l'user.
+
+    Concepts: dxf, plan, coupe, section, trait de coupe, marker, géo-ref,
+              annotation, G-ANNO, élévation, phase 1
+    Phrases: "trouve les traits de coupe", "où sont les coupes dans le plan",
+             "détecte les marqueurs d'élévation", "section markers"
+    Similar: dwg_inspect_sections, dxf_context_register_section_line,
+             dwg_verify_section_scale
+
+    Args:
+        file_path: chemin du DXF plan (doit être kind='plan' selon
+            classify_dxf — pas de vérification stricte ici, le tool
+            détecte les markers même sur un DXF unknown).
+        scale_override: facteur supplémentaire $INSUNITS si nécessaire.
+
+    Returns:
+        {"ok": bool, "file": str, "section_count": int,
+         "elevation_count": int, "markers": [{...}, ...]}
+        Chaque marker : kind, p1_m, p2_m, length_m, is_vertical,
+        is_horizontal, view_dir_candidates, associated_blocks,
+        source_layer.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError("File not found: {}".format(path))
+
+    entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    markers = dwg_section_reader.find_section_markers(entities)
+
+    markers_dict = [_section_marker_to_dict(m) for m in markers]
+    section_count = sum(1 for m in markers if m.kind == "section")
+    elevation_count = sum(1 for m in markers if m.kind == "elevation")
+
+    return {
+        "ok": True,
+        "file": str(path),
+        "section_count": section_count,
+        "elevation_count": elevation_count,
+        "markers": markers_dict,
+        "note": (
+            "Pour chaque trait de coupe (kind='section'), demander à "
+            "l'utilisateur de confirmer (a) le mapping vers quel DXF "
+            "de coupe et (b) la direction de vue parmi `view_dir_candidates`. "
+            "Puis appeler `dxf_context_register_section_line` avec ces "
+            "infos."
+            if section_count > 0 else
+            "Aucun trait de coupe détecté. Vérifier que le DXF a été "
+            "exporté avec les annotations Coupes visibles (Revit : VG → "
+            "Annotations → Coupes coché + configuration export DXF "
+            "mapping correct)."
+        ),
+    }
+
+
+# ----- 6. Verify section scale (Phase 1 Étape 3) ------------------------
+
+
+@tool(name="dwg_verify_section_scale", tier=2)
+def verify_section_scale(
+    kg: ProjectKG,
+    section_line_length_m: float,
+    coupe_path: str,
+    plan_path: Optional[str] = None,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Vérifie la cohérence d'échelle entre un trait de coupe en plan et le
+    DXF de coupe correspondant (Étape 3 Phase 1).
+
+    Sanity check, pas géo-ref exhaustive. Compare :
+
+    1. **Cohérence d'unités** : `$INSUNITS` du plan et de la coupe. Si
+       discordance (plan mm, coupe feet, etc.) → warning.
+    2. **Extension géométrique** : range des coordonnées de la coupe
+       (calculée sur A-WALL ou bbox global) vs longueur du trait dans
+       le plan. Ratio > 50% drift → warning, > 100% → erreur.
+
+    Le tool ne touche pas au KG ; le caller persiste éventuellement
+    `drift_pct` via `dxf_context_register_section_line(... scale_verified=
+    True, drift_pct=X)`.
+
+    **Limitation V0** : la coupe DXF inclut souvent du contexte
+    hors-bâtiment (terrain, sky, légendes, cartouche), donc le bbox
+    A-WALL surévalue la largeur réelle. Le drift attendu reste élevé
+    sur des coupes « complètes » — l'agent doit interpréter les
+    seuils comme indicatifs, pas comme un échec strict.
+
+    Concepts: dxf, coupe, échelle, scale, géo-ref, vérification,
+              cohérence, drift, phase 1, $INSUNITS
+    Phrases: "vérifie l'échelle entre plan et coupe", "scale check",
+             "is the section line at the right scale",
+             "drift entre plan et coupe"
+    Similar: dwg_find_section_markers, dxf_context_register_section_line,
+             dwg_inspect_sections
+
+    Args:
+        section_line_length_m: longueur du trait de coupe dans le plan,
+            en mètres. Typiquement obtenu de `dwg_find_section_markers`.
+        coupe_path: chemin du DXF coupe.
+        plan_path: chemin du DXF plan, optionnel. Si fourni, le tool
+            vérifie aussi la cohérence d'unités plan ↔ coupe.
+        scale_override: voir `dwg_inspect`.
+
+    Returns:
+        {"ok": bool, "scale_match": bool, "warning": str | None,
+         "section_line_length_m": float, "coupe_a_wall_extent_m": float,
+         "drift_pct": float, "drift_m": float, "units_consistent": bool,
+         "plan_units_factor": float | None, "coupe_units_factor": float}
+    """
+    coupe_path_obj = Path(coupe_path)
+    if not coupe_path_obj.exists():
+        raise FileNotFoundError("Coupe file not found: {}".format(coupe_path_obj))
+    coupe_entities, coupe_meta = dwg_reader.parse(
+        coupe_path_obj, scale_override=scale_override,
+    )
+
+    plan_units_factor: Optional[float] = None
+    units_consistent = True
+    if plan_path is not None:
+        plan_path_obj = Path(plan_path)
+        if not plan_path_obj.exists():
+            raise FileNotFoundError("Plan file not found: {}".format(plan_path_obj))
+        _, plan_meta = dwg_reader.parse(plan_path_obj, scale_override=scale_override)
+        plan_units_factor = plan_meta["units_factor_to_m"]
+        coupe_units_factor = coupe_meta["units_factor_to_m"]
+        units_consistent = abs(plan_units_factor - coupe_units_factor) < 1e-6
+    else:
+        coupe_units_factor = coupe_meta["units_factor_to_m"]
+
+    # Coupe A-WALL X extent (in metres post-conversion).
+    xs: List[float] = []
+    for e in coupe_entities:
+        if e.layer != "A-WALL" or e.kind != "LINE":
+            continue
+        for pt in e.coords:
+            xs.append(pt[0])
+    if not xs:
+        # Fallback : use any LINE on any wall-like layer.
+        for e in coupe_entities:
+            if e.kind == "LINE":
+                for pt in e.coords:
+                    xs.append(pt[0])
+    if not xs:
+        return {
+            "ok": False,
+            "scale_match": False,
+            "warning": "Coupe contient aucune LINE — extent géométrique non calculable.",
+            "section_line_length_m": float(section_line_length_m),
+            "coupe_a_wall_extent_m": 0.0,
+            "drift_pct": float("inf"),
+            "drift_m": 0.0,
+            "units_consistent": units_consistent,
+            "plan_units_factor": plan_units_factor,
+            "coupe_units_factor": coupe_units_factor,
+        }
+
+    coupe_extent_m = max(xs) - min(xs)
+    sl_len = float(section_line_length_m)
+    drift_m = abs(sl_len - coupe_extent_m)
+    # drift_pct relatif à la valeur max (plus stable que relativement à
+    # un côté arbitraire).
+    denom = max(sl_len, coupe_extent_m, 1e-6)
+    drift_pct = 100.0 * drift_m / denom
+
+    # Tolérance pragmatique : la coupe inclut souvent du contexte
+    # hors-bâtiment, donc on accepte un drift jusqu'à 50% comme
+    # "scale_match" mais avec warning au-delà de 25%.
+    scale_match = units_consistent and drift_pct < 50.0
+    warning: Optional[str] = None
+    if not units_consistent:
+        warning = (
+            "Unit mismatch: plan factor {} vs coupe factor {} — un des "
+            "deux DXF a un $INSUNITS différent. Re-export avec mêmes "
+            "unités recommandé.".format(plan_units_factor, coupe_units_factor)
+        )
+    elif drift_pct >= 50.0:
+        warning = (
+            "Drift {:.1f}% entre trait de coupe ({:.2f}m) et extent A-WALL "
+            "de la coupe ({:.2f}m). Possibles causes : (1) mauvais mapping "
+            "trait↔coupe ; (2) coupe inclut un contexte étendu hors-"
+            "bâtiment. Vérifier visuellement avant d'enchaîner."
+            .format(drift_pct, sl_len, coupe_extent_m)
+        )
+    elif drift_pct >= 25.0:
+        warning = (
+            "Drift {:.1f}% notable mais tolérable (la coupe inclut souvent "
+            "du contexte hors-bâtiment). Acceptable si le mapping trait↔"
+            "coupe a été confirmé par l'utilisateur."
+            .format(drift_pct)
+        )
+
+    return {
+        "ok": True,
+        "scale_match": scale_match,
+        "warning": warning,
+        "section_line_length_m": round(sl_len, 4),
+        "coupe_a_wall_extent_m": round(coupe_extent_m, 4),
+        "drift_pct": round(drift_pct, 2),
+        "drift_m": round(drift_m, 4),
+        "units_consistent": units_consistent,
+        "plan_units_factor": plan_units_factor,
+        "coupe_units_factor": coupe_units_factor,
+    }

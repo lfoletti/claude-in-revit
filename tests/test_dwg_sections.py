@@ -22,8 +22,10 @@ ezdxf = pytest.importorskip("ezdxf")
 from lib import dwg_reader, dwg_section_reader as dsr
 from lib.dwg_section_reader import (
     Level,
+    SectionMarker,
     SectionOpening,
     classify_dxf,
+    find_section_markers,
     match_openings,
     parse_block_dimensions,
     parse_block_id,
@@ -322,6 +324,227 @@ def test_match_openings_by_block_id(tmp_path):
     assert unmatched_plan == [2]  # 255830 sans pendant
 
 
+# ----- find_section_markers (synthetic) --------------------------------
+
+
+def _make_plan_with_section_marker_dxf(
+    tmp_path: Path,
+    *,
+    units_code: int = 4,  # mm
+    section_orientation: str = "vertical",  # "vertical" | "horizontal"
+    include_elevation: bool = False,
+) -> Path:
+    """DXF plan synthétique avec un trait de coupe sur G-ANNO-SYMB et un
+    bloc « Coupe » à chaque extrémité.
+
+    Si `include_elevation=True`, ajoute aussi un marqueur d'élévation
+    isolé (INSERT sur G-ANNO-SYMB avec bloc « Elévation - Flèche »).
+    """
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = units_code
+    doc.layers.add("A-WALL")
+    doc.layers.add("A-AREA-IDEN")
+    doc.layers.add("G-ANNO-SYMB")
+    msp = doc.modelspace()
+
+    # Un petit dessin de plan minimal (sinon classify_dxf renverra plan vide).
+    msp.add_mtext("Pièce 1", dxfattribs={
+        "layer": "A-AREA-IDEN", "insert": (0, 0), "char_height": 200,
+    })
+    msp.add_line((0, 0), (5000, 0), dxfattribs={"layer": "A-WALL"})
+
+    # Block defs for section markers + elevation arrows.
+    sect_block_name = "Coupe - Marque de la ligne de coupe - Verticale pleine-1234-Niveau 0"
+    if sect_block_name not in doc.blocks:
+        blk = doc.blocks.new(name=sect_block_name)
+        blk.add_line((0, 0), (10, 0), dxfattribs={"layer": "G-ANNO-SYMB"})
+    elev_block_name = "Elévation - Flèche pleine-9999-Niveau 0"
+    if elev_block_name not in doc.blocks:
+        blk = doc.blocks.new(name=elev_block_name)
+        blk.add_circle((0, 0), 5, dxfattribs={"layer": "G-ANNO-SYMB"})
+
+    # Section line + markers at endpoints.
+    if section_orientation == "vertical":
+        line_p1, line_p2 = (5000.0, -10000.0), (5000.0, 10000.0)
+    else:
+        line_p1, line_p2 = (-10000.0, 5000.0), (10000.0, 5000.0)
+    msp.add_line(line_p1, line_p2, dxfattribs={"layer": "G-ANNO-SYMB"})
+    msp.add_blockref(sect_block_name, line_p1, dxfattribs={"layer": "G-ANNO-SYMB"})
+    msp.add_blockref(sect_block_name, line_p2, dxfattribs={"layer": "G-ANNO-SYMB"})
+
+    if include_elevation:
+        # Elevation marker on its own (not on a line). It still gets
+        # detected because we attach it to a LINE that has another bloc.
+        # Actually : in our algo, a LINE without any associated INSERT
+        # is filtered out, and an INSERT alone (no LINE) is not detected.
+        # So to test elevation: place a separate LINE with elevation
+        # blocks at both endpoints.
+        elev_line_p1, elev_line_p2 = (15000.0, 0.0), (20000.0, 0.0)
+        msp.add_line(elev_line_p1, elev_line_p2, dxfattribs={"layer": "G-ANNO-SYMB"})
+        msp.add_blockref(elev_block_name, elev_line_p1, dxfattribs={"layer": "G-ANNO-SYMB"})
+        msp.add_blockref(elev_block_name, elev_line_p2, dxfattribs={"layer": "G-ANNO-SYMB"})
+
+    path = tmp_path / "plan_with_section.dxf"
+    doc.saveas(str(path))
+    return path
+
+
+def test_find_section_markers_detects_vertical_section(tmp_path):
+    path = _make_plan_with_section_marker_dxf(tmp_path, section_orientation="vertical")
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    assert len(sections) == 1
+    m = sections[0]
+    assert m.is_vertical is True
+    assert m.is_horizontal is False
+    assert m.view_dir_candidates == ["left", "right"]
+    # Markers at both endpoints found.
+    assert len(m.associated_blocks) >= 2
+
+
+def test_find_section_markers_detects_horizontal_section(tmp_path):
+    path = _make_plan_with_section_marker_dxf(tmp_path, section_orientation="horizontal")
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    assert len(sections) == 1
+    m = sections[0]
+    assert m.is_horizontal is True
+    assert m.view_dir_candidates == ["up", "down"]
+
+
+def test_find_section_markers_distinguishes_elevation(tmp_path):
+    """Bloc 'Elévation - Flèche' → kind='elevation', pas 'section'."""
+    path = _make_plan_with_section_marker_dxf(
+        tmp_path, section_orientation="vertical", include_elevation=True,
+    )
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    elevations = [m for m in markers if m.kind == "elevation"]
+    assert len(sections) == 1
+    assert len(elevations) == 1
+
+
+def test_find_section_markers_ignores_short_lines(tmp_path):
+    """Une LINE < 2m sur G-ANNO-SYMB ne devrait pas être qualifiée."""
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("G-ANNO-SYMB")
+    msp = doc.modelspace()
+    sect_block = "Coupe - X-1-Niveau 0"
+    doc.blocks.new(name=sect_block).add_line((0, 0), (1, 0), dxfattribs={"layer": "G-ANNO-SYMB"})
+    # 1m line on a long-ranged layer.
+    msp.add_line((0, 0), (1000, 0), dxfattribs={"layer": "G-ANNO-SYMB"})
+    msp.add_blockref(sect_block, (0, 0), dxfattribs={"layer": "G-ANNO-SYMB"})
+    msp.add_blockref(sect_block, (1000, 0), dxfattribs={"layer": "G-ANNO-SYMB"})
+    path = tmp_path / "short.dxf"
+    doc.saveas(str(path))
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    assert all(m.length_m >= 2.0 for m in markers)
+
+
+def test_find_section_markers_returns_empty_when_no_g_anno_layer(tmp_path):
+    """Plan sans layer G-ANNO-* → liste vide, pas d'erreur."""
+    path = _make_plan_dxf(tmp_path)  # no section markers
+    entities, _ = dwg_reader.parse(path)
+    markers = find_section_markers(entities)
+    assert markers == []
+
+
+# ----- dwg_verify_section_scale (synthetic) ----------------------------
+
+
+def test_verify_scale_close_match(tmp_path):
+    """Trait 10m + coupe avec WALLs sur extent 10m → drift ~0, scale_match=True."""
+    # Plan and coupe with identical units.
+    plan = _make_plan_dxf(tmp_path)
+    coupe = _make_section_dxf(tmp_path, level_elevations_m=(0.0, 3.0))
+    # Manually add A-WALL lines on coupe to cover 10m range.
+    doc = ezdxf.readfile(str(coupe))
+    msp = doc.modelspace()
+    doc.layers.add("A-WALL") if "A-WALL" not in doc.layers else None
+    msp.add_line((0, 0), (10000, 0), dxfattribs={"layer": "A-WALL"})  # 10m
+    doc.saveas(str(coupe))
+
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_verify_section_scale",
+        {"section_line_length_m": 10.0, "coupe_path": str(coupe), "plan_path": str(plan)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["scale_match"] is True
+    assert payload["drift_pct"] < 5.0
+    assert payload["units_consistent"] is True
+
+
+def test_verify_scale_drift_warning(tmp_path):
+    """Trait 10m vs coupe 30m → drift 66%, warning émis."""
+    plan = _make_plan_dxf(tmp_path)
+    coupe = _make_section_dxf(tmp_path, level_elevations_m=(0.0,))
+    doc = ezdxf.readfile(str(coupe))
+    msp = doc.modelspace()
+    if "A-WALL" not in doc.layers:
+        doc.layers.add("A-WALL")
+    msp.add_line((0, 0), (30000, 0), dxfattribs={"layer": "A-WALL"})  # 30m
+    doc.saveas(str(coupe))
+
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_verify_section_scale",
+        {"section_line_length_m": 10.0, "coupe_path": str(coupe), "plan_path": str(plan)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["drift_pct"] > 50.0
+    assert payload["warning"] is not None
+    assert "drift" in payload["warning"].lower()
+
+
+def test_verify_scale_unit_mismatch_flagged(tmp_path):
+    """Plan en mm vs coupe en mètres → units_consistent=False."""
+    plan = _make_plan_dxf(tmp_path, units_code=4)  # mm
+    # Same content but with units_code=6 (metres) on coupe.
+    coupe = _make_section_dxf(tmp_path, units_code=6, level_elevations_m=(0.0,))
+    doc = ezdxf.readfile(str(coupe))
+    msp = doc.modelspace()
+    if "A-WALL" not in doc.layers:
+        doc.layers.add("A-WALL")
+    msp.add_line((0, 0), (10, 0), dxfattribs={"layer": "A-WALL"})
+    doc.saveas(str(coupe))
+
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_verify_section_scale",
+        {"section_line_length_m": 10.0, "coupe_path": str(coupe), "plan_path": str(plan)},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["units_consistent"] is False
+    assert "unit mismatch" in payload["warning"].lower()
+
+
 # ----- Integration : DXF réels Projet4 (skip si absents) ---------------
 
 
@@ -446,6 +669,97 @@ def test_dwg_inspect_accepts_section_with_kind_label():
     assert result["is_error"] is False
     payload = json.loads(result["content"])
     assert payload["kind"] == "section"
+
+
+@projet4_available
+def test_projet4_plan_has_section_markers():
+    """Le nouveau export du plan Projet4 doit avoir 2 traits de coupe
+    sur G-ANNO-SYMB : 1 vertical (Coupe 2) + 1 horizontal (Coupe 1).
+    Plus 8 marqueurs d'élévation (4 façades × 2 blocs imbriqués)."""
+    entities, _ = dwg_reader.parse(PROJET4_PLAN)
+    markers = find_section_markers(entities)
+    sections = [m for m in markers if m.kind == "section"]
+    elevations = [m for m in markers if m.kind == "elevation"]
+    assert len(sections) >= 1, f"Expected ≥1 section marker, got {len(sections)}"
+    # Chaque trait de coupe doit être vertical OU horizontal (cas de
+    # base Revit export). Pas de coupe oblique sur Projet4.
+    for m in sections:
+        assert m.is_vertical or m.is_horizontal, (
+            f"Section line should be axis-aligned, got p1={m.p1_m} p2={m.p2_m}"
+        )
+        # Direction de vue → 2 candidats (left/right pour vertical,
+        # up/down pour horizontal).
+        assert len(m.view_dir_candidates) == 2
+        assert all(d in ("left", "right", "up", "down") for d in m.view_dir_candidates)
+
+
+@projet4_available
+def test_dwg_verify_section_scale_projet4():
+    """Cas Projet4 : trait horizontal en plan ~13.7m, coupe horizontale
+    avec ses A-WALL qui couvre ~32m. Le drift est important (≈ 57%) mais
+    cohérent car la coupe inclut du contexte hors-bâtiment."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    # Section line horizontale du plan, longueur 13.7m (du test précédent).
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_verify_section_scale",
+        {
+            "section_line_length_m": 13.7,
+            "coupe_path": str(PROJET4_COUPE1),
+            "plan_path": str(PROJET4_PLAN),
+        },
+        "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["units_consistent"] is True
+    assert payload["section_line_length_m"] == 13.7
+    # Coupe 1 A-WALL X extent ≈ 20m (façade Est complète vue de profil).
+    assert 10 < payload["coupe_a_wall_extent_m"] < 50
+    # Drift > 25% → warning attendu.
+    assert payload["warning"] is not None
+
+
+@projet4_available
+def test_projet4_section_markers_via_tool():
+    """Roundtrip via dispatcher : tool dwg_find_section_markers.
+
+    Note : Projet4 contient aussi 8 marqueurs d'élévation standalone
+    (façades Nord/Sud/Est/Ouest, INSERTs sans LINE associée). L'algo
+    V0 ne les capte pas car il requiert une LINE pour ancrer. Limitation
+    documentée — à étendre V1 (passe standalone INSERTs).
+    """
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_find_section_markers",
+        {"file_path": str(PROJET4_PLAN)},
+        "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    # Au moins 2 sections attendues (Coupe 1 horizontale + Coupe 2
+    # verticale). Élévations standalone non détectées en V0.
+    assert payload["section_count"] >= 1
+    # Les markers sont triés par longueur décroissante.
+    lengths = [m["length_m"] for m in payload["markers"]]
+    assert lengths == sorted(lengths, reverse=True)
+    # Au moins un trait est vertical OU horizontal (axis-aligned).
+    axis_aligned = [m for m in payload["markers"]
+                    if m["is_vertical"] or m["is_horizontal"]]
+    assert len(axis_aligned) >= 1
 
 
 @projet4_available
