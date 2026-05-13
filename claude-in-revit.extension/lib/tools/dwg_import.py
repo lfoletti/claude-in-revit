@@ -2383,6 +2383,78 @@ def _find_default_family_type(
     return None
 
 
+def _collect_coupe_openings_world(
+    kg: ProjectKG,
+    section_lines: List[Dict[str, Any]],
+    scale_override: Optional[float],
+    level_elev_by_ref: Dict[str, float],
+    level_match_tol_m: float = 0.05,
+) -> List[Dict[str, Any]]:
+    """Lit les openings de chaque coupe référencée, projette en world plan,
+    déterminé leur niveau hôte, déduplique par block_id+position.
+
+    Returns:
+        Liste de dicts `{block_id, block_name, x_world, y_world, sill_m,
+        height_m, width_m, level_elevation_m, coupe_path,
+        section_line_index}`.
+    """
+    raw: List[Dict[str, Any]] = []
+    for sl_idx, sl in enumerate(section_lines):
+        coupe_path = sl.get("coupe_path")
+        if not coupe_path:
+            continue
+        cp = Path(coupe_path)
+        if not cp.exists():
+            continue
+        ents, _ = dwg_reader.parse(cp, scale_override=scale_override)
+        levels = sorted(
+            dwg_section_reader.read_levels(ents),
+            key=lambda l: l.elevation_m,
+        )
+        sec_openings = dwg_section_reader.read_section_openings(ents)
+        sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
+        sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
+        for so in sec_openings:
+            # Niveau hôte = le plus haut niveau ≤ y_dxf de l'opening.
+            host_lvl_elev: Optional[float] = None
+            for lv in levels:
+                if lv.elevation_m <= so.y_dxf_m + 1e-3:
+                    host_lvl_elev = lv.elevation_m
+            if host_lvl_elev is None:
+                continue
+            sill = round(so.y_dxf_m - host_lvl_elev, 4)
+            x_w, y_w = dwg_plan_openings.project_section_opening_to_world(
+                so.x_dxf_m, sp1, sp2,
+            )
+            raw.append({
+                "block_id": so.block_id,
+                "block_name": so.block_name,
+                "x_world": x_w,
+                "y_world": y_w,
+                "sill_m": sill,
+                "height_m": so.height_m,
+                "width_m": so.width_m,
+                "level_elevation_m": host_lvl_elev,
+                "coupe_path": str(cp),
+                "section_line_index": sl_idx,
+            })
+
+    # Dédup par (block_id, round position, level_elevation).
+    # Un même opening peut être vu depuis 2 coupes (même block_id) à la
+    # même position world → 1 seule fenêtre à créer.
+    seen: Dict[Tuple[Any, float, float, float], Dict[str, Any]] = {}
+    for co in raw:
+        key = (
+            co["block_id"] or co["block_name"],
+            round(co["x_world"], 2),
+            round(co["y_world"], 2),
+            round(co["level_elevation_m"], 3),
+        )
+        if key not in seen:
+            seen[key] = co
+    return list(seen.values())
+
+
 @tool(name="dwg_import_walls_and_openings_typed_many", tier=2)
 def import_walls_and_openings_typed_many(
     kg: ProjectKG,
@@ -2398,28 +2470,39 @@ def import_walls_and_openings_typed_many(
     door_family_type_ref: Optional[str] = None,
     window_family_type_ref: Optional[str] = None,
     coupe_paths: Optional[List[str]] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
     max_walls_per_file: int = 500,
 ) -> Dict[str, Any]:
-    """Phase 2 complète : import bulk multi-plans avec fusion fragments
-    + openings hosted (Phase 2.5).
+    """Phase 2 complète V1 : import bulk multi-plans avec fusion fragments
+    + openings hosted, **piloté par les coupes** (source primaire).
 
-    Diffère de `dwg_import_walls_typed_many` :
+    **V1 — pipeline coupe-first** (refonte session r post-runtime P7,
+    walls_merged=0 sur V0 plan-only) :
 
-    - Pour chaque plan, après classify, lit aussi les INSERTs A-GLAZ et
-      tente la fusion des fragments collinéaires encadrant un opening
-      (`dwg_plan_openings.merge_walls_with_openings`). Résultat : 1 mur
-      continu + 1 opening hosted au lieu de 2 murs distincts.
-    - Si des coupes sont accessibles (via `coupe_paths` ou via le
-      `DxfImportContext.section_lines` du KG), match les openings par
-      `block_id` partagé → récupère `sill_m` + `height_m` depuis chaque
-      coupe.
-    - Classifie chaque opening en `door` (sill ≤ 0.15 et height ≥ 1.9)
-      ou `window` selon `dwg_plan_openings.classify_opening_kind`.
-    - Crée les openings hosted via `openings_create_many` (FamilyType
-      auto-détecté Door/Window ou explicite).
+    1. Lit les `section_lines` (KG `DxfImportContext` ou argument).
+    2. Pour chaque coupe référencée : lit les openings (`block_id`,
+       `x_cut_m`, `sill_m`, `height_m`), les projette en world plan via
+       `project_section_opening_to_world` (convention DXF anchor).
+       Dédup par `(block_id, position arrondie, niveau)` pour éviter
+       les doublons quand une fenêtre apparaît dans 2 coupes.
+    3. Classify les walls de chaque plan (paires parallèles, **sans**
+       fusion via INSERT A-GLAZ plan — la V0 plan-only échouait là).
+    4. Pour chaque coupe_opening world : trouve le plan dont level
+       matche, puis utilise `merge_fragments_around_opening` qui
+       fusionne 2 fragments encadrants (collinéaires + gap ≤ 3m + opening
+       projeté dans le gap). Pas de fusion accidentelle parce que la
+       position de l'opening vient de la coupe (fiable, pas du plan).
+    5. Pre-flight : `project_pos_onto_wall_centerline` clamp la position
+       à la centerline du mur hôte (±5cm des extrémités). Évite l'erreur
+       Revit `ArgumentException: ne coupent rien` si la position est
+       légèrement off-curve.
+    6. Crée types DXF_WALL_*cm (1 Tx), murs (1 Tx), openings (1 Tx).
+       Classify door/window selon `sill_m ≤ 0.15 et height_m ≥ 1.9`.
 
-    Openings sans match coupe → pas créés (sill/height inconnus).
-    Reportés dans `openings_unmatched_count`. L'user résout après.
+    **Limites V1** :
+    - Un opening absent des coupes ne sera pas créé (orphelin compté).
+    - Un mur en plan sans opening n'est pas fusionné (intact).
+    - Pour les openings sans match, prévoir post-traitement manuel.
 
     Concepts: dxf, import, mur, fenêtre, porte, opening, fusion,
               continuité, plan, coupe, phase 2.5, walls openings hosted
@@ -2455,57 +2538,40 @@ def import_walls_and_openings_typed_many(
          "inner_walls": ..., "inner_openings": ...,
          "note": str}
     """
+    # --- V1 — pipeline coupe-first --------------------------------------
+    # 1. Lire section_lines (KG ou explicite via coupe_paths).
+    # 2. Lire les openings de chaque coupe, projeter en world plan.
+    # 3. Classify walls de chaque plan (sans fusion plan-side).
+    # 4. Pour chaque opening world, déterminer son level + plan hôte,
+    #    fusionner les fragments mur si besoin, puis assigner host_wall.
+    # 5. Créer types DXF_WALL_*cm + walls + openings.
+    # 6. Pre-flight project_pos_onto_wall_centerline pour éviter
+    #    l'erreur Revit « ne coupent rien ».
     if not isinstance(items, list) or not items:
         raise ValueError("items must be a non-empty list")
     if layer_mapping is None:
         layer_mapping = {"A-WALL": "wall"}
 
-    # --- Résoudre coupe_paths depuis KG si non fourni -------------------
-    if coupe_paths is None:
+    # --- Build section_lines (paramètre explicite ou KG) --------------
+    if section_lines is None:
+        section_lines = []
         from .dxf_context import _find_live_context
         nid = _find_live_context(kg)
         if nid is not None:
             ctx = kg.get_node(nid)
-            seen: Set[str] = set()
-            coupe_paths = []
-            for sl in ctx.get("section_lines", []):
-                cp = sl.get("coupe_path")
-                if cp and cp not in seen:
-                    seen.add(cp)
-                    coupe_paths.append(cp)
-        else:
-            coupe_paths = []
+            section_lines = list(ctx.get("section_lines", []))
+    if not section_lines:
+        raise ValueError(
+            "Pas de section_lines (ni argument explicite, ni "
+            "DxfImportContext en KG). Lance d'abord Phase 1 "
+            "(dwg_inspect_sections + dxf_context_register_section_line_many) "
+            "ou passe explicitement `section_lines=[{coupe_path, plan_p1, "
+            "plan_p2, view_dir}, ...]`."
+        )
 
-    # --- Pré-lire les openings des coupes pour matching block_id --------
-    section_openings_by_block_id: Dict[str, Dict[str, Any]] = {}
-    for cp in coupe_paths or []:
-        cp_path = Path(cp)
-        if not cp_path.exists():
-            continue
-        ents, _ = dwg_reader.parse(cp_path, scale_override=scale_override)
-        sec_openings = dwg_section_reader.read_section_openings(ents)
-        # Lit aussi les niveaux pour calculer sill/height depuis y_dxf.
-        levels = dwg_section_reader.read_levels(ents)
-        # base_level_y : Y DXF du niveau 0 (ou le plus bas).
-        if levels:
-            base_y = min(lv.y_dxf_m for lv in levels)
-        else:
-            base_y = 0.0
-        for so in sec_openings:
-            if so.block_id is None:
-                continue
-            # sill_m = y_dxf - base_y (élévation depuis le sol du niveau).
-            sill_m = so.y_dxf_m - base_y
-            section_openings_by_block_id[so.block_id] = {
-                "sill_m": round(sill_m, 4),
-                "height_m": so.height_m,
-                "width_m": so.width_m,
-                "block_name": so.block_name,
-                "coupe_path": str(cp_path),
-            }
-
-    # --- Pour chaque plan : classify + extract openings + fusion --------
-    plan_extracts: List[Dict[str, Any]] = []
+    # --- Pré-valider items + classifier les walls de chaque plan -------
+    plan_records: List[Dict[str, Any]] = []
+    level_elev_by_ref: Dict[str, float] = {}
     for i, it in enumerate(items):
         if not isinstance(it, dict):
             raise ValueError("items[{}] must be a dict".format(i))
@@ -2523,6 +2589,9 @@ def import_walls_and_openings_typed_many(
                 "items[{}]: file not found: {}".format(i, path)
             )
         _refuse_if_section(path)
+        # Niveau du plan (élévation, pour matcher avec coupe_openings).
+        lvl_node = kg.get_node(level_ref)
+        level_elev_by_ref[level_ref] = float(lvl_node.get("elevation", 0.0))
 
         entities, _ = dwg_reader.parse(path, scale_override=scale_override)
         classified = dwg_classifier.classify(
@@ -2537,25 +2606,55 @@ def import_walls_and_openings_typed_many(
                     i, path.name, len(classified.walls), max_walls_per_file,
                 )
             )
-        plan_openings_objs = dwg_section_reader.read_section_openings(entities)
-
-        merged_walls, assigned_openings = (
-            dwg_plan_openings.merge_walls_with_openings(
-                classified.walls, plan_openings_objs,
-            )
-        )
-        plan_extracts.append({
+        plan_records.append({
             "item": it,
-            "merged_walls": merged_walls,
-            "assigned_openings": assigned_openings,
+            "walls_initial": list(classified.walls),
+            "walls_current": list(classified.walls),  # muté pendant la fusion
+            "openings_assigned": [],  # liste de (coupe_opening, host_idx_in_current)
         })
 
-    # --- Dédup global thicknesses + get_or_create types ----------------
+    # --- Lire les coupe_openings, projet world, dédup -------------------
+    coupe_openings = _collect_coupe_openings_world(
+        kg, section_lines, scale_override, level_elev_by_ref,
+    )
+
+    # --- Distribuer chaque coupe_opening sur son plan + fusion fragments --
+    openings_orphan_count = 0
+    for co in coupe_openings:
+        # Trouve le(s) plan(s) dont level matche l'élévation de l'opening.
+        # En P7 typique : 1 plan par niveau, donc 0 ou 1 match.
+        host_plan_idx: Optional[int] = None
+        for pidx, pr in enumerate(plan_records):
+            level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
+            if abs(level_elev - co["level_elevation_m"]) <= 0.05:
+                host_plan_idx = pidx
+                break
+        if host_plan_idx is None:
+            openings_orphan_count += 1
+            continue
+        pr = plan_records[host_plan_idx]
+        dx_m = float(pr["item"].get("dx_m", 0.0))
+        dy_m = float(pr["item"].get("dy_m", 0.0))
+        # Position en world du plan = (co.x_world + dx, co.y_world + dy).
+        # Mais : les murs DXF ne sont PAS encore translatés (on translate
+        # seulement à la création Revit). Donc on travaille en coords DXF
+        # ici (les murs sont dans le repère DXF, l'opening aussi).
+        opening_xy = (co["x_world"], co["y_world"])
+        new_walls, host_idx = dwg_plan_openings.merge_fragments_around_opening(
+            pr["walls_current"], opening_xy,
+        )
+        pr["walls_current"] = new_walls
+        if host_idx is None:
+            openings_orphan_count += 1
+            continue
+        pr["openings_assigned"].append({"coupe_opening": co, "host_idx": host_idx})
+
+    # --- Dédup global thicknesses + get_or_create types -----------------
     seen_buckets: Set[int] = set()
     unique_thicknesses_m: List[float] = []
-    for ex in plan_extracts:
-        for mw in ex["merged_walls"]:
-            cm = int(round(mw.thickness * 100 / bucket_cm)) * bucket_cm
+    for pr in plan_records:
+        for w in pr["walls_current"]:
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
             if cm not in seen_buckets:
                 seen_buckets.add(cm)
                 unique_thicknesses_m.append(cm / 100.0)
@@ -2571,34 +2670,34 @@ def import_walls_and_openings_typed_many(
             base_type_ref=base_type_ref,
         )
     else:
-        types_result = {
-            "types": [], "created_count": 0, "reused_count": 0,
-        }
+        types_result = {"types": [], "created_count": 0, "reused_count": 0}
     type_ref_by_cm: Dict[int, str] = {}
     for entry in types_result["types"]:
         cm = int(round(entry["thickness_m"] * 100))
         type_ref_by_cm[cm] = entry["llm_id"]
 
-    # --- Build wall items + walls_create_many --------------------------
+    # --- Build wall items + walls_create_many ---------------------------
     all_wall_items: List[Dict[str, Any]] = []
     walls_per_file: Dict[str, int] = {}
     walls_merged_count = 0
     thickness_dist: Dict[int, int] = {}
-    # Mapping (plan_extract_idx, local_wall_idx) → global wall_item_idx
-    # pour résoudre les host_wall_index plus tard.
+    # Mapping (plan_idx, local_wall_idx_in_walls_current) → global_idx
+    # dans all_wall_items.
     wall_global_index: Dict[Tuple[int, int], int] = {}
-    for plan_idx, ex in enumerate(plan_extracts):
-        plan_item = ex["item"]
+    for plan_idx, pr in enumerate(plan_records):
+        plan_item = pr["item"]
         fp = plan_item["file_path"]
         level_ref = plan_item["level_ref"]
         dx_m = float(plan_item.get("dx_m", 0.0))
         dy_m = float(plan_item.get("dy_m", 0.0))
         height_m = plan_item.get("height_m")
         per_file_count = 0
-        for local_idx, mw in enumerate(ex["merged_walls"]):
-            if len(mw.source_indices) > 1:
+        for local_idx, w in enumerate(pr["walls_current"]):
+            # MergedWall ou WallCandidate : tester la présence de
+            # `source_indices` (MergedWall a au moins 2 indices si fusion).
+            if hasattr(w, "source_indices") and len(w.source_indices) > 1:
                 walls_merged_count += 1
-            cm = int(round(mw.thickness * 100 / bucket_cm)) * bucket_cm
+            cm = int(round(w.thickness * 100 / bucket_cm)) * bucket_cm
             wall_type_ref = type_ref_by_cm.get(cm)
             if wall_type_ref is None:
                 raise RuntimeError(
@@ -2607,8 +2706,8 @@ def import_walls_and_openings_typed_many(
             wall_item: Dict[str, Any] = {
                 "level_ref": level_ref,
                 "wall_type_ref": wall_type_ref,
-                "p1": [mw.p1[0] + dx_m, mw.p1[1] + dy_m],
-                "p2": [mw.p2[0] + dx_m, mw.p2[1] + dy_m],
+                "p1": [w.p1[0] + dx_m, w.p1[1] + dy_m],
+                "p2": [w.p2[0] + dx_m, w.p2[1] + dy_m],
             }
             if height_m is not None:
                 wall_item["height"] = float(height_m)
@@ -2625,14 +2724,11 @@ def import_walls_and_openings_typed_many(
         inner_walls = None
 
     # Récupérer les wall_llm_ids dans l'ordre de création.
-    # walls_create_many retourne `llm_ids: [...]` (full) ou
-    # `first_llm_id/last_llm_id/contiguous` (compact).
     wall_llm_ids: List[str] = []
     if inner_walls is not None:
         if "llm_ids" in inner_walls:
             wall_llm_ids = list(inner_walls["llm_ids"])
         elif inner_walls.get("contiguous") and "first_llm_id" in inner_walls:
-            # Reconstitue depuis first/last.
             first = inner_walls["first_llm_id"]
             last = inner_walls["last_llm_id"]
             prefix = first.rsplit("_", 1)[0]
@@ -2642,8 +2738,7 @@ def import_walls_and_openings_typed_many(
                 "{}_{:03d}".format(prefix, n) for n in range(start, end + 1)
             ]
 
-    # --- Préparer les openings items ------------------------------------
-    # Auto-détection des FamilyType door/window si non fourni.
+    # --- Préparer les opening items + pre-flight projection --------------
     if door_family_type_ref is None:
         door_family_type_ref = _find_default_family_type(kg, "Doors")
     if window_family_type_ref is None:
@@ -2651,25 +2746,16 @@ def import_walls_and_openings_typed_many(
 
     door_items: List[Dict[str, Any]] = []
     window_items: List[Dict[str, Any]] = []
-    head_height_targets: List[Tuple[int, float, str]] = []
-    # (index_in_combined, head_m, kind) — pour set head_height_many après création.
     openings_unmatched_count = 0
-    openings_orphan_count = 0
-    for plan_idx, ex in enumerate(plan_extracts):
-        plan_item = ex["item"]
+    for plan_idx, pr in enumerate(plan_records):
+        plan_item = pr["item"]
         dx_m = float(plan_item.get("dx_m", 0.0))
         dy_m = float(plan_item.get("dy_m", 0.0))
-        for ao in ex["assigned_openings"]:
-            if ao.host_wall_index is None:
-                openings_orphan_count += 1
-                continue
-            # Lookup section opening by block_id pour sill/height.
-            sec_info = section_openings_by_block_id.get(ao.block_id or "")
-            if sec_info is None:
-                openings_unmatched_count += 1
-                continue
-            sill_m = sec_info["sill_m"]
-            height_m = sec_info["height_m"]
+        for assigned in pr["openings_assigned"]:
+            co = assigned["coupe_opening"]
+            host_idx_local = assigned["host_idx"]
+            sill_m = co["sill_m"]
+            height_m = co["height_m"]
             if sill_m is None or height_m is None:
                 openings_unmatched_count += 1
                 continue
@@ -2677,13 +2763,22 @@ def import_walls_and_openings_typed_many(
             if kind == "unknown":
                 openings_unmatched_count += 1
                 continue
-            # Host wall llm_id.
-            global_idx = wall_global_index.get((plan_idx, ao.host_wall_index))
+            global_idx = wall_global_index.get((plan_idx, host_idx_local))
             if global_idx is None or global_idx >= len(wall_llm_ids):
                 openings_orphan_count += 1
                 continue
             host_wall_ref = wall_llm_ids[global_idx]
-            position = [ao.x_dxf_m + dx_m, ao.y_dxf_m + dy_m]
+            host_wall_item = all_wall_items[global_idx]
+            # Pre-flight : projeter la position sur la centerline du mur
+            # (clamp ±5cm des extrémités). Évite l'erreur Revit
+            # « ouverture ne coupe rien » si la position est légèrement
+            # off-curve.
+            wall_p1 = (host_wall_item["p1"][0], host_wall_item["p1"][1])
+            wall_p2 = (host_wall_item["p2"][0], host_wall_item["p2"][1])
+            opening_pos = (co["x_world"] + dx_m, co["y_world"] + dy_m)
+            projected = dwg_plan_openings.project_pos_onto_wall_centerline(
+                opening_pos, wall_p1, wall_p2,
+            )
             family_ref = (
                 door_family_type_ref if kind == "door"
                 else window_family_type_ref
@@ -2695,37 +2790,20 @@ def import_walls_and_openings_typed_many(
                 "kind": kind,
                 "host_wall_ref": host_wall_ref,
                 "family_type_ref": family_ref,
-                "position": position,
+                "position": [projected[0], projected[1]],
                 "sill_height": sill_m,
-                "head_m": sill_m + height_m,
             }
             if kind == "door":
                 door_items.append(opening_item)
             else:
                 window_items.append(opening_item)
 
-    # --- openings_create_many (1 Tx pour doors + 1 pour windows) -------
+    # --- openings_create_many (1 Tx mixte door+window) ------------------
     openings_entry = registry.get("openings_create_many")
-
-    def _strip_for_create(it: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "kind": it["kind"],
-            "host_wall_ref": it["host_wall_ref"],
-            "family_type_ref": it["family_type_ref"],
-            "position": it["position"],
-            "sill_height": it["sill_height"],
-        }
-
-    inner_doors = None
-    inner_windows = None
     all_opening_create = door_items + window_items
     if all_opening_create and openings_entry is not None:
-        # openings_create_many accepte un seul list mixte door+window
-        # via `kind` ?  Voyons sa signature — pour V0, on suppose oui
-        # (cf. _helpers.bulk_summary pattern).
         inner_openings = openings_entry.fn(
-            kg=kg, doc=doc,
-            items=[_strip_for_create(it) for it in all_opening_create],
+            kg=kg, doc=doc, items=all_opening_create,
         )
     else:
         inner_openings = None
@@ -2748,6 +2826,7 @@ def import_walls_and_openings_typed_many(
         "types_created": types_result["created_count"],
         "types_reused": types_result["reused_count"],
         "types": types_result["types"],
+        "coupe_openings_detected": len(coupe_openings),
         "openings_doors_created": len(door_items),
         "openings_windows_created": len(window_items),
         "openings_unmatched_count": openings_unmatched_count,

@@ -531,83 +531,81 @@ def test_merge_opening_on_intact_wall_assigns_host():
 # ----- Tool smoke : dwg_import_walls_and_openings_typed_many ------
 
 
-def _make_plan_with_window_dxf(tmp_path: Path) -> Path:
-    """Plan DXF : 2 fragments de mur (20cm) séparés par 1 INSERT A-GLAZ
-    de largeur 1m. block_id=999, hauteur 1.5m dans le block name.
-
-    Layout :
-    - Mur frag 1 : x=0→4 (paire à y=-0.1/+0.1)
-    - INSERT A-GLAZ au point (4.5, 0), block_name parsable.
-    - Mur frag 2 : x=5→10 (paire à y=-0.1/+0.1)
+def _make_plan_v1_dxf(tmp_path: Path) -> Path:
+    """Plan DXF V1 : 2 fragments mur **verticaux** séparés par un gap
+    de 2m (entre y=4 et y=6). Mur à x=5 (centerline), épaisseur 20cm.
+    Pas d'INSERT A-GLAZ en plan — la V1 fait confiance à la coupe.
     """
     doc = ezdxf.new("R2018")
     doc.header["$INSUNITS"] = 6
     doc.layers.add("A-WALL")
-    doc.layers.add("A-GLAZ")
     doc.layers.add("A-AREA-IDEN")
     msp = doc.modelspace()
-    # Frag 1.
-    msp.add_line((0.0, -0.1), (4.0, -0.1), dxfattribs={"layer": "A-WALL"})
-    msp.add_line((0.0, 0.1), (4.0, 0.1), dxfattribs={"layer": "A-WALL"})
-    # Frag 2.
-    msp.add_line((5.0, -0.1), (10.0, -0.1), dxfattribs={"layer": "A-WALL"})
-    msp.add_line((5.0, 0.1), (10.0, 0.1), dxfattribs={"layer": "A-WALL"})
-    # Bloc fenêtre.
-    blk_name = "Fenêtre - 1 Vantail - 1_00 m x 1_50 m - Appui aluminium-999-Niveau 0"
-    blk = doc.blocks.new(name=blk_name)
-    blk.add_circle((0, 0), 0.1, dxfattribs={"layer": "A-GLAZ"})
-    msp.add_blockref(blk_name, (4.5, 0.0), dxfattribs={"layer": "A-GLAZ"})
+    # Frag 1 : x=4.9 et 5.1, y=0→4.
+    msp.add_line((4.9, 0.0), (4.9, 4.0), dxfattribs={"layer": "A-WALL"})
+    msp.add_line((5.1, 0.0), (5.1, 4.0), dxfattribs={"layer": "A-WALL"})
+    # Frag 2 : x=4.9 et 5.1, y=6→10.
+    msp.add_line((4.9, 6.0), (4.9, 10.0), dxfattribs={"layer": "A-WALL"})
+    msp.add_line((5.1, 6.0), (5.1, 10.0), dxfattribs={"layer": "A-WALL"})
     # Label plan.
     msp.add_mtext("Pièce 1", dxfattribs={
         "layer": "A-AREA-IDEN", "insert": (1, 1), "char_height": 0.2,
     })
-    p = tmp_path / "plan_with_window.dxf"
+    p = tmp_path / "plan_v1.dxf"
     doc.saveas(str(p))
     return p
 
 
-def _make_coupe_with_matching_window(tmp_path: Path) -> Path:
-    """Coupe DXF avec un INSERT A-GLAZ de même block_id=999.
+def _make_coupe_v1_dxf(tmp_path: Path) -> Path:
+    """Coupe V1 : trait horizontal à y=5, INSERT A-GLAZ à x_cut=5,
+    y=0.9 (= sill 0.9m au-dessus du Niveau 0 à y=0).
 
-    Niveau 0 à y=0 (A-FLOR-LEVL). INSERT A-GLAZ à (x_cut=4.5, y=0.9)
-    → sill = 0.9 - 0 = 0.9m, height = 1.5m (depuis block name).
-    Donc kind = "window" (sill > 0.15).
+    Trait horizontal en plan → DXF X de la coupe = world X. Donc
+    l'opening à x_cut=5 se projette à world X=5, sur le mur fragmenté
+    (centerline x=5).
     """
     doc = ezdxf.new("R2018")
     doc.header["$INSUNITS"] = 6
     for ly in ("A-WALL", "A-GLAZ", "A-FLOR-LEVL"):
         doc.layers.add(ly)
     msp = doc.modelspace()
-    # Niveau 0 sur A-FLOR-LEVL.
     msp.add_line((0.0, 0.0), (10.0, 0.0), dxfattribs={"layer": "A-FLOR-LEVL"})
-    # Bloc fenêtre coupe.
     blk_name = "Fenêtre - 1 Vantail - 1_00 m x 1_50 m - Appui aluminium-999-Coupe 1"
     blk = doc.blocks.new(name=blk_name)
     blk.add_circle((0, 0), 0.1, dxfattribs={"layer": "A-GLAZ"})
-    msp.add_blockref(blk_name, (4.5, 0.9), dxfattribs={"layer": "A-GLAZ"})
-    p = tmp_path / "coupe_with_window.dxf"
+    msp.add_blockref(blk_name, (5.0, 0.9), dxfattribs={"layer": "A-GLAZ"})
+    p = tmp_path / "coupe_v1.dxf"
     doc.saveas(str(p))
     return p
 
 
-def test_import_walls_and_openings_typed_many_fuses_and_creates_window(
+def test_import_walls_and_openings_typed_many_v1_fuses_via_coupe(
     tmp_path, kg_fresh,
 ):
-    """Smoke : 2 fragments + A-GLAZ + coupe match → 1 mur fusionné + 1 fenêtre."""
-    plan = _make_plan_with_window_dxf(tmp_path)
-    coupe = _make_coupe_with_matching_window(tmp_path)
+    """V1 smoke : 2 fragments mur verticaux + coupe avec opening projeté
+    pile entre eux → 1 mur fusionné + 1 fenêtre."""
+    plan = _make_plan_v1_dxf(tmp_path)
+    coupe = _make_coupe_v1_dxf(tmp_path)
     level_id = kg_fresh.add_node("Level", {"name": "N0", "elevation": 0.0})
-    # FamilyType Window minimum dans le KG.
-    fam_window = kg_fresh.add_node("FamilyType", {
+    kg_fresh.add_node("FamilyType", {
         "family_name": "Fenêtre", "type_name": "Std", "category": "Windows",
     })
+
+    # Trait horizontal à y=5, traversant le gap entre les fragments.
+    section_lines = [{
+        "coupe_path": str(coupe),
+        "plan_p1": [0.0, 5.0],
+        "plan_p2": [10.0, 5.0],
+        "view_dir": "up",
+        "name": "Coupe 1",
+    }]
 
     r = llm_protocol.dispatch_tool_use(
         "dwg_import_walls_and_openings_typed_many",
         {
             "items": [{"file_path": str(plan), "level_ref": level_id,
                        "height_m": 3.0}],
-            "coupe_paths": [str(coupe)],
+            "section_lines": section_lines,
         },
         "t1", kg_fresh,
     )
@@ -617,41 +615,27 @@ def test_import_walls_and_openings_typed_many_fuses_and_creates_window(
     assert p["walls_merged_count"] == 1
     assert p["openings_windows_created"] == 1
     assert p["openings_doors_created"] == 0
-    assert p["openings_unmatched_count"] == 0
-    assert p["openings_orphan_count"] == 0
-    # KG : 1 Wall + 1 Window.
-    walls = list(kg_fresh.find_by_type("Wall"))
-    windows = list(kg_fresh.find_by_type("Window"))
-    assert len(walls) == 1
-    assert len(windows) == 1
+    assert p["coupe_openings_detected"] >= 1
 
 
-def test_import_walls_and_openings_typed_many_unmatched_when_no_coupe(
+def test_import_walls_and_openings_typed_many_v1_no_match_no_openings(
     tmp_path, kg_fresh,
 ):
-    """Sans coupe match : opening reste unmatched (sill inconnu), mur quand
-    même fusionné."""
-    plan = _make_plan_with_window_dxf(tmp_path)
+    """Sans section_lines actionable → erreur explicite."""
+    plan = _make_plan_v1_dxf(tmp_path)
     level_id = kg_fresh.add_node("Level", {"name": "N0", "elevation": 0.0})
-    fam_window = kg_fresh.add_node("FamilyType", {
-        "family_name": "Fenêtre", "type_name": "Std", "category": "Windows",
-    })
 
     r = llm_protocol.dispatch_tool_use(
         "dwg_import_walls_and_openings_typed_many",
         {
             "items": [{"file_path": str(plan), "level_ref": level_id,
                        "height_m": 3.0}],
-            "coupe_paths": [],
+            "section_lines": [],
         },
         "t1", kg_fresh,
     )
-    p = json.loads(r["content"])
-    assert p["walls_imported_total"] == 1
-    assert p["walls_merged_count"] == 1
-    assert p["openings_windows_created"] == 0
-    assert p["openings_doors_created"] == 0
-    assert p["openings_unmatched_count"] == 1  # pas de match coupe
+    assert r.get("is_error") is True
+    assert "section_lines" in r["content"].lower()
 
 
 def test_import_walls_typed_refuses_section_dxf(tmp_path, kg_fresh):

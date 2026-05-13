@@ -14,6 +14,105 @@
 
 ---
 
+## 2026-05-13 (session s) — V1 vote multi-sources : openings depuis coupe = source primaire
+
+### Contexte & objectif
+
+Runtime P7 session r : 2 problèmes constatés.
+
+1. **Bug stale binding** : `walls_get_or_create_dxf_type_many` réutilisait
+   un node KG dont le revit_id pointait sur un WallType supprimé →
+   `Wall.Create` lève `ArgumentException: No WallType`. Fix commit
+   `96d5fd9`.
+
+2. **V0 plan-only inefficace** : `walls_merged=0` sur P7. L'algo se basait
+   sur la présence d'INSERTs A-GLAZ en plan avec `width_m` parsable du
+   block name. Sur Projet8 (P7), la convention de block name diffère ou
+   les tolérances trop strictes empêchent toute fusion. Résultat : 26
+   murs fragmentés + 8 fenêtres (sur murs intacts) + 7 orphelines +
+   erreurs Revit « ne coupent rien » + warnings « doublons ».
+   User : « je ne vois pas d'amélioration au niveau du modèle ».
+
+User : « attaquer V1 vote multi-sources direct ».
+
+### Décision : openings de la coupe = source primaire
+
+Au lieu de partir des fragments en plan, on part des **INSERTs A-GLAZ
+des coupes** :
+
+- Chaque opening en coupe a `block_id`, `x_cut_m`, `sill_m`, `height_m`
+  — données précises et fiables (export Revit AIA).
+- La convention DXF section anchor (déjà résolue session m, mémoire
+  `project-dxf-section-anchor-investigation`) projette `x_cut` en world
+  plan via la `section_line` associée.
+- Le plan ne sert plus qu'à détecter les fragments murs à fusionner
+  *autour* de chaque opening projeté.
+
+C'est l'incarnation V0 du framework de vote multi-sources discuté
+session r : la coupe « vote » plus fortement que le plan pour la
+position d'un opening parce qu'elle est plus discriminante.
+
+### Phases livrées
+
+**Extensions `lib/dwg_plan_openings.py`** (~200 lignes) :
+
+- `CoupeOpening` (dataclass) : opening lu depuis coupe + projeté en world.
+- `project_section_opening_to_world(x_cut, sl_p1, sl_p2)` : projection
+  selon trait vertical (x_cut = world Y) ou horizontal (x_cut = world X).
+- `find_host_wall_for_world_opening(opening_xy, walls, perp_tol)` :
+  cherche le mur dont la centerline passe au plus près.
+- `project_pos_onto_wall_centerline(pos, wall_p1, wall_p2, margin)` :
+  clamp orthogonalement sur la centerline ± 5cm des extrémités. Évite
+  l'erreur Revit `ArgumentException: ne coupent rien`.
+- `merge_fragments_around_opening(walls, opening_xy, ...)` : pilotée
+  par la position WORLD de l'opening (pas par INSERT A-GLAZ plan).
+  Fusion sûre car la position vient de la source fiable.
+
+**Refonte `dwg_import_walls_and_openings_typed_many`** (~250 lignes) :
+
+- Helper `_collect_coupe_openings_world(kg, section_lines, ...)` : lit
+  les openings de chaque coupe, projette en world, **déduplique** par
+  `(block_id, position arrondie, niveau)` pour éviter les doublons quand
+  une fenêtre apparaît dans 2 coupes (cause du warning Revit
+  « occurrences identiques »).
+- Pipeline V1 : lit section_lines (KG ou explicite via nouveau
+  paramètre `section_lines`), collecte coupe_openings world, classify
+  walls par plan, pour chaque opening trouve son plan via level
+  elevation, fusion fragments, projet position sur centerline, crée
+  walls + openings.
+- Nouveau champ retour : `coupe_openings_detected` (nb d'openings
+  distincts lus depuis les coupes après dédup).
+
+### Tests
+
+`tests/test_dwg_phase2.py` : refactor du smoke test V0 (qui passait
+`coupe_paths` sans section_lines) → V1 layout cohérent (mur vertical
+fragmenté, trait horizontal, opening coupe projeté pile dans le gap).
+**574 tests verts** (pas de régression).
+
+### Reste à valider runtime sur P7
+
+L'user supprime à nouveau les 26 murs DXF + types côté Revit, puis
+re-prompt « importe ce projet ». Attentes :
+- `walls_merged_count > 0` (fusion via coupe).
+- Aucune erreur Revit « ne coupent rien » (clamp centerline).
+- Pas de doublons (dédup par block_id+position).
+- Murs continus visibles en 3D + fenêtres hostées correctement.
+
+### Reste à faire
+
+- Audit `check_planset_integrity` toujours en mode severity-max. Les
+  warnings « murs coupe sans contrepartie plan » et « openings
+  unmatched » sont des faux positifs (murs intérieurs derrière le trait
+  de coupe — normal). À reclasser comme info, pas warning. Pas urgent
+  car le gate est `needs_user`, pas `abort`.
+- Vote multi-sources complet (fusion plan + coupe + élévation) reste
+  V2+. La V1 actuelle utilise coupe comme source primaire avec plan
+  comme support de détection des fragments. Élévation pas encore
+  intégrée (cf. mémoire `project-planset-coherence-byproduct`).
+
+---
+
 ## 2026-05-13 (session r) — Phase 2.5 : fusion fragments + openings hostées
 
 ### Contexte & objectif
