@@ -14,6 +14,138 @@
 
 ---
 
+## 2026-05-13 (session l) — UC1 Phase 4 coupes : inventaire + dwg_section_reader + tool dwg_inspect_sections
+
+### Contexte & objectif
+
+Après validation runtime session k (le fix pair detection corrige
+visuellement la cloison fragmentée — 2 murs parallèles résiduels en
+runtime mais acceptables en manuel), démarrage du chapitre **coupes**
+(note d'intention 2026-05-12). User a réordonné les priorités en cours
+de session : **« en premier lieu il faut repérer les traits de coupe
+en plan, de manière à interpoler les dessins correctement »** → la
+géo-ref doit précéder l'extraction des hauteurs.
+
+### Inventaire DXF Projet4
+
+3 fichiers : `Projet4 - Plan d'étage - Niveau 0.dxf`,
+`Projet4 - Coupe - Coupe 1.dxf`, `Projet4 - Coupe - Coupe 2.dxf`.
+Chaque vue dans son propre fichier (→ phase 0 « segmentation » de la
+note d'intention devient triviale).
+
+Conventions AIA respectées :
+- `A-FLOR-LEVL` (coupes) : 3 LIGNES horizontales à Y=0/3000/6000 (mm)
+  + 6 MTEXT par paires (`Niveau 0` / `0`, `Niveau 1` / `3.00`,
+  `Niveau 2` / `6.00`) + 3 INSERT `Niveau - Marqueur de niveau`.
+- `A-GLAZ` : INSERT de blocs fenêtre. Block names dont l'**ID Revit
+  numérique est partagé entre plan et coupes** :
+  - Plan : `... -255828-Niveau 0`
+  - Coupe 1 : `... -255828-Coupe 1`
+  - Le `255828` matche → pivot de matching coupe ↔ plan sans
+    géométrie supplémentaire.
+- `A-AREA-IDEN` (plan uniquement) : MTEXT labels pièces.
+- Dimensions encodées dans le nom de bloc : `2_00 m x 1_40 m`
+  (underscore décimal = échappement du `.` Windows).
+
+**Aucun trait de coupe marqué dans le plan** : pas de layer `A-SECT`,
+pas de bloc INSERT « symbole de coupe », pas de MTEXT « A-A » / « B-B ».
+→ Géo-ref par pointage user obligatoire (auto-détection par feature
+matching reste possible en V1 si DXF moins bien fait).
+
+### Décisions
+
+1. **Phase A (was 3) géo-ref FIRST**, par pointage utilisateur. La
+   détection auto par matching INSERT n'est pas le mécanisme principal
+   mais pourra servir de pré-remplissage en V1.
+
+2. **Premier livrable read-only** : tool `dwg_inspect_sections` qui
+   parse N fichiers et sort un rapport JSON. Pas d'écriture Revit. Le
+   LLM ou l'user décide ensuite des actions à prendre.
+
+3. **Pas de nouveau module ezdxf** : `dwg_section_reader` consomme les
+   `DwgEntity` retournés par `dwg_reader.parse()` (qui supporte déjà
+   INSERT, MTEXT). Cohérent avec le pattern dwg_classifier.
+
+4. **Fixtures de test** : synthétiques (DXF générés en mémoire via
+   ezdxf) + integration optionnelle sur les 3 fichiers Projet4 (skip
+   propre si absents).
+
+### Phases livrées
+
+**Phase 1** — `lib/dwg_section_reader.py` (nouveau).
+- `classify_dxf(layers_meta) -> ("plan"|"section"|"unknown", evidence)`.
+- `parse_block_id(name)` : regex `-(\d{4,})-(?:Niveau|Coupe|...)` →
+  ID numérique.
+- `parse_block_dimensions(name)` : regex `(\d+)_(\d+) m x (\d+)_(\d+) m`.
+- `read_levels(entities) -> List[Level]` : associe LIGNES horizontales
+  + MTEXT proches (vertical tol 2m, horizontal tol 1m), distingue nom
+  vs valeur par contenu. Fallback chain :
+  - mtext_label+value (cas normal)
+  - mtext_value_only
+  - mtext_label_only_inferred_elevation (élév déduite de Y_ligne)
+  - line_only_inferred (élév = Y_ligne, nom = `Niveau N`)
+- `read_section_openings(entities) -> List[SectionOpening]` : INSERTs
+  sur `A-GLAZ` + parsing block_id + dimensions.
+- `match_openings(plan, section) -> (matches, unmatched_sec, unmatched_plan)`
+  par block_id partagé.
+
+**Phase 2** — Tool `dwg_inspect_sections` dans `lib/tools/dwg_import.py`.
+- Tier 2. Read-only. Accepte une liste de file_paths.
+- Pour chaque fichier : classify + extract (selon kind).
+- Calcule section_to_plan_matches : pour chaque coupe, donne match_count,
+  unmatched_*, distinct_block_ids.
+- Docstring convention (Concepts/Phrases/Similar) renseignée pour
+  routing tier-2 + future intégration au KG logiciel.
+
+**Phase 3** — Tests `tests/test_dwg_sections.py` (nouveau).
+- 15 tests synthétiques (parse_block_id, parse_block_dimensions,
+  classify_dxf, read_levels avec et sans labels, read_section_openings,
+  match_openings).
+- 6 tests d'intégration sur Projet4 (skip propre via
+  `pytest.mark.skipif`). Asserts précis : 22 openings coupe 1, 20
+  openings plan, 3 niveaux à 0/3/6m, matching complet.
+
+### Validation
+
+- `pytest -q` : **374 verts** (353 → +21). Aucune régression.
+- Test live direct via registry : tool registered correctly, output sur
+  Projet4 :
+  - Coupe 1 : 22 openings (2× Sud 255828, 2× Nord 255829, 18× Est
+    255830 sur 2 niveaux), 3 niveaux à 0/3/6m, **22/22 matched** au
+    plan, unmatched_plan=9 (les 9 Ouest absents de Coupe 1).
+  - Coupe 2 : 6 openings (2× Nord, 2× Est, 2× Ouest), **6/6 matched**,
+    unmatched_plan=1 (le Sud absent de Coupe 2).
+  - Plan : 20 openings (1+1+9+9 par façade), tous avec block_id reconnu.
+
+### Dettes notées en cours de session (user)
+
+1. **Orientation fenêtre dans le mur** : lors de la création de
+   fenêtres (`windows_create_many` ou copie), la rotation/face de la
+   fenêtre dans le mur n'est pas prise en compte. À traiter : capter
+   l'orientation depuis le bloc DXF (rotation = façade) ou depuis le
+   mur hôte (face inside/outside).
+
+2. **Type sol/dalle absent** : pas de Floor dans le KG, pas de tools
+   `floors_*`. Nouveau chantier proposé : `lib/tools/floors.py` avec
+   `floors_create`, `floors_create_many`, `floors_delete`,
+   `query.floors_list_by_level`. KG node `Floor` avec
+   `{level_ref, floor_type_ref, boundary_polygon, thickness_m}`.
+
+### Reste à faire pour le chantier coupes (suite)
+
+- **Phase B** : pointage utilisateur du trait de coupe — soit via
+  dialog Revit (2 points sur le plan + direction de vue), soit en
+  conversationnel via le LLM (« la coupe 1 est prise selon une
+  horizontale à Y=0, regardant l'Est »). Stocker dans le KG (nouveau
+  node `SectionAxis`?). Cf. dette `dwg_section_reader` interpolation.
+- **Phase C** : extraire sill/head des INSERTs en coupe — déjà
+  largement résolu par `parse_block_dimensions` (height_m = 1.40 par
+  ex) mais à enrichir par l'Y d'insertion (= sill depuis le niveau).
+- **Phase D** : orchestrateur `dwg_import_full` qui combine plan walls
+  + niveaux + ouvertures avec hauteurs correctes.
+
+---
+
 ## 2026-05-13 (session k) — Dette pair detection réglée : endpoint adjacency + length ratio
 
 ### Contexte & objectif

@@ -25,7 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .. import dwg_classifier, dwg_reader
+from .. import dwg_classifier, dwg_reader, dwg_section_reader
 from ..llm_protocol import tool
 from ..project_kg import ProjectKG
 
@@ -358,4 +358,191 @@ def import_walls(
         "rejected_count": len(result.rejected),
         "thickness_distribution": thickness_dist,
         "inner": inner,
+    }
+
+
+# ----- 4. Inspect sections (preview plan + coupes) ----------------------
+
+
+def _level_to_dict(lv: dwg_section_reader.Level) -> Dict[str, Any]:
+    return {
+        "name": lv.name,
+        "elevation_m": round(lv.elevation_m, 4),
+        "y_dxf_m": round(lv.y_dxf_m, 4),
+        "line_x_range_m": [round(lv.line_x_range_m[0], 4), round(lv.line_x_range_m[1], 4)],
+        "source": lv.source,
+    }
+
+
+def _opening_to_dict(o: dwg_section_reader.SectionOpening) -> Dict[str, Any]:
+    return {
+        "block_id": o.block_id,
+        "x_dxf_m": round(o.x_dxf_m, 4),
+        "y_dxf_m": round(o.y_dxf_m, 4),
+        "rotation_deg": round(o.rotation_deg, 2),
+        "width_m": o.width_m,
+        "height_m": o.height_m,
+    }
+
+
+@tool(name="dwg_inspect_sections", tier=2)
+def inspect_sections(
+    kg: ProjectKG,
+    file_paths: List[str],
+    scale_override: Optional[float] = None,
+    opening_preview_limit: int = 30,
+) -> Dict[str, Any]:
+    """Inspecte un plan + N coupes DXF. Read-only, sort un rapport JSON.
+
+    Pipeline du chapitre coupes (UC1 Phase 4, voir JOURNAL 2026-05-12 note
+    d'intention + entrée 2026-05-13 inventaire Projet4) :
+
+    1. Parse chaque fichier.
+    2. `classify_dxf` → `plan` | `section` | `unknown`.
+    3. Pour les sections : extrait niveaux (layer `A-FLOR-LEVL`) +
+       ouvertures (INSERTs sur `A-GLAZ`).
+    4. Pour le plan : extrait les ouvertures (INSERTs sur `A-GLAZ`).
+    5. Pour chaque section, calcule le matching ouvertures coupe↔plan
+       via `block_id` partagé (l'ID Revit inscrit dans le nom de bloc,
+       partagé entre `... -255828-Niveau 0` et `... -255828-Coupe 1`).
+
+    Le caller (LLM ou user) utilise ensuite ce rapport pour décider :
+    - lesquelles des coupes utiliser pour quel pan du plan (géo-ref via
+      pointage user, à venir) ;
+    - quels niveaux créer (via `levels_create_many`) ;
+    - quelles hauteurs sill/head appliquer aux ouvertures du plan.
+
+    Aucun écrit Revit ou KG ici. Le tool est sûr à appeler plusieurs fois.
+
+    Concepts: dwg, dxf, coupe, section, niveau, level, elevation,
+              fenêtre, opening, glazing, plan, géo-ref, inspect, audit
+    Phrases: "inspecte les coupes", "qu'y a-t-il dans ces coupes",
+             "extrait les niveaux", "match les fenêtres entre plan et coupe",
+             "préview des coupes du projet", "analyse plan + coupes DXF"
+    Similar: dwg_inspect, dwg_classify, levels_create_many
+
+    Args:
+        file_paths: liste de chemins de fichiers .dxf (plan + coupes).
+            Au moins 1 plan + 1 coupe recommandés pour le matching.
+        scale_override: voir `dwg_inspect`. Appliqué à tous les fichiers.
+        opening_preview_limit: nombre max d'ouvertures listées par
+            fichier dans le preview (défaut 30). Au-delà, agrégation
+            par block_id.
+
+    Returns:
+        {"ok": bool, "files": [{...}, ...],
+         "section_to_plan_matches": [{section_path, match_count,
+                                       unmatched_section_count,
+                                       distinct_block_ids: [...]}, ...]}
+    """
+    if not file_paths:
+        raise ValueError("file_paths must contain at least one DXF path.")
+
+    parsed: List[Dict[str, Any]] = []
+    plan_index: Optional[int] = None
+
+    for fp in file_paths:
+        path = Path(fp)
+        if not path.exists():
+            raise FileNotFoundError("File not found: {}".format(path))
+
+        entities, meta = dwg_reader.parse(path, scale_override=scale_override)
+        kind, evidence = dwg_section_reader.classify_dxf(meta["layers"])
+
+        file_record: Dict[str, Any] = {
+            "path": str(path),
+            "name": path.name,
+            "kind": kind,
+            "kind_evidence": evidence,
+            "units_factor_to_m": meta["units_factor_to_m"],
+            "total_entities": meta["total_entities"],
+        }
+
+        if kind == "section":
+            levels = dwg_section_reader.read_levels(entities)
+            openings = dwg_section_reader.read_section_openings(entities)
+            file_record["levels"] = [_level_to_dict(lv) for lv in levels]
+            file_record["openings_count"] = len(openings)
+            file_record["openings_with_id_count"] = sum(
+                1 for o in openings if o.block_id is not None
+            )
+            file_record["openings"] = [
+                _opening_to_dict(o) for o in openings[:opening_preview_limit]
+            ]
+            if len(openings) > opening_preview_limit:
+                file_record["openings_truncated"] = True
+            # Aggregate by block_id for compact view.
+            by_id: Dict[str, int] = {}
+            for o in openings:
+                key = o.block_id or "<unknown>"
+                by_id[key] = by_id.get(key, 0) + 1
+            file_record["openings_by_block_id"] = by_id
+        elif kind == "plan":
+            openings = dwg_section_reader.read_section_openings(entities)
+            file_record["openings_count"] = len(openings)
+            file_record["openings_with_id_count"] = sum(
+                1 for o in openings if o.block_id is not None
+            )
+            file_record["openings"] = [
+                _opening_to_dict(o) for o in openings[:opening_preview_limit]
+            ]
+            if len(openings) > opening_preview_limit:
+                file_record["openings_truncated"] = True
+            by_id: Dict[str, int] = {}
+            for o in openings:
+                key = o.block_id or "<unknown>"
+                by_id[key] = by_id.get(key, 0) + 1
+            file_record["openings_by_block_id"] = by_id
+            if plan_index is None:
+                plan_index = len(parsed)
+            # Stocke les openings pour le matching post-loop.
+            file_record["_openings_internal"] = openings
+        else:
+            file_record["note"] = (
+                "Unknown DXF type — neither A-FLOR-LEVL nor A-AREA-IDEN "
+                "signature found. Layers: {}".format(
+                    evidence.get("available_layers", []),
+                )
+            )
+
+        if kind == "section":
+            file_record["_openings_internal"] = openings
+
+        parsed.append(file_record)
+
+    # Matching section ↔ plan.
+    section_to_plan_matches: List[Dict[str, Any]] = []
+    if plan_index is not None:
+        plan_openings = parsed[plan_index].pop("_openings_internal")
+        for i, rec in enumerate(parsed):
+            if rec.get("kind") != "section":
+                continue
+            sec_openings = rec.pop("_openings_internal")
+            matches, unmatched_sec, unmatched_plan = (
+                dwg_section_reader.match_openings(plan_openings, sec_openings)
+            )
+            distinct_ids = sorted({m.block_id for m in matches})
+            section_to_plan_matches.append({
+                "section_path": rec["path"],
+                "section_name": rec["name"],
+                "match_count": len(matches),
+                "unmatched_section_count": len(unmatched_sec),
+                "unmatched_plan_count": len(unmatched_plan),
+                "distinct_block_ids": distinct_ids,
+            })
+    else:
+        # No plan found — drop any internal data we may have stored.
+        for rec in parsed:
+            rec.pop("_openings_internal", None)
+
+    return {
+        "ok": True,
+        "files": parsed,
+        "section_to_plan_matches": section_to_plan_matches,
+        "note": (
+            "Read-only inspection. To actually create Revit elements, use "
+            "levels_create_many for niveaux, then dwg_import_walls for the "
+            "plan walls. Geo-référencement plan↔coupe (mapping x_coupe → "
+            "axe_plan) reste à demander à l'utilisateur."
+        ),
     }
