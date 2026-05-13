@@ -903,35 +903,28 @@ def filter_walls_via_elevation_vote(
             )
             votes.append(v)
 
-        # Critère V3.11 (user 2026-05-13 : « 1 seul trait ≠ mur, donc
-        # 0 traits = certainement pas un mur ») : filter si au moins
-        # UNE élévation a `zero_lines == True` (= zone projetée
-        # complètement vide). Plus strict que `no_count >= 1` mais
-        # ne génère pas les régressions des critères « 1 seul trait »
-        # (V3.7-V3.10) car les vrais murs intérieurs ont typiquement
-        # au moins 1 ligne dans toutes les élévations.
-        # Exemption : les murs fusionnés via vote élévation sont immunes.
+        # Critère V3.13 (rollback V3.5 + multi-niveaux après runtime
+        # P7 export 2 user : régression V3.12 « zero_lines » trop
+        # strict, ne filtrait plus rien). Retour au critère permissif
+        # `no_count >= 1` (= au moins 1 élévation avec overlap
+        # insuffisant). Skip fusions + check multi-niveaux protège
+        # les vrais murs intérieurs.
         if hasattr(w, "source_indices") and len(getattr(w, "source_indices", [])) > 1:
             kept.append(w)
             continue
-        no_strict_count = sum(
-            1 for v in votes
-            if v.answer is False and v.evidence.get("zero_lines")
-        )
-        if no_strict_count >= 1:
-            # V3.12 : check multi-niveaux — si un wall équivalent existe
-            # à un autre niveau, c'est probablement un vrai mur intérieur
-            # (masqué en élévation mais cohérent multi-niveaux). Garde.
-            if walls_at_other_levels and has_equivalent_wall_at_other_level(
-                w, walls_at_other_levels,
-            ):
-                kept.append(w)
-                continue
+        no_count = sum(1 for v in votes if v.answer is False)
+        if no_count >= 1:
+            # V3.14 (rollback du check multi-niveaux V3.13 — sur P7,
+            # les FP communs N0+N1 se couvraient mutuellement → 0
+            # filtré). Critère simple `no_count >= 1` qui filtrait 2/3
+            # FP sur P7 en V3.5 initial. Accepte les régressions
+            # potentielles sur murs intérieurs masqués (user restaure
+            # via Revit).
             removed.append({
                 "wall_p1": list(w.p1),
                 "wall_p2": list(w.p2),
                 "thickness_m": round(w.thickness, 4),
-                "no_strict_count": no_strict_count,
+                "no_count": no_count,
                 "votes": [
                     {"source": v.source, "answer": v.answer,
                      "confidence": round(v.confidence, 3)}
