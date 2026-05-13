@@ -2406,12 +2406,21 @@ def _collect_coupe_openings_world(
         cp = Path(coupe_path)
         if not cp.exists():
             continue
-        ents, _ = dwg_reader.parse(cp, scale_override=scale_override)
+        ents, meta = dwg_reader.parse(cp, scale_override=scale_override)
         levels = sorted(
             dwg_section_reader.read_levels(ents),
             key=lambda l: l.elevation_m,
         )
         sec_openings = dwg_section_reader.read_section_openings(ents)
+        # Résout la VRAIE position de chaque opening en lisant la
+        # BLOCK_DEFINITION référencée — Revit DXF met l'INSERT à
+        # `(0, level_y)` et la géométrie réelle dans le bloc. Sans cette
+        # résolution, toutes les openings se projettent au même point
+        # (= sur le trait) et restent orphelines. Bug runtime P7 session s.
+        sec_openings = dwg_section_reader.resolve_section_opening_positions(
+            cp, sec_openings,
+            units_factor_to_m=meta.get("units_factor_to_m", 1.0),
+        )
         sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
         sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
         for so in sec_openings:

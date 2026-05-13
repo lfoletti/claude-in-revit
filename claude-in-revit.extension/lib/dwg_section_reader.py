@@ -779,6 +779,14 @@ def find_section_markers(
 def read_section_openings(entities: List[DwgEntity]) -> List[SectionOpening]:
     """Extrait les INSERT du layer `A-GLAZ` (ouvertures vitrées) d'un DXF
     de coupe ou de plan. Le caller distingue les rôles via `classify_dxf`.
+
+    **Convention DXF Revit AIA — IMPORTANT** : le point d'insertion de
+    l'INSERT peut être `(0, 0)` ou `(0, level_y)` (cas P7 / Projet8) car
+    la géométrie réelle de la fenêtre est dans la définition du bloc
+    (sub-entities), pas à l'INSERT lui-même. Pour récupérer la VRAIE
+    position de la fenêtre, le caller doit appeler
+    `resolve_section_opening_positions(file_path, openings)` après cet
+    extracteur — voir runtime P7 session s.
     """
     out: List[SectionOpening] = []
     for e in entities:
@@ -799,6 +807,121 @@ def read_section_openings(entities: List[DwgEntity]) -> List[SectionOpening]:
         if dims is not None:
             out[-1].width_m, out[-1].height_m = dims
     return out
+
+
+def resolve_section_opening_positions(
+    file_path: Any,
+    openings: List[SectionOpening],
+    *,
+    units_factor_to_m: float,
+    aglaz_sub_layers: Tuple[str, ...] = ("A-GLAZ", "A-GLAZ-SILL"),
+) -> List[SectionOpening]:
+    """Résout la **vraie** position des openings A-GLAZ en lisant la
+    BLOCK_DEFINITION référencée par chaque INSERT.
+
+    **Pourquoi** (runtime P7 session s) : Revit DXF export met l'INSERT
+    A-GLAZ à `(0, level_y)` et la géométrie réelle de la fenêtre dans
+    les sub-entities du bloc (LINE sur A-GLAZ / A-GLAZ-SILL). Le point
+    d'insertion ne reflète **pas** la position de la fenêtre dans la
+    coupe. La projection world via le seul INSERT.coords retournait
+    toujours `(X_trait, 0)` → tous orphelins.
+
+    Fix : pour chaque INSERT, calcule le centroïde de la bbox des LINEs
+    sur `aglaz_sub_layers` à l'intérieur du bloc, l'ajoute au point
+    d'insertion, et met à jour `x_dxf_m` / `y_dxf_m`.
+
+    En passant, recalcule `width_m` / `height_m` depuis la bbox (plus
+    fiable que `parse_block_dimensions` du nom).
+
+    Args:
+        file_path: chemin du DXF (re-parsed ici en read-only via ezdxf
+            pour accéder aux BLOCK_RECORDs).
+        openings: liste retournée par `read_section_openings`. Modifiée
+            in-place et retournée.
+        units_factor_to_m: facteur de conversion DXF → mètres (cf.
+            `dwg_reader.meta["units_factor_to_m"]`). Appliqué aux coords
+            des sub-entities du bloc.
+        aglaz_sub_layers: layers à considérer comme "fenêtre" à
+            l'intérieur du bloc. Défaut couvre Revit AIA standard.
+
+    Returns:
+        La même liste `openings`, modifiée in-place (positions et dims
+        mises à jour si la résolution réussit).
+    """
+    try:
+        import ezdxf
+    except ImportError:
+        return openings  # graceful fallback : pas d'amélioration
+
+    try:
+        doc = ezdxf.readfile(str(file_path))
+    except Exception:  # noqa: BLE001 — fichier illisible / corrompu
+        return openings
+
+    # Build name → block geometric center (in mètres, après conversion).
+    block_centers: Dict[str, Tuple[float, float, float, float, float, float]] = {}
+    # Tuple = (cx, cy, x_min, x_max, y_min, y_max) tous en mètres.
+    for blk_name, blk in ((b.name, b) for b in doc.blocks if not b.name.startswith("*")):
+        xs: List[float] = []
+        ys: List[float] = []
+        for e in blk:
+            try:
+                ly = e.dxf.layer
+            except Exception:  # noqa: BLE001
+                continue
+            if ly not in aglaz_sub_layers:
+                continue
+            if e.dxftype() == "LINE":
+                xs.extend([e.dxf.start.x, e.dxf.end.x])
+                ys.extend([e.dxf.start.y, e.dxf.end.y])
+            elif e.dxftype() in ("LWPOLYLINE", "POLYLINE"):
+                try:
+                    for pt in e.vertices():
+                        xs.append(float(pt.dxf.location.x))
+                        ys.append(float(pt.dxf.location.y))
+                except Exception:  # noqa: BLE001
+                    try:
+                        for v in e:
+                            xs.append(float(v[0]))
+                            ys.append(float(v[1]))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if not xs:
+            continue
+        x_min = min(xs) * units_factor_to_m
+        x_max = max(xs) * units_factor_to_m
+        y_min = min(ys) * units_factor_to_m
+        y_max = max(ys) * units_factor_to_m
+        cx = (x_min + x_max) / 2.0
+        cy = (y_min + y_max) / 2.0
+        block_centers[blk_name] = (cx, cy, x_min, x_max, y_min, y_max)
+
+    # Met à jour chaque opening avec block_center + insert offset.
+    for op in openings:
+        bc = block_centers.get(op.block_name)
+        if bc is None:
+            continue
+        cx, cy, x_min, x_max, y_min, y_max = bc
+        # Position : insert + centre bbox horizontal, insert + bottom
+        # bbox vertical (le bottom = sill, plus parlant que le centre).
+        op.x_dxf_m = round(op.x_dxf_m + cx, 6)
+        op.y_dxf_m = round(op.y_dxf_m + y_min, 6)
+        # Dims : préférer la bbox si elle est plausible (W ≥ 0.3 m,
+        # H ≥ 0.5 m) — couvre les vraies fenêtres/portes. Si la bbox
+        # paraît dégénérée (bloc parent avec sub-INSERTs où les LINEs
+        # directes sont des décorations), garder les dims parsées du
+        # block_name (`parse_block_dimensions` plus fiable dans ce cas).
+        # Cas observé runtime P7 session s : bloc parent avec bbox
+        # 0.015 × 0.017 mais block_name `... - 0_60 m x 0_95 m - ...`
+        # → garder 0.6 × 0.95.
+        bbox_w = x_max - x_min
+        bbox_h = y_max - y_min
+        if bbox_w >= 0.3 and bbox_h >= 0.5:
+            op.width_m = round(bbox_w, 4)
+            op.height_m = round(bbox_h, 4)
+        # else : conserver width_m / height_m déjà posés par
+        # `read_section_openings` (parse_block_dimensions du nom).
+    return openings
 
 
 # ----- Walls observés en coupe (Phase 2 Étape 1) ------------------------

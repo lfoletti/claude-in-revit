@@ -526,8 +526,8 @@ def merge_fragments_around_opening(
     walls: List[Any],
     opening_world: Tuple[float, float],
     *,
-    perp_tol_m: float = 0.05,
-    max_fragment_gap_m: float = 3.0,
+    perp_tol_m: float = 0.10,
+    max_fragment_gap_m: float = 5.0,
     angle_tol_rad: float = math.radians(5.0),
 ) -> Tuple[List[Any], Optional[int]]:
     """Fusionne 2 fragments collinéaires encadrant un opening world.
