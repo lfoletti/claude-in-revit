@@ -110,6 +110,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "dwg_inspect_sections",
         "dwg_find_section_markers",
         "dwg_verify_section_scale",
+        "dxf_assign_coupes_to_traits",
         "dwg_identify_source",
         "dxf_context_get",
         "dxf_context_register_inspection",

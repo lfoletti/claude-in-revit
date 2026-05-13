@@ -942,3 +942,139 @@ def verify_section_scale(
         "plan_units_factor": plan_units_factor,
         "coupe_units_factor": coupe_units_factor,
     }
+
+
+# ----- 7. Assign coupes to traits (Phase 1 Étape 2.5 — fix swap) -------
+
+
+def _coupe_a_wall_extent_m(path: Path) -> Optional[float]:
+    """Helper : retourne l'étendue X des LINEs A-WALL d'un DXF coupe,
+    en mètres. None si le fichier n'a pas de A-WALL.
+    """
+    entities, _ = dwg_reader.parse(path)
+    xs: List[float] = []
+    for e in entities:
+        if e.layer != "A-WALL" or e.kind != "LINE":
+            continue
+        for pt in e.coords:
+            xs.append(pt[0])
+    if not xs:
+        return None
+    return max(xs) - min(xs)
+
+
+@tool(name="dxf_assign_coupes_to_traits", tier=2)
+def assign_coupes_to_traits(
+    kg: ProjectKG,
+    coupe_paths: List[str],
+    section_markers: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Trouve l'assignment optimal coupe_dxf ↔ section_marker par minimum
+    drift total (brute force pour N ≤ 4).
+
+    Use case : après `dwg_find_section_markers`, l'agent a N traits de
+    coupe et N fichiers DXF coupe. L'ordre des markers (trié par longueur)
+    ne correspond PAS forcément à l'ordre des fichiers (par nom). Sans
+    ce tool, l'agent risque de swapper.
+
+    Algo : pour chaque permutation P des traits, calcule la somme des
+    drifts (drift = |coupe_extent - trait_length|). L'assignment optimal
+    minimise cette somme totale.
+
+    Concepts: dxf, coupe, assignment, match, trait, swap, optimal,
+              drift, phase 1
+    Phrases: "assigne chaque coupe à son trait", "match dxf coupe au
+             bon trait", "optimal section assignment"
+    Similar: dwg_find_section_markers, dwg_verify_section_scale,
+             dxf_context_register_section_line
+
+    Args:
+        coupe_paths: liste de chemins DXF coupe (en général 2-4).
+        section_markers: liste de dicts {p1_m, p2_m, length_m, ...} comme
+            retournée par `dwg_find_section_markers.markers` filtrée
+            sur `kind=='section'`.
+
+    Returns:
+        {"ok": bool, "assignment": [{coupe_path, marker_index, drift_m,
+            length_m, extent_m}, ...], "total_drift_m": float,
+         "alternative_swaps_drift_m": list}
+        L'`assignment` est la liste finale optimale. `alternative_swaps_
+        drift_m` liste les drifts des autres permutations pour info.
+    """
+    if not coupe_paths:
+        raise ValueError("coupe_paths must be non-empty")
+    if not section_markers:
+        raise ValueError("section_markers must be non-empty")
+    if len(coupe_paths) != len(section_markers):
+        raise ValueError(
+            "coupe_paths ({}) and section_markers ({}) must have same length"
+            .format(len(coupe_paths), len(section_markers))
+        )
+
+    # Précalcul des A-WALL extents pour chaque coupe.
+    coupe_extents: List[Tuple[str, float]] = []
+    for p in coupe_paths:
+        path = Path(p)
+        if not path.exists():
+            raise FileNotFoundError("Coupe not found: {}".format(path))
+        ext = _coupe_a_wall_extent_m(path)
+        if ext is None:
+            raise ValueError("Coupe {} has no A-WALL LINEs".format(path.name))
+        coupe_extents.append((str(path), ext))
+
+    # Précalcul des longueurs de section markers.
+    marker_lengths: List[float] = [
+        float(m.get("length_m") or 0.0) for m in section_markers
+    ]
+
+    # Brute force toutes les permutations.
+    import itertools
+    best_perm: Optional[Tuple[int, ...]] = None
+    best_total_drift = float("inf")
+    perm_drifts: List[Dict[str, Any]] = []
+    for perm in itertools.permutations(range(len(section_markers))):
+        total = 0.0
+        per_pair: List[float] = []
+        for ci, mi in enumerate(perm):
+            drift = abs(coupe_extents[ci][1] - marker_lengths[mi])
+            total += drift
+            per_pair.append(round(drift, 4))
+        perm_drifts.append({"perm": list(perm), "total_drift_m": round(total, 4)})
+        if total < best_total_drift:
+            best_total_drift = total
+            best_perm = perm
+
+    assert best_perm is not None  # at least one perm exists
+
+    assignment: List[Dict[str, Any]] = []
+    for ci, mi in enumerate(best_perm):
+        coupe_path, extent = coupe_extents[ci]
+        marker = section_markers[mi]
+        drift = abs(extent - marker_lengths[mi])
+        assignment.append({
+            "coupe_path": coupe_path,
+            "coupe_name": Path(coupe_path).name,
+            "marker_index": mi,
+            "marker_length_m": round(marker_lengths[mi], 4),
+            "coupe_extent_m": round(extent, 4),
+            "drift_m": round(drift, 4),
+            "drift_pct": round(
+                100.0 * drift / max(marker_lengths[mi], extent, 1e-6), 2
+            ),
+        })
+
+    return {
+        "ok": True,
+        "assignment": assignment,
+        "total_drift_m": round(best_total_drift, 4),
+        "alternative_swaps_drift_m": sorted(
+            [p["total_drift_m"] for p in perm_drifts]
+        ),
+        "note": (
+            "Assignment optimal par minimum drift total. Si l'ordre est "
+            "**différent** de l'ordre des `coupe_paths` (ex: coupe_paths[0] "
+            "→ marker_index=1), c'est un swap évité. L'agent doit "
+            "utiliser ce mapping pour `dxf_context_register_section_line` "
+            "et `views_link_cad`, pas l'ordre alphabétique des fichiers."
+        ),
+    }
