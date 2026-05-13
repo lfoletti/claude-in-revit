@@ -646,7 +646,7 @@ def build_virtual_wall_hypothesis(
     section_line_p2: Tuple[float, float],
     *,
     default_thickness_m: float = 0.20,
-    span_m: float = 6.0,
+    span_m: float = 2.5,
 ) -> Dict[str, Any]:
     """Construit un mur virtuel passant par l'opening, perpendiculaire
     au trait de coupe.
@@ -656,8 +656,15 @@ def build_virtual_wall_hypothesis(
     voit en coupe transversale).
     Si trait horizontal (cut along world X) → opening sur mur VERTICAL.
 
-    `span_m` est la longueur arbitraire du mur hypothétique (centrée sur
-    l'opening). Le vote élévation valide ou invalide.
+    `span_m=2.5` (V2.1) : assez court pour minimiser les chevauchements
+    avec les murs réels adjacents (warning Revit « murs en surbrillance
+    se chevauchent » observé runtime P7 session t avec span=6m), assez
+    long pour héberger une fenêtre standard 1m + 0.75m de marge de
+    chaque côté. L'user devra possiblement étendre les endpoints
+    manuellement pour rejoindre les vrais murs adjacents.
+
+    Le vote élévation valide ou invalide globalement la pertinence du
+    mur virtuel — pas sa longueur exacte.
 
     Returns:
         Dict `{p1, p2, thickness, layer, confidence}` consommable comme
