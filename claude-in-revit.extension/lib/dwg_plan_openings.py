@@ -734,6 +734,7 @@ def merge_fragments_via_elevation_vote(
                         v = vote_wall_visible_in_elevation(
                             cand_p1, cand_p2,
                             level_elevation_m, height_m, ev,
+                            wall_thickness_m=(w_i.thickness + w_j.thickness) / 2.0,
                         )
                         votes.append(v)
                 # Si pas d'élévations et gap > 0 : refuse (pas de validation).
@@ -837,6 +838,7 @@ def filter_walls_via_elevation_vote(
         for direction, ev in elevations.items():
             v = vote_wall_visible_in_elevation(
                 w.p1, w.p2, level_elevation_m, height_m, ev,
+                wall_thickness_m=w.thickness,
             )
             votes.append(v)
 
@@ -938,6 +940,7 @@ def compute_3d_consensus_score(
     for direction, ev in elevations.items():
         v = vote_wall_visible_in_elevation(
             wall.p1, wall.p2, level_elevation_m, height_m, ev,
+            wall_thickness_m=wall.thickness,
         )
         elev_votes_detail.append({
             "direction": direction,

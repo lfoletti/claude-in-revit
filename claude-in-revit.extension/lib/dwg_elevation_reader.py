@@ -155,6 +155,7 @@ def vote_wall_visible_in_elevation(
     height_m: float,
     elevation: ElevationView,
     *,
+    wall_thickness_m: float = 0.20,
     perp_tol_m: float = 0.30,
     min_overlap_m: float = 0.30,
 ) -> Vote:
@@ -203,6 +204,19 @@ def vote_wall_visible_in_elevation(
     x_max_w = max(p1_elev[0], p2_elev[0])
     y_min_w = level_elevation_m
     y_max_w = level_elevation_m + height_m
+
+    # V3.6 : un mur a une épaisseur, donc il est aussi visible DE PROFIL
+    # depuis l'élévation latérale (= comme une bande étroite de largeur
+    # ≈ thickness). User 2026-05-13 : « un mur a une épaisseur et est
+    # par conséquent visible dans l'autre direction, pas seulement de
+    # face ». En vue de profil, la projection des 2 endpoints donne le
+    # même x_elev → bande de largeur 0. On l'élargit par thickness pour
+    # couvrir l'épaisseur réelle.
+    profile_view = (x_max_w - x_min_w) < wall_thickness_m * 0.5
+    if profile_view:
+        x_center = (x_min_w + x_max_w) / 2.0
+        x_min_w = x_center - wall_thickness_m / 2.0
+        x_max_w = x_center + wall_thickness_m / 2.0
 
     # Si la projection est COMPLÈTEMENT en dehors de la bbox A-WALL de
     # l'élévation, le mur n'est pas visible dans cette vue.
@@ -268,9 +282,19 @@ def vote_wall_visible_in_elevation(
         "v_lines_count": v_lines_count,
         "overlap_h_m": round(overlap_h, 3),
         "overlap_v_m": round(overlap_v, 3),
+        "profile_view": profile_view,
     }
 
-    # Critère yes : overlap_h ou overlap_v ≥ min_overlap_m.
+    # V3.6 : critère unifié (face + profil), avec extension thickness
+    # du x_range en profil (déjà fait plus haut). Le critère existant
+    # détecte automatiquement les présences :
+    # - Vue de face : silhouette large → overlap_h ou overlap_v ≥ seuil.
+    # - Vue de profil : thickness extension capture la bande étroite →
+    #   si verticale(s) présente(s) à l'épaisseur du mur → overlap_v
+    #   positif → yes. Sinon (zone strictement vide) → no.
+    # Tested sur P7 : wall_161/162/166 (FP) vu de profil → 0 verticales
+    # dans la bande → no. Vrais murs vu de profil → ≥ 1 verticale du
+    # coin extérieur → yes.
     if overlap_h >= min_overlap_m or overlap_v >= min_overlap_m:
         # Confidence proportional to combined overlap, capped at 1.0.
         wall_length = math.sqrt(
