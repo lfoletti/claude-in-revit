@@ -271,3 +271,102 @@ def vote_wall_visible_in_elevation(
         confidence=0.5,
         **evidence,
     )
+
+
+# ----- Votes opening dans élévation -----------------------------------
+
+
+def vote_opening_visible_in_elevation(
+    opening_world: Tuple[float, float],
+    level_elevation_m: float,
+    sill_m: float,
+    height_m: float,
+    width_m: float,
+    elevation: ElevationView,
+    *,
+    x_tol_m: float = 0.30,
+    y_tol_m: float = 0.30,
+) -> Vote:
+    """Vote si une opening (porte/fenêtre) est visible dans l'élévation.
+
+    Une opening en élévation laisse :
+    - **Fenêtre** : linteau (bande horizontale en haut) + allège (bande
+      horizontale en bas) au-dessus et en dessous de la zone.
+    - **Porte** : linteau seulement (la zone descend jusqu'au sol).
+
+    Vote yes si : au moins UNE ligne horizontale A-WALL chevauche
+    horizontalement la zone projetée de l'opening, ET cette ligne est
+    proche du sill ou du head attendu.
+
+    Args:
+        opening_world: `(x, y)` position world plan de l'opening.
+        level_elevation_m: élévation absolue du niveau (m).
+        sill_m: hauteur d'allège (m, au-dessus du niveau).
+        height_m: hauteur de la fenêtre/porte (m).
+        width_m: largeur (m).
+        elevation: `ElevationView` parsée.
+        x_tol_m: tolérance horizontale (défaut 30cm).
+        y_tol_m: tolérance verticale pour sill / head (défaut 30cm).
+
+    Returns:
+        `Vote` avec source `"elevation_<dir>_opening"`.
+    """
+    if elevation.a_wall_bbox is None:
+        return abstain(
+            "elevation_{}_opening".format(elevation.direction),
+            reason="no A-WALL",
+        )
+
+    # Project center of opening (the world point we have).
+    cx_elev, _ = project_world_to_elevation(
+        opening_world[0], opening_world[1], level_elevation_m,
+        elevation.direction,
+    )
+    x_min = cx_elev - width_m / 2.0
+    x_max = cx_elev + width_m / 2.0
+    sill_elev_y = level_elevation_m + sill_m
+    head_elev_y = level_elevation_m + sill_m + height_m
+
+    bx_min, bx_max, _, _ = elevation.a_wall_bbox
+    if x_max < bx_min - x_tol_m or x_min > bx_max + x_tol_m:
+        return abstain(
+            "elevation_{}_opening".format(elevation.direction),
+            reason="outside elevation bbox",
+        )
+
+    # Cherche linteau (ligne horizontale à head_elev_y ± y_tol).
+    linteau_found = False
+    allege_found = False
+    for line in elevation.a_wall_lines:
+        if not line.is_horizontal:
+            continue
+        y_line = (line.p1[1] + line.p2[1]) / 2.0
+        x_l, x_r = sorted((line.p1[0], line.p2[0]))
+        # Overlap horizontal.
+        ov = max(0.0, min(x_max, x_r) - max(x_min, x_l))
+        if ov < width_m * 0.3:  # exige au moins 30% d'overlap
+            continue
+        if abs(y_line - head_elev_y) <= y_tol_m:
+            linteau_found = True
+        if abs(y_line - sill_elev_y) <= y_tol_m and sill_m > 0.1:
+            allege_found = True
+
+    if linteau_found:
+        # Linteau présent → opening confirmée.
+        conf = 0.9 if allege_found else 0.6
+        return yes_vote(
+            "elevation_{}_opening".format(elevation.direction),
+            confidence=conf,
+            linteau=True, allege=allege_found,
+        )
+    if allege_found:
+        return yes_vote(
+            "elevation_{}_opening".format(elevation.direction),
+            confidence=0.5,
+            linteau=False, allege=True,
+        )
+    return no_vote(
+        "elevation_{}_opening".format(elevation.direction),
+        confidence=0.4,
+        linteau=False, allege=False,
+    )

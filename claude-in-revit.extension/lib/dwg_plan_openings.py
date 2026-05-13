@@ -637,6 +637,177 @@ def merge_fragments_around_opening(
     return walls, None
 
 
+# ----- V2 — Votes coupe pour mur / opening (multi-sources) ------------
+
+
+def vote_wall_visible_in_section(
+    wall_p1: Tuple[float, float],
+    wall_p2: Tuple[float, float],
+    level_elevation_m: float,
+    height_m: float,
+    section_line: Dict[str, Any],
+    section_walls: List[Dict[str, Any]],
+    *,
+    x_cut_tol_m: float = 0.20,
+    thickness_tol_m: float = 0.05,
+    wall_thickness_m: Optional[float] = None,
+) -> Any:
+    """Vote si un mur (en plan) est visible dans une coupe donnée.
+
+    Si le mur ne croise PAS le trait de coupe en plan → abstain (la
+    coupe ne peut pas voir un mur qu'elle ne traverse pas).
+
+    Sinon, project la position de l'intersection plan↔trait en x_cut
+    (convention DXF anchor : trait vertical → x_cut = world_Y de
+    l'intersection ; horizontal → world_X). Cherche un `section_wall`
+    à `x_cut_tol_m` près. Si trouvé :
+    - yes confiance 0.9 si thickness match (± `thickness_tol_m`).
+    - yes confiance 0.5 si présent mais thickness diverge.
+    Sinon : no confiance 0.6 (mur attendu mais absent en coupe).
+
+    Args:
+        wall_p1 / wall_p2: centerline en world plan.
+        level_elevation_m / height_m: position verticale du mur.
+        section_line: dict avec `plan_p1, plan_p2, coupe_path`.
+        section_walls: liste de `SectionWall` sérialisés (cf.
+            `read_section_walls`).
+        x_cut_tol_m: tolérance en x_cut (défaut 20cm).
+        thickness_tol_m: tolérance d'épaisseur (défaut 5cm).
+        wall_thickness_m: si fourni, exigé pour confirmer le match.
+
+    Returns:
+        `Vote` depuis `dwg_voting`.
+    """
+    # Import paresseux pour éviter cycle.
+    from .dwg_voting import abstain as _abstain, yes_vote, no_vote
+
+    source = "section_{}".format(
+        section_line.get("name") or section_line.get("coupe_path", "?")
+    )
+    sp1 = (float(section_line["plan_p1"][0]), float(section_line["plan_p1"][1]))
+    sp2 = (float(section_line["plan_p2"][0]), float(section_line["plan_p2"][1]))
+
+    # Intersection mur ↔ trait.
+    inter = _segment_intersection_for_vote(wall_p1, wall_p2, sp1, sp2)
+    if inter is None:
+        return _abstain(source, reason="wall does not cross section line")
+    ix, iy = inter
+
+    # Vertical ou horizontal ?
+    trait_dx = sp2[0] - sp1[0]
+    trait_dy = sp2[1] - sp1[1]
+    x_cut_expected = iy if abs(trait_dx) < abs(trait_dy) else ix
+
+    # Cherche un section_wall à cette x_cut.
+    candidates = [
+        sw for sw in section_walls
+        if abs(float(sw["x_cut_m"]) - x_cut_expected) <= x_cut_tol_m
+    ]
+    if not candidates:
+        return no_vote(
+            source, confidence=0.6,
+            x_cut_expected=round(x_cut_expected, 3),
+            reason="no section_wall at x_cut",
+        )
+    # Prend le plus proche.
+    best = min(
+        candidates,
+        key=lambda sw: abs(float(sw["x_cut_m"]) - x_cut_expected),
+    )
+    if wall_thickness_m is not None:
+        thick_drift = abs(wall_thickness_m - float(best["thickness_m"]))
+        if thick_drift <= thickness_tol_m:
+            return yes_vote(
+                source, confidence=0.9,
+                x_cut_expected=round(x_cut_expected, 3),
+                section_thickness_m=float(best["thickness_m"]),
+                thick_drift=round(thick_drift, 4),
+            )
+        return yes_vote(
+            source, confidence=0.5,
+            x_cut_expected=round(x_cut_expected, 3),
+            section_thickness_m=float(best["thickness_m"]),
+            thick_drift=round(thick_drift, 4),
+            note="thickness diverges",
+        )
+    return yes_vote(
+        source, confidence=0.7,
+        x_cut_expected=round(x_cut_expected, 3),
+        section_thickness_m=float(best["thickness_m"]),
+    )
+
+
+def vote_opening_visible_in_section(
+    opening_world: Tuple[float, float],
+    block_id_expected: Optional[str],
+    section_line: Dict[str, Any],
+    section_openings_by_block_id: Dict[str, Dict[str, Any]],
+    *,
+    perp_tol_m: float = 0.30,
+) -> Any:
+    """Vote si une opening est visible dans une coupe (matching par
+    block_id et proximité du trait).
+
+    Si l'opening n'est pas proche du trait → abstain (la coupe ne
+    montre pas cette opening). Sinon, cherche par block_id dans
+    `section_openings_by_block_id`. yes si trouvé, no sinon.
+
+    Args:
+        opening_world: position de l'opening en world plan.
+        block_id_expected: block_id à matcher (peut être None si
+            inconnu — abstain).
+        section_line: dict avec `plan_p1, plan_p2`.
+        section_openings_by_block_id: index `{block_id: info_dict}`
+            (cf. _collect_coupe_openings_world).
+        perp_tol_m: tolérance perpendiculaire au trait.
+
+    Returns:
+        `Vote`.
+    """
+    from .dwg_voting import abstain as _abstain, yes_vote, no_vote
+
+    source = "section_{}_opening".format(
+        section_line.get("name") or section_line.get("coupe_path", "?")
+    )
+    if block_id_expected is None:
+        return _abstain(source, reason="no block_id to match")
+
+    sp1 = (float(section_line["plan_p1"][0]), float(section_line["plan_p1"][1]))
+    sp2 = (float(section_line["plan_p2"][0]), float(section_line["plan_p2"][1]))
+    perp = _perp_distance_point_to_line(opening_world, sp1, sp2)
+    if perp > perp_tol_m:
+        return _abstain(
+            source, reason="opening not near section line", perp=round(perp, 3),
+        )
+    info = section_openings_by_block_id.get(block_id_expected)
+    if info is None:
+        return no_vote(source, confidence=0.6, reason="block_id not in section")
+    return yes_vote(
+        source, confidence=0.95,
+        sill_m=info.get("sill_m"), height_m=info.get("height_m"),
+    )
+
+
+def _segment_intersection_for_vote(
+    p1: Tuple[float, float], p2: Tuple[float, float],
+    q1: Tuple[float, float], q2: Tuple[float, float],
+    eps: float = 1e-9,
+) -> Optional[Tuple[float, float]]:
+    """Intersection de 2 segments 2D — version simplifiée du helper
+    utilisé dans `dwg_coherence` (évite l'import croisé)."""
+    rx, ry = p2[0] - p1[0], p2[1] - p1[1]
+    sx, sy = q2[0] - q1[0], q2[1] - q1[1]
+    denom = rx * sy - ry * sx
+    if abs(denom) < eps:
+        return None
+    qx, qy = q1[0] - p1[0], q1[1] - p1[1]
+    t = (qx * sy - qy * sx) / denom
+    u = (qx * ry - qy * rx) / denom
+    if t < -eps or t > 1 + eps or u < -eps or u > 1 + eps:
+        return None
+    return (p1[0] + t * rx, p1[1] + t * ry)
+
+
 # ----- Classification porte vs fenêtre --------------------------------
 
 

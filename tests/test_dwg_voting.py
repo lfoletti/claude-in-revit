@@ -181,6 +181,95 @@ p7_available = pytest.mark.skipif(
 )
 
 
+# ----- Votes coupe (vote_wall_visible_in_section / opening) -----------
+
+
+def test_vote_wall_visible_in_section_yes_when_thickness_matches():
+    from lib.dwg_plan_openings import vote_wall_visible_in_section
+    # Trait vertical à x=5, mur horizontal traversant à y=3 → cross at (5, 3).
+    # Trait vertical → x_cut = world Y = 3.
+    section_line = {
+        "plan_p1": [5.0, 0.0], "plan_p2": [5.0, 10.0],
+        "coupe_path": "/c.dxf", "name": "C1",
+    }
+    section_walls = [
+        {"x_cut_m": 3.0, "thickness_m": 0.20,
+         "y_bottom_m": 0.0, "y_top_m": 3.0},
+    ]
+    v = vote_wall_visible_in_section(
+        (0.0, 3.0), (10.0, 3.0), 0.0, 3.0,
+        section_line, section_walls, wall_thickness_m=0.20,
+    )
+    assert v.answer is True
+    assert v.confidence >= 0.85
+
+
+def test_vote_wall_visible_in_section_abstains_when_no_crossing():
+    from lib.dwg_plan_openings import vote_wall_visible_in_section
+    section_line = {"plan_p1": [5.0, 0.0], "plan_p2": [5.0, 10.0],
+                    "coupe_path": "/c.dxf"}
+    v = vote_wall_visible_in_section(
+        (0.0, 20.0), (10.0, 20.0), 0.0, 3.0,
+        section_line, [],
+    )
+    assert v.answer is None  # abstain (no crossing)
+
+
+def test_vote_wall_visible_in_section_no_when_absent():
+    from lib.dwg_plan_openings import vote_wall_visible_in_section
+    section_line = {"plan_p1": [5.0, 0.0], "plan_p2": [5.0, 10.0],
+                    "coupe_path": "/c.dxf"}
+    v = vote_wall_visible_in_section(
+        (0.0, 3.0), (10.0, 3.0), 0.0, 3.0,
+        section_line, [],  # pas de section walls
+    )
+    assert v.answer is False
+
+
+def test_vote_opening_visible_in_section_yes_when_block_id_matches():
+    from lib.dwg_plan_openings import vote_opening_visible_in_section
+    section_line = {"plan_p1": [5.0, 0.0], "plan_p2": [5.0, 10.0],
+                    "coupe_path": "/c.dxf", "name": "C1"}
+    by_id = {"123": {"sill_m": 0.9, "height_m": 1.5}}
+    v = vote_opening_visible_in_section(
+        (5.0, 4.0), "123", section_line, by_id,
+    )
+    assert v.answer is True
+
+
+def test_vote_opening_visible_in_section_abstains_far_from_trait():
+    from lib.dwg_plan_openings import vote_opening_visible_in_section
+    section_line = {"plan_p1": [5.0, 0.0], "plan_p2": [5.0, 10.0],
+                    "coupe_path": "/c.dxf"}
+    v = vote_opening_visible_in_section(
+        (10.0, 4.0), "123", section_line, {"123": {"sill_m": 0.9, "height_m": 1.5}},
+    )
+    assert v.answer is None  # abstain : opening loin du trait
+
+
+# ----- Votes opening dans élévation -----------------------------------
+
+
+def test_vote_opening_in_elevation_yes_with_linteau():
+    from lib.dwg_elevation_reader import vote_opening_visible_in_elevation
+    # Élévation Sud avec linteau à y=2.5 et allège à y=1.0.
+    ev = ElevationView(
+        direction="Sud",
+        a_wall_lines=[
+            ElevationLine((2, 2.5), (8, 2.5), is_horizontal=True, is_vertical=False),
+            ElevationLine((2, 1.0), (8, 1.0), is_horizontal=True, is_vertical=False),
+        ],
+        a_wall_bbox=(0.0, 10.0, 0.0, 3.0),
+        levels_y=[0.0],
+    )
+    # opening world (5, y) → x_elev=5 (Sud). sill=1.0, height=1.5 → head=2.5.
+    v = vote_opening_visible_in_elevation(
+        (5.0, 0.0), 0.0, sill_m=1.0, height_m=1.5, width_m=1.0,
+        elevation=ev,
+    )
+    assert v.answer is True
+
+
 @p7_available
 def test_p7_sud_elevation_votes_yes_for_south_exterior_wall():
     """Sur P7, le mur extérieur Sud (y=-1.17) doit voter yes confiance 1
