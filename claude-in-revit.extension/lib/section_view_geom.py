@@ -145,27 +145,38 @@ def compute_section_view_bounds(
         bottom_elev_m,
     )
 
-    # Look vector (toward where viewer is looking).
+    # Look vector (toward where viewer is looking, in the world).
     look = _VIEW_DIR_TO_LOOK_VECTOR[view_dir]
-    # BasisZ = opposite of look (out of page toward viewer).
-    basis_z = (-look[0], -look[1], -look[2])
+    # **Convention BasisZ corrigée 2026-05-13 (3e itération)** : BasisZ
+    # pointe dans la DIRECTION DE REGARD (= look, away from viewer).
+    # Les itérations précédentes utilisaient `BasisZ = -look` (toward
+    # viewer) en se fiant à la doc Revit « view direction is along
+    # negative Z », mais empiriquement Revit interprète Min.Z comme le
+    # cut plane (near) et Max.Z comme le back of view (far in look
+    # direction). Avec BasisZ = +look, c'est cohérent :
+    #   - Min.Z = 0 → cut plane à l'Origin (= trait de coupe)
+    #   - Max.Z = +far_clip → back of view à far_clip dans le sens du
+    #     regard (Origin + far_clip × look)
+    basis_z = (look[0], look[1], look[2])
     # BasisY = world up.
     basis_y = (0.0, 0.0, 1.0)
-    # BasisX = BasisY × BasisZ (right-hand rule).
-    basis_x = _cross(basis_y, basis_z)
+    # BasisX = BasisZ × BasisY (right-hand rule pour viewer's right).
+    # Avec l'ancienne convention BasisZ=-look, c'était BasisY × BasisZ ;
+    # avec BasisZ=+look, l'ordre s'inverse pour préserver la même
+    # orientation finale de BasisX (= right hand du viewer).
+    basis_x = _cross(basis_z, basis_y)
     basis_x = _normalize(basis_x)
 
     # BBox en repère LOCAL :
     # X: ±half-section-length (symétrique le long de la section line).
-    # Y: [0, full_height] (asymétrique : Origin.Z = bottom_elev, donc
-    #    Y=0 local = bottom_elev en world, Y=full_height local = top + buffer).
-    # Z: [-far_clip_m, 0] où Max.Z = 0 = plan de coupe (= trait dans le
-    #    plan), et Min.Z = -far_clip_m = fond de la vue (profondeur dans
-    #    le sens du regard, dans la direction opposée à BasisZ).
+    # Y: [0, full_height] (asymétrique : Origin.Z = bottom_elev).
+    # Z: [0, +far_clip_m] où Min.Z=0 = plan de coupe à l'Origin (= trait
+    #    de coupe), Max.Z=+far_clip = back of view dans la direction
+    #    du regard (= +BasisZ dans le monde).
     half_len = section_length / 2.0
     full_height = top_elev_m - bottom_elev_m + height_buffer_m
-    bbox_min = (-half_len, 0.0, -far_clip_m)
-    bbox_max = (half_len, full_height, 0.0)
+    bbox_min = (-half_len, 0.0, 0.0)
+    bbox_max = (half_len, full_height, far_clip_m)
 
     return SectionViewBounds(
         origin_m=origin,

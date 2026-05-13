@@ -34,11 +34,9 @@ def test_zero_length_section_raises():
 def test_horizontal_section_view_down():
     """Trait horizontal Y=-6m, viewer regarde vers le sud (-Y).
 
-    BasisX = horizontal in view. Viewer face -Y → world +X is on left.
-    BasisX devrait pointer vers le right-in-view = world -X.
-    BasisZ pointe vers viewer = +Y.
-    Origin Z = bottom_elev_m pour que DXF lié en OrientToView aligne
-    son y=0 sur world Z=0 (= Niveau 0).
+    Convention 3e itération : BasisZ = +look (direction de regard,
+    away from viewer). Pour view_dir='down' = look vers -Y :
+    BasisZ = (0, -1, 0).
     """
     r = compute_section_view_bounds(
         [-1.8, -6.0], [11.9, -6.0], "down",
@@ -46,18 +44,21 @@ def test_horizontal_section_view_down():
     )
     # Origin = midpoint horizontal + bottom_elev_m en Z.
     assert r.origin_m == pytest.approx(((-1.8 + 11.9) / 2, -6.0, 0.0))
-    # BasisZ = -look = -(0, -1, 0) = (0, +1, 0) → vers le viewer (au +Y).
-    assert r.basis_z == pytest.approx((0.0, 1.0, 0.0))
+    # BasisZ = +look = (0, -1, 0) pour view_dir='down'.
+    assert r.basis_z == pytest.approx((0.0, -1.0, 0.0))
     # BasisY = world up.
     assert r.basis_y == pytest.approx((0.0, 0.0, 1.0))
-    # BasisX = BasisY × BasisZ = (0,0,1) × (0,1,0) = (-1, 0, 0).
+    # BasisX = BasisZ × BasisY = (0,-1,0) × (0,0,1) = (-1, 0, 0).
+    # Viewer face -Y, right hand = -X. ✓
     assert r.basis_x == pytest.approx((-1.0, 0.0, 0.0))
 
 
 def test_horizontal_section_view_up():
     """Même trait, viewer regarde vers le nord (+Y)."""
     r = compute_section_view_bounds([-1.8, -6.0], [11.9, -6.0], "up")
-    assert r.basis_z == pytest.approx((0.0, -1.0, 0.0))
+    # BasisZ = +look = (0, +1, 0).
+    assert r.basis_z == pytest.approx((0.0, 1.0, 0.0))
+    # BasisX = (0,1,0) × (0,0,1) = (1, 0, 0). Viewer face +Y, right = +X. ✓
     assert r.basis_x == pytest.approx((1.0, 0.0, 0.0))
 
 
@@ -67,16 +68,18 @@ def test_horizontal_section_view_up():
 def test_vertical_section_view_right():
     """Trait vertical X=5.25, viewer regarde vers l'est (+X)."""
     r = compute_section_view_bounds([5.25, -13.0], [5.25, 14.0], "right")
-    # BasisZ = -(+X) = -X.
-    assert r.basis_z == pytest.approx((-1.0, 0.0, 0.0))
-    # BasisX = (0,0,1) × (-1,0,0) = (0×0 - 1×0, 1×(-1) - 0×0, 0×0 - 0×(-1)) = (0, -1, 0).
+    # BasisZ = +look = (+1, 0, 0).
+    assert r.basis_z == pytest.approx((1.0, 0.0, 0.0))
+    # BasisX = (1,0,0) × (0,0,1) = (0, -1, 0). Viewer face +X, right = -Y. ✓
     assert r.basis_x == pytest.approx((0.0, -1.0, 0.0))
 
 
 def test_vertical_section_view_left():
     """Même trait, viewer regarde vers l'ouest (-X)."""
     r = compute_section_view_bounds([5.25, -13.0], [5.25, 14.0], "left")
-    assert r.basis_z == pytest.approx((1.0, 0.0, 0.0))
+    # BasisZ = +look = (-1, 0, 0).
+    assert r.basis_z == pytest.approx((-1.0, 0.0, 0.0))
+    # BasisX = (-1,0,0) × (0,0,1) = (0, 1, 0). Viewer face -X, right = +Y. ✓
     assert r.basis_x == pytest.approx((0.0, 1.0, 0.0))
 
 
@@ -84,11 +87,11 @@ def test_vertical_section_view_left():
 
 
 def test_bbox_dimensions_match_section_length_and_height():
-    """X symétrique autour d'Origin, Y asymétrique [0, height] depuis
-    Origin.Z = bottom_elev, Z = [-far_clip, 0] (cut plane à Max.Z).
+    """X symétrique, Y asymétrique [0, height], Z [0, +far_clip]
+    (Min.Z=cut plane à l'Origin, Max.Z=back of view).
 
-    Origin.Z = bottom_elev = 0 → DXF y=0 lié au view aligne avec
-    Niveau 0 Revit (world Z=0).
+    Convention 3e itération : BasisZ pointe dans la direction de regard,
+    donc Min.Z=0 = cut plane et Max.Z=+far_clip = depth dans look direction.
     """
     r = compute_section_view_bounds(
         [0, 0], [10, 0], "down",
@@ -101,23 +104,25 @@ def test_bbox_dimensions_match_section_length_and_height():
     # Y span asymétrique : 0 à full_height = 7m (= 6 + buffer 1).
     assert r.bbox_min_m[1] == pytest.approx(0.0)
     assert r.bbox_max_m[1] == pytest.approx(7.0)
-    # Z span = [-far_clip, 0] : cut plane à Max.Z=0, fond à Min.Z=-20.
-    assert r.bbox_min_m[2] == pytest.approx(-20.0)
-    assert r.bbox_max_m[2] == pytest.approx(0.0)
+    # Z span = [0, +far_clip] : cut plane à Min.Z=0, back of view à Max.Z=20.
+    assert r.bbox_min_m[2] == pytest.approx(0.0)
+    assert r.bbox_max_m[2] == pytest.approx(20.0)
     # Origin.Z = bottom_elev_m (= 0 pour alignement DXF).
     assert r.origin_m[2] == pytest.approx(0.0)
 
 
-def test_max_z_is_cut_plane_at_zero():
-    """Revit convention : Max.Z (local) = plan de coupe = 0 (à l'Origin).
+def test_min_z_is_cut_plane_at_zero():
+    """Revit convention 3e itération : Min.Z (local) = cut plane = 0
+    (à l'Origin) ; Max.Z = +far_clip = back of view.
 
-    Rien ne doit être visible côté viewer (Z > 0). C'est le fix runtime
-    2026-05-13 : avant, Max.Z=+1m plaçait le cut plane 1m offset du
-    trait → user voyait coupe et fond inversés.
+    Avant : BasisZ pointe vers viewer + Max.Z=0 (cut) — inverted Z
+    issue runtime 2026-05-13 où la coupe affichait le fond à la place
+    du plan de coupe. Fix : BasisZ pointe dans le sens du regard +
+    Min.Z=0/Max.Z=+far_clip.
     """
     r = compute_section_view_bounds([0, 0], [5, 0], "down", far_clip_m=15.0)
-    assert r.bbox_max_m[2] == 0.0
-    assert r.bbox_min_m[2] == -15.0
+    assert r.bbox_min_m[2] == 0.0
+    assert r.bbox_max_m[2] == 15.0
 
 
 def test_section_length_computed():
