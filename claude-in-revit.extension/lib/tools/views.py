@@ -167,6 +167,7 @@ def link_cad(
     view_revit_id: Optional[int] = None,
     placement: str = "origin",
     color_mode: str = "preserved",
+    restore_pinned: bool = True,
 ) -> Dict[str, Any]:
     """Insère un DXF dans une vue Revit en tant que LIEN (pas import dur).
 
@@ -195,10 +196,17 @@ def link_cad(
             `"center"` (centré sur l'écran). Défaut `"origin"`.
         color_mode: `"preserved"`, `"black_and_white"`, ou
             `"by_layer"`. Défaut `"preserved"`.
+        restore_pinned: si True (défaut), re-épingle le link après
+            l'alignement sur view.Origin (préserve le comportement
+            Revit standard où les liens CAD avec OrientToView sont
+            verrouillés). Si False, laisse dépinglé — utile pendant
+            la phase de validation visuelle où l'user veut peut-être
+            ajuster manuellement.
 
     Returns:
         {"ok": bool, "file": str, "view_revit_id": int | None,
-         "link_revit_id": int | None}
+         "link_revit_id": int | None, "aligned_to_view_origin": bool,
+         "pinned": bool}
     """
     path = Path(file_path)
     if not path.exists():
@@ -258,6 +266,7 @@ def link_cad(
 
     link_revit_id: Optional[int] = None
     aligned_to_view_origin = False
+    final_pinned = False
     with rp.transaction(doc, "views.link_cad"):
         # PythonNet 3.x convention pour les `out` params .NET :
         # appeler la méthode sans pré-créer le placeholder, et
@@ -308,19 +317,32 @@ def link_cad(
                 or abs(origin.Y) > 1e-9
                 or abs(origin.Z) > 1e-9
             ):
+                target_eid = out_id if isinstance(out_id, _EID) else _EID(int(link_revit_id))
+                instance = doc.GetElement(target_eid)
                 try:
-                    target_eid = out_id if isinstance(out_id, _EID) else _EID(int(link_revit_id))
                     # Unpin before move (OrientToView auto-pins).
-                    instance = doc.GetElement(target_eid)
                     if instance is not None and getattr(instance, "Pinned", False):
                         instance.Pinned = False
                     ElementTransformUtils.MoveElement(doc, target_eid, origin)
                     aligned_to_view_origin = True
                 except Exception:  # noqa: BLE001
-                    # Si le move échoue malgré l'unpin (cas exotique),
-                    # le link reste posé mais sans alignement — user
-                    # peut corriger manuel via UI Revit.
                     aligned_to_view_origin = False
+                # Re-pin si demandé (défaut True : préserve le
+                # comportement Revit standard).
+                if restore_pinned and instance is not None:
+                    try:
+                        instance.Pinned = True
+                        final_pinned = True
+                    except Exception:  # noqa: BLE001
+                        final_pinned = False
+        # Si pas dans la branche d'alignement (vue plan, ou Origin déjà
+        # à 0), récupère le statut Pinned actuel pour le rapport.
+        if not final_pinned and out_id is not None and link_revit_id is not None:
+            try:
+                inst = doc.GetElement(_EID(link_revit_id))
+                final_pinned = bool(getattr(inst, "Pinned", False)) if inst else False
+            except Exception:  # noqa: BLE001
+                final_pinned = False
 
     return {
         "ok": True,
@@ -330,6 +352,7 @@ def link_cad(
         "placement": placement,
         "color_mode": color_mode,
         "aligned_to_view_origin": aligned_to_view_origin,
+        "pinned": final_pinned,
         "note": (
             "Lien CAD posé. `link_revit_id` peut être None si la version "
             "PythonNet ne supporte pas le tuple-return — le lien existe "
