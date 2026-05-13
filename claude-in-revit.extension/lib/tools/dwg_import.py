@@ -76,9 +76,13 @@ def inspect(
     entities, meta = dwg_reader.parse(path, scale_override=scale_override)
     dwg_classifier.annotate_layers(meta["layers"])
 
+    kind, kind_evidence = dwg_section_reader.classify_dxf(meta["layers"])
+
     return {
         "ok": True,
         "file": str(path),
+        "kind": kind,
+        "kind_evidence": kind_evidence,
         "units_code": meta["units_code"],
         "units_factor_to_m": meta["units_factor_to_m"],
         "total_entities": meta["total_entities"],
@@ -86,6 +90,34 @@ def inspect(
         "source_format": meta["source_format"],
         "layers": meta["layers"],
     }
+
+
+def _refuse_if_section(path: Path) -> None:
+    """Raise actionable ValueError si le DXF est une coupe et pas un plan.
+
+    Garde-fou contre le bug runtime 2026-05-13 (session l) : l'agent
+    importait les murs de chaque DXF du dossier — y compris les coupes —
+    en pensant qu'il s'agissait de plans. Les coupes ont aussi un layer
+    `A-WALL` (sections verticales des murs), ce qui produit des « murs »
+    bidons offsetés dans le plan Revit + des dépassements géométriques.
+
+    Le check est partagé entre `dwg_classify` et `dwg_import_walls` pour
+    couper court dès le preview, pas seulement au commit.
+    """
+    entities, meta = dwg_reader.parse(path)
+    kind, evidence = dwg_section_reader.classify_dxf(meta["layers"])
+    if kind == "section":
+        raise ValueError(
+            "DXF identifié comme COUPE (section), pas plan : {}. "
+            "Layers détectés : {}. "
+            "Utilise `dwg_inspect_sections` (qui sait lire plans + coupes) "
+            "à la place de `dwg_classify` / `dwg_import_walls` pour ce "
+            "fichier. Évidence : {}".format(
+                path.name,
+                [l["name"] for l in meta["layers"]],
+                evidence.get("trigger", ""),
+            )
+        )
 
 
 # ----- 2. Classify (preview wall candidates) ----------------------------
@@ -167,6 +199,8 @@ def classify(
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError("File not found: {}".format(path))
+
+    _refuse_if_section(path)
 
     entities, _ = dwg_reader.parse(path, scale_override=scale_override)
     result = dwg_classifier.classify(
@@ -289,6 +323,7 @@ def import_walls(
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError("File not found: {}".format(path))
+    _refuse_if_section(path)
     if not kg.has_node(level_ref):
         raise ValueError("Unknown level_ref: {}".format(level_ref))
     if not kg.has_node(wall_type_ref):

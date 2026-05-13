@@ -88,6 +88,7 @@ def test_canonical_registry_has_expected_tier1_tools(kg_with_seed):
         "rooms_delete",
         "rooms_set_name_many",
         "levels_create",
+        "levels_create_many",
         "levels_create_floor_plan",
         "levels_set_elevation",
         "levels_set_name",
@@ -2227,6 +2228,71 @@ def test_levels_create_refuses_empty_name(kg_with_seed):
     )
     assert result["is_error"] is True
     assert "non-empty" in result["content"]
+
+
+def test_levels_create_many_creates_three_levels(kg_with_seed):
+    """Use case import projet : 3 niveaux extraits depuis coupes en 1 appel."""
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_many",
+        {"items": [
+            {"name": "RDC", "elevation_m": 0.0},
+            {"name": "Étage 1", "elevation_m": 3.0},
+            {"name": "Étage 2", "elevation_m": 6.0},
+        ]},
+        "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 3
+    assert len(payload["llm_ids"]) == 3
+    # KG-only path → no floor plans, note documente.
+    assert payload["floor_plans_created"] == 0
+    assert "no Revit views" in payload["floor_plan_note"]
+    # Vérifier que chaque level est bien typé Level + a la bonne élévation.
+    elevs = sorted(kg.get_node(nid)["elevation"] for nid in payload["llm_ids"])
+    assert elevs == [0.0, 3.0, 6.0]
+
+
+def test_levels_create_many_rolls_back_on_duplicate_name(kg_with_seed):
+    """Si un item entre en collision avec un Level pré-existant, aucun
+    niveau du batch ne doit être commit."""
+    kg, _, _ = kg_with_seed
+    # kg_with_seed pose déjà un Level "N00" → collision sur le 2e item.
+    initial = kg.count_by_type("Level")
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_many",
+        {"items": [
+            {"name": "RDC", "elevation_m": 0.0},
+            {"name": "N00", "elevation_m": 3.0},  # collision
+        ]},
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert kg.count_by_type("Level") == initial
+
+
+def test_levels_create_many_rejects_intra_batch_duplicate(kg_with_seed):
+    """Deux items avec le même nom dans le batch → erreur explicite."""
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_many",
+        {"items": [
+            {"name": "RDC", "elevation_m": 0.0},
+            {"name": "RDC", "elevation_m": 3.0},
+        ]},
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    assert "duplicate" in result["content"].lower()
+
+
+def test_levels_create_many_rejects_empty_items(kg_with_seed):
+    kg, _, _ = kg_with_seed
+    result = llm_protocol.dispatch_tool_use(
+        "levels_create_many", {"items": []}, "t1", kg,
+    )
+    assert result["is_error"] is True
 
 
 def test_levels_set_elevation_kg_only_no_drift(kg_with_seed):

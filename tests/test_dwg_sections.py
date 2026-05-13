@@ -378,6 +378,77 @@ def test_projet4_plan_has_20_openings_all_with_id():
 
 
 @projet4_available
+def test_dwg_classify_refuses_section(tmp_path):
+    """Garde-fou contre le bug runtime session l : dwg_classify sur une
+    coupe doit lever ValueError actionnable, pas tenter de traiter les
+    A-WALL de la coupe comme un plan."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_classify",
+        {"file_path": str(PROJET4_COUPE1), "layer_mapping": {"A-WALL": "wall"}},
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    content = result["content"].lower()
+    assert "coupe" in content or "section" in content
+
+
+@projet4_available
+def test_dwg_import_walls_refuses_section(tmp_path):
+    """Idem pour dwg_import_walls : ne doit JAMAIS importer depuis une coupe."""
+    from lib import llm_protocol
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    lvl = kg.add_node("Level", {"name": "N0", "elevation": 0.0})
+    wt = kg.add_node("WallType", {"name": "X", "total_thickness": 0.2})
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_import_walls",
+        {
+            "file_path": str(PROJET4_COUPE1),
+            "level_ref": lvl,
+            "wall_type_ref": wt,
+            "layer_mapping": {"A-WALL": "wall"},
+        },
+        "t1", kg,
+    )
+    assert result["is_error"] is True
+    content = result["content"].lower()
+    assert "coupe" in content or "section" in content
+    # Aucun mur ne doit avoir été créé en KG.
+    assert kg.count_by_type("Wall") == 0
+
+
+@projet4_available
+def test_dwg_inspect_accepts_section_with_kind_label():
+    """dwg_inspect reste read-only et tolérant — il retourne kind='section'
+    plutôt que de raise. Différence vs dwg_classify / dwg_import_walls."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_inspect",
+        {"file_path": str(PROJET4_COUPE1)},
+        "t1", kg,
+    )
+    assert result["is_error"] is False
+    payload = json.loads(result["content"])
+    assert payload["kind"] == "section"
+
+
+@projet4_available
 def test_projet4_coupe1_matches_plan_via_block_id():
     """Test structural — les IDs Revit changent au re-export du DXF
     (observé 2026-05-13 : passage de 255828/29/30/31 à 258141/258127/

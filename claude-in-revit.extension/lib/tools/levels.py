@@ -284,6 +284,122 @@ def create_floor_plan(
     }
 
 
+@tool(name="levels_create_many", tier=1)
+def create_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: list,
+    create_floor_plans: bool = True,
+) -> Dict[str, Any]:
+    """Crée N niveaux en **une seule** transaction Revit + KG.
+
+    Use case canonique : après `dwg_inspect_sections`, l'agent récupère
+    les niveaux extraits des coupes (0/3/6 m) et veut tous les créer
+    d'un coup. Ce tool évite N appels séparés à `levels_create`.
+
+    Transactionnel : si un item échoue (nom dupliqué, élévation invalide),
+    **aucun niveau** n'est commité.
+
+    Chaque item génère aussi son `FloorPlan ViewPlan` par défaut
+    (parallèle à `levels_create.create_floor_plan=True`).
+
+    Concepts: niveau, level, étage, batch, plusieurs, import, plan d'étage
+    Phrases: "crée tous les niveaux", "ajoute ces étages", "import niveaux
+             depuis coupe", "batch levels"
+    Similar: levels_create, levels_create_floor_plan, dwg_inspect_sections
+
+    Args:
+        items: liste de specs. Chaque entrée est un dict :
+            - `name` (str, requis) : nom du niveau.
+            - `elevation_m` (float, requis) : altitude en mètres.
+        create_floor_plans: si True (défaut), crée un FloorPlan par
+            niveau. Identique au `create_floor_plan` de `levels_create`.
+
+    Returns:
+        {"ok", "count", "llm_ids", "floor_plans_created": int,
+         "floor_plan_note": str | None}
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+
+    # Pré-validation : noms non vides + non-doublons (côté KG + interne au batch).
+    seen_names: set = set()
+    specs: list = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                "items[{}] must be a dict, got {}".format(i, type(item).__name__)
+            )
+        name = item.get("name")
+        elev = item.get("elevation_m")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("items[{}]: name required (non-empty str)".format(i))
+        if elev is None:
+            raise ValueError("items[{}]: elevation_m required".format(i))
+        name = name.strip()
+        if name in seen_names:
+            raise ValueError(
+                "items[{}]: duplicate name {!r} within batch".format(i, name)
+            )
+        if _name_collision(kg, name):
+            raise ValueError(
+                "items[{}]: name {!r} already exists in KG/Revit".format(i, name)
+            )
+        seen_names.add(name)
+        specs.append({"name": name, "elevation_m": float(elev)})
+
+    if doc is None:
+        llm_ids: list = []
+        for spec in specs:
+            llm_ids.append(_record_in_kg(
+                kg, name=spec["name"], elevation=spec["elevation_m"],
+            ))
+        return {
+            "ok": True,
+            "count": len(llm_ids),
+            "llm_ids": llm_ids,
+            "floor_plans_created": 0,
+            "floor_plan_note": "doc is None — no Revit views created (KG-only).",
+        }
+
+    from .. import kg_sync, revit_primitives as rp
+    from Autodesk.Revit.DB import Level
+
+    llm_ids: list = []
+    floor_plans_created = 0
+    floor_plan_note: Optional[str] = None
+    with rp.transaction(doc, "levels.create_many"):
+        for spec in specs:
+            elev_ft = rp.meters_to_internal(spec["elevation_m"])
+            level = Level.Create(doc, elev_ft)
+            level.Name = spec["name"]
+            revit_id = int(level.Id.Value)
+            llm_id = _record_in_kg(
+                kg, name=spec["name"], elevation=spec["elevation_m"],
+            )
+            kg.set_revit_id(llm_id, revit_id)
+            stamp_llm_id(level, llm_id)
+            kg_sync.refresh_node_from_revit(kg, doc, llm_id)
+            llm_ids.append(llm_id)
+            if create_floor_plans:
+                fp_id = _create_floor_plan_for_level(doc, level)
+                if fp_id is not None:
+                    floor_plans_created += 1
+                elif floor_plan_note is None:
+                    floor_plan_note = (
+                        "Aucun ViewFamilyType FloorPlan trouvé — plans d'étage "
+                        "non générés pour certains niveaux."
+                    )
+
+    return {
+        "ok": True,
+        "count": len(llm_ids),
+        "llm_ids": llm_ids,
+        "floor_plans_created": floor_plans_created,
+        "floor_plan_note": floor_plan_note,
+    }
+
+
 @tool(name="levels_set_elevation", tier=1)
 def set_elevation(
     kg: ProjectKG,
