@@ -36,6 +36,152 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .dwg_reader import DwgEntity
 
 
+# ----- Source detection (Étape 4 Phase 1) -------------------------------
+#
+# Identifie la convention de nommage des layers d'un DXF, pour appliquer
+# le bon dictionnaire de mapping aux étapes suivantes (find walls,
+# section markers, levels, etc.).
+#
+# Conventions supportées V0 :
+# - **AIA** (American Institute of Architects, US standard, ce que
+#   Revit exporte par défaut) : préfixe `<discipline>-<group>-<modifier>`
+#   où discipline ∈ {A, S, M, E, G, C, L, P, Q, T, V, X, Z}.
+#   Exemples : `A-WALL`, `A-FLOR-LEVL`, `G-ANNO-SYMB`, `S-COLS`.
+# - **ISO 13567** (International standard) : codes alphanumériques
+#   structurés courts, sans mots. Format type `A23G---N1` (agent +
+#   element + presentation + ...). Difficile à matcher strictement
+#   parce que beaucoup d'exports « ISO-style » divergent du standard
+#   strict. Heuristique : layer = courte (≤ 10 char), alpha+num
+#   uniquement, contient des digits, pas de mot reconnaissable.
+#
+# Extensible : ajouter une entry à `_SOURCE_DETECTORS` pour d'autres
+# conventions (ArchiCAD, BS1192, AllPlan, etc.).
+
+import re as _re
+
+_AIA_DISCIPLINES = "ASMEGCLPQTVXZ"
+_AIA_LAYER_RE = _re.compile(
+    r"^[" + _AIA_DISCIPLINES + r"]-[A-Z]{3,5}(-[A-Z0-9]+)*$",
+    _re.IGNORECASE,
+)
+# ISO 13567 strict serait `^[A-Z]\d{2}[A-Z]\d{2}[A-Z][A-Z0-9-]+$` mais
+# trop restrictif. Heuristique : court, alphanumérique, contient au moins
+# 1 digit, et pas un mot anglais/français reconnaissable.
+_ISO_LAYER_RE = _re.compile(r"^[A-Z0-9-]{4,10}$")
+_ISO_LAYER_HAS_DIGIT = _re.compile(r"\d")
+# Mots habituels qui révèlent une convention « parlée » (FR + EN) — pas
+# AIA ni ISO, mais une 3e convention « language-based ». Pour V0 on les
+# range dans `other` ; on raffinera si une 3e source devient pertinente.
+_LANGUAGE_LAYER_PATTERNS = [
+    _re.compile(p, _re.IGNORECASE) for p in (
+        r"^(mur|wall|cloison|paroi)",
+        r"^(fenetre|window|fen[êe]tre|vitrage)",
+        r"^(porte|door|ouverture)",
+        r"^(sol|floor|dalle|plancher|slab)",
+        r"^(plafond|ceiling)",
+        r"^(toit|toiture|roof)",
+    )
+]
+
+
+def _is_aia_layer(name: str) -> bool:
+    """True si le nom suit le pattern AIA `<lettre>-<group>(-<mod>)*`."""
+    return bool(_AIA_LAYER_RE.match(name))
+
+
+def _is_iso_layer(name: str) -> bool:
+    """True si le nom ressemble à un code ISO 13567 (alphanumérique court
+    avec au moins 1 digit, pas de mot reconnaissable).
+    """
+    if not _ISO_LAYER_RE.match(name):
+        return False
+    if not _ISO_LAYER_HAS_DIGIT.search(name):
+        return False
+    # Exclude layers that match a language pattern (e.g., "M3" alone is
+    # OK for ISO, but "MUR3" should not be ISO).
+    for pat in _LANGUAGE_LAYER_PATTERNS:
+        if pat.match(name):
+            return False
+    return True
+
+
+# Set de layers à ignorer pour le score (présents dans tous les DXF, peu
+# discriminants).
+_LAYER_NOISE = {"0", "Defpoints", "DEFPOINTS"}
+
+
+def identify_source(layers_meta: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Identifie la convention de nommage des layers du DXF.
+
+    Score = ratio de layers matching chaque convention. Le winner est
+    celui qui dépasse 50% (sinon `"other"`). Égalité → AIA prévaut
+    (plus précis comme contrainte de pattern).
+
+    Args:
+        layers_meta: la valeur de `meta["layers"]` retournée par
+            `dwg_reader.parse()`. Doit contenir au moins `name`.
+
+    Returns:
+        `{source: str, confidence: float, evidence: dict, layers: list}`
+        - `source` ∈ `"aia" | "iso" | "other"`.
+        - `confidence` : ratio de layers matching la convention winner.
+        - `evidence` : counts par convention + sample de layers
+          (caller-facing).
+    """
+    layer_names = [l["name"] for l in layers_meta if l.get("name")]
+    # Exclure les layers bruit pour le scoring.
+    significant = [n for n in layer_names if n not in _LAYER_NOISE]
+    if not significant:
+        return {
+            "source": "other",
+            "confidence": 0.0,
+            "evidence": {
+                "aia_count": 0, "iso_count": 0, "language_count": 0,
+                "total_significant": 0, "layers": layer_names,
+            },
+        }
+
+    aia_layers = [n for n in significant if _is_aia_layer(n)]
+    iso_layers = [n for n in significant if _is_iso_layer(n) and not _is_aia_layer(n)]
+    language_layers = [
+        n for n in significant
+        if any(pat.match(n) for pat in _LANGUAGE_LAYER_PATTERNS)
+    ]
+
+    n = len(significant)
+    aia_ratio = len(aia_layers) / n
+    iso_ratio = len(iso_layers) / n
+    language_ratio = len(language_layers) / n
+
+    # Winner : ratio > 0.5 et > autres.
+    if aia_ratio >= 0.5 and aia_ratio >= iso_ratio:
+        source = "aia"
+        confidence = aia_ratio
+    elif iso_ratio >= 0.5 and iso_ratio > aia_ratio:
+        source = "iso"
+        confidence = iso_ratio
+    else:
+        source = "other"
+        # Confidence est faible quand on ne reconnaît pas — prendre le
+        # max des 3 ratios comme indicateur de proximité.
+        confidence = max(aia_ratio, iso_ratio, language_ratio)
+
+    return {
+        "source": source,
+        "confidence": round(confidence, 3),
+        "evidence": {
+            "aia_count": len(aia_layers),
+            "iso_count": len(iso_layers),
+            "language_count": len(language_layers),
+            "total_significant": n,
+            "aia_sample": aia_layers[:5],
+            "iso_sample": iso_layers[:5],
+            "language_sample": language_layers[:5],
+            "all_layers": layer_names,
+        },
+    }
+
+
 # ----- Constantes de layer ----------------------------------------------
 
 LAYER_LEVELS = "A-FLOR-LEVL"

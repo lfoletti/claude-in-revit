@@ -702,6 +702,61 @@ def find_section_markers(
     }
 
 
+# ----- 5b. Identify source convention (Phase 1 Étape 4) -----------------
+
+
+@tool(name="dwg_identify_source", tier=2)
+def identify_source(
+    kg: ProjectKG,
+    file_path: str,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Identifie la convention de nommage des layers d'un DXF.
+
+    Étape 4 de la Phase 1 import projet. 2 conventions supportées V0 :
+
+    - **AIA** (American Institute of Architects, US standard) — c'est
+      ce que Revit exporte par défaut. Format `<discipline>-<group>-
+      <modifier>`, ex `A-WALL`, `G-ANNO-SYMB`.
+    - **ISO 13567** (International standard) — codes alphanumériques
+      courts, ex `A23G---N1`.
+    - **other** — fallback (conventions locales, ArchiCAD français,
+      BS1192, etc.). À enrichir plus tard si une 3e source devient
+      pertinente.
+
+    Le résultat permet ensuite à l'agent d'appliquer le bon dictionnaire
+    de mapping aux étapes 2, 5, etc. (find_section_markers utilise
+    actuellement `G-ANNO-SYMB`/`G-ANNO-SECT` qui sont AIA — pour ISO il
+    faudra adapter).
+
+    Concepts: dxf, source, nomenclature, convention, AIA, ISO, layer,
+              identification, phase 1, mapping
+    Phrases: "quelle convention de calques", "identify the layer source",
+             "AIA ou ISO ?", "détecte la source d'export"
+    Similar: dwg_inspect_sections, dwg_inspect, dwg_find_section_markers
+
+    Args:
+        file_path: chemin du DXF à analyser.
+        scale_override: voir `dwg_inspect`.
+
+    Returns:
+        {"ok": bool, "file": str, "source": str, "confidence": float,
+         "evidence": {aia_count, iso_count, language_count, samples, ...}}
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError("File not found: {}".format(path))
+    _, meta = dwg_reader.parse(path, scale_override=scale_override)
+    detection = dwg_section_reader.identify_source(meta["layers"])
+    return {
+        "ok": True,
+        "file": str(path),
+        "source": detection["source"],
+        "confidence": detection["confidence"],
+        "evidence": detection["evidence"],
+    }
+
+
 # ----- 6. Verify section scale (Phase 1 Étape 3) ------------------------
 
 

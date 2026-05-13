@@ -26,11 +26,26 @@ from lib.dwg_section_reader import (
     SectionOpening,
     classify_dxf,
     find_section_markers,
+    identify_source,
     match_openings,
     parse_block_dimensions,
     parse_block_id,
     read_levels,
     read_section_openings,
+)
+
+
+# ----- Projet4 marker (defined here so all sections can use @projet4_available) ----
+
+
+PROJET4_DIR = Path(r"C:\Users\lauro\Documents\IT\claude-in-revit-projects\DXF")
+PROJET4_PLAN = PROJET4_DIR / "Projet4 - Plan d'étage - Niveau 0.dxf"
+PROJET4_COUPE1 = PROJET4_DIR / "Projet4 - Coupe - Coupe 1.dxf"
+PROJET4_COUPE2 = PROJET4_DIR / "Projet4 - Coupe - Coupe 2.dxf"
+
+projet4_available = pytest.mark.skipif(
+    not PROJET4_COUPE1.exists(),
+    reason="Projet4 DXF fixtures not present on this machine",
 )
 
 
@@ -454,6 +469,100 @@ def test_find_section_markers_returns_empty_when_no_g_anno_layer(tmp_path):
     assert markers == []
 
 
+# ----- identify_source --------------------------------------------------
+
+
+def test_identify_source_aia_via_revit_export(tmp_path):
+    """Set de layers AIA standard → source='aia' confiance haute."""
+    layers_meta = [
+        {"name": "0"},
+        {"name": "A-WALL"},
+        {"name": "A-GLAZ"},
+        {"name": "A-GLAZ-SILL"},
+        {"name": "A-AREA-IDEN"},
+        {"name": "G-ANNO-SYMB"},
+        {"name": "Defpoints"},
+    ]
+    result = identify_source(layers_meta)
+    assert result["source"] == "aia"
+    assert result["confidence"] >= 0.9  # 5 / 5 significant layers match
+    assert "A-WALL" in result["evidence"]["aia_sample"]
+
+
+def test_identify_source_iso_via_short_codes():
+    """Layers ISO 13567 style → source='iso'."""
+    layers_meta = [
+        {"name": "0"},
+        {"name": "A23G1N1"},
+        {"name": "A11G2N1"},
+        {"name": "S15G1"},
+        {"name": "G99A2"},
+    ]
+    result = identify_source(layers_meta)
+    assert result["source"] == "iso"
+
+
+def test_identify_source_other_when_language_based():
+    """Layers en français/anglais ≠ AIA/ISO → source='other'."""
+    layers_meta = [
+        {"name": "0"},
+        {"name": "Mur_Exterieur"},
+        {"name": "Fenetre_Nord"},
+        {"name": "Porte_Interieure"},
+    ]
+    result = identify_source(layers_meta)
+    assert result["source"] == "other"
+    # Pas un strict 0 — language_count > 0.
+    assert result["evidence"]["language_count"] >= 3
+
+
+def test_identify_source_ignores_noise_layers():
+    """`0`, `Defpoints` ne comptent pas dans le ratio."""
+    layers_meta = [
+        {"name": "0"},
+        {"name": "Defpoints"},
+        {"name": "A-WALL"},  # 1 significant AIA
+    ]
+    result = identify_source(layers_meta)
+    assert result["source"] == "aia"
+    assert result["confidence"] == 1.0
+    assert result["evidence"]["total_significant"] == 1
+
+
+def test_identify_source_empty_returns_other():
+    result = identify_source([])
+    assert result["source"] == "other"
+    assert result["confidence"] == 0.0
+
+
+@projet4_available
+def test_identify_source_projet4_returns_aia():
+    """Projet4 = export Revit → convention AIA stricte."""
+    from lib import dwg_reader as _dr
+    _, meta = _dr.parse(PROJET4_PLAN)
+    result = identify_source(meta["layers"])
+    assert result["source"] == "aia"
+
+
+@projet4_available
+def test_identify_source_via_tool():
+    """Roundtrip via dispatcher : dwg_identify_source."""
+    from lib import llm_protocol
+    import json
+    llm_protocol.reset_registry()
+    llm_protocol.get_registry()
+    from lib.project_kg import ProjectKG
+    kg = ProjectKG("p")
+    kg.advance_turn()
+    result = llm_protocol.dispatch_tool_use(
+        "dwg_identify_source", {"file_path": str(PROJET4_PLAN)}, "t1", kg,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["source"] == "aia"
+    assert payload["confidence"] >= 0.5
+
+
 # ----- dwg_verify_section_scale (synthetic) ----------------------------
 
 
@@ -546,17 +655,6 @@ def test_verify_scale_unit_mismatch_flagged(tmp_path):
 
 
 # ----- Integration : DXF réels Projet4 (skip si absents) ---------------
-
-
-PROJET4_DIR = Path(r"C:\Users\lauro\Documents\IT\claude-in-revit-projects\DXF")
-PROJET4_PLAN = PROJET4_DIR / "Projet4 - Plan d'étage - Niveau 0.dxf"
-PROJET4_COUPE1 = PROJET4_DIR / "Projet4 - Coupe - Coupe 1.dxf"
-PROJET4_COUPE2 = PROJET4_DIR / "Projet4 - Coupe - Coupe 2.dxf"
-
-projet4_available = pytest.mark.skipif(
-    not PROJET4_COUPE1.exists(),
-    reason="Projet4 DXF fixtures not present on this machine",
-)
 
 
 @projet4_available
