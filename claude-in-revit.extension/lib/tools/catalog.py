@@ -295,16 +295,32 @@ def list_elevation_views(kg: ProjectKG, doc: Any = None) -> Dict[str, List[Dict[
         FilteredElementCollector, View, ViewType,
     )
 
-    # Map direction vector → cardinal label (closest match).
+    # **Priorité au NAME** (plus fiable que ViewDirection dont la
+    # convention de signe est ambiguë dans la doc Revit) :
+    # 1. Parse le nom de la vue pour "Est" / "Nord" / "Sud" / "Ouest"
+    #    (avec "Ouest" testé AVANT "Est" car "est" est substring).
+    # 2. Fallback : closest match de ViewDirection avec les 4 cardinaux.
+    # 3. Si rien : direction=None, l'agent peut quand même utiliser
+    #    le revit_id mais devra mapper manuellement.
+    name_aliases = (
+        ("Ouest", ("ouest", "west")),
+        ("Nord", ("nord", "north")),
+        ("Sud", ("sud", "south")),
+        ("Est", ("est", "east")),
+    )
+
+    # Map ViewDirection vector → cardinal label (fallback uniquement).
+    # Note : Revit ViewDirection est ambiguë selon la version/source.
+    # On tente les 2 conventions (look direction vs toward viewer).
     direction_map = [
-        ("Sud", (0.0, 1.0, 0.0)),
-        ("Nord", (0.0, -1.0, 0.0)),
+        # Try both signs — caller-side match is by name, this is fallback.
         ("Est", (-1.0, 0.0, 0.0)),
         ("Ouest", (1.0, 0.0, 0.0)),
+        ("Nord", (0.0, -1.0, 0.0)),
+        ("Sud", (0.0, 1.0, 0.0)),
     ]
 
     def closest_direction(vd_x: float, vd_y: float, vd_z: float) -> Optional[str]:
-        # Find the cardinal direction whose unit vector best matches.
         best = None
         best_dot = -2.0
         for label, vec in direction_map:
@@ -312,7 +328,6 @@ def list_elevation_views(kg: ProjectKG, doc: Any = None) -> Dict[str, List[Dict[
             if dot > best_dot:
                 best_dot = dot
                 best = label
-        # Reject if even the best match is barely positive (non-cardinal).
         return best if best_dot > 0.7 else None
 
     for v in FilteredElementCollector(doc).OfClass(View):
@@ -321,19 +336,16 @@ def list_elevation_views(kg: ProjectKG, doc: Any = None) -> Dict[str, List[Dict[
         if v.ViewType != ViewType.Elevation:
             continue
         vd = v.ViewDirection
-        cardinal = closest_direction(vd.X, vd.Y, vd.Z)
-        # Fallback : try parsing from view name.
+        # 1. Name-based primary detection (most reliable for default views).
+        cardinal = None
+        name_lower = (v.Name or "").lower()
+        for d, aliases in name_aliases:
+            if any(a in name_lower for a in aliases):
+                cardinal = d
+                break
+        # 2. Fallback : ViewDirection vector match.
         if cardinal is None:
-            name_lower = (v.Name or "").lower()
-            for d, aliases in (
-                ("Sud", ("sud", "south")),
-                ("Nord", ("nord", "north")),
-                ("Est", ("est", "east")),
-                ("Ouest", ("ouest", "west")),
-            ):
-                if any(a in name_lower for a in aliases):
-                    cardinal = d
-                    break
+            cardinal = closest_direction(vd.X, vd.Y, vd.Z)
         out.append({
             "revit_id": int(v.Id.Value),
             "name": v.Name,
