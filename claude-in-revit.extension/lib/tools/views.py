@@ -36,7 +36,6 @@ def create_section(
     bottom_elev_m: float = 0.0,
     top_elev_m: float = 6.0,
     far_clip_m: float = 20.0,
-    near_clip_m: float = 1.0,
     height_buffer_m: float = 1.0,
 ) -> Dict[str, Any]:
     """Crée une vue ViewSection Revit le long du trait de coupe spécifié.
@@ -84,8 +83,7 @@ def create_section(
     bounds = compute_section_view_bounds(
         p1_m, p2_m, view_dir,
         bottom_elev_m=bottom_elev_m, top_elev_m=top_elev_m,
-        far_clip_m=far_clip_m, near_clip_m=near_clip_m,
-        height_buffer_m=height_buffer_m,
+        far_clip_m=far_clip_m, height_buffer_m=height_buffer_m,
     )
 
     if doc is None:

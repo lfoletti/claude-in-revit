@@ -80,10 +80,19 @@ def compute_section_view_bounds(
     bottom_elev_m: float = 0.0,
     top_elev_m: float = 6.0,
     far_clip_m: float = 20.0,
-    near_clip_m: float = 1.0,
     height_buffer_m: float = 1.0,
 ) -> SectionViewBounds:
     """Calcule le Transform + BBox pour `ViewSection.CreateSection`.
+
+    **Convention BBox Revit** (cf. Building Coder + RevitAPI docs) :
+    - `Max.Z` (local) = plan de coupe (= position du trait dans le plan).
+      Doit être 0 puisque l'Origin est sur le trait.
+    - `Min.Z` (local) = fond de la vue = `-far_clip_m` (profondeur
+      dans le sens du regard, opposé à BasisZ).
+    - Pas de « near_clip » : le trait EST le plan de coupe, rien
+      n'est visible côté viewer. Bug initial reporté runtime
+      2026-05-13 (« plan de coupe et fond inversés ») corrigé en
+      passant de `Max.Z=+near_clip` à `Max.Z=0`.
 
     Args:
         p1_m, p2_m: les 2 endpoints du trait de coupe dans le plan,
@@ -94,10 +103,9 @@ def compute_section_view_bounds(
         bottom_elev_m: élévation du bas de la vue (default 0, niveau
             sol).
         top_elev_m: élévation du haut de la vue (default 6 m).
-        far_clip_m: profondeur du clip arrière (default 20 m — typique
-            pour traverser un bâtiment de bord en bord).
-        near_clip_m: profondeur du clip avant (default 1 m — léger
-            offset devant le plan de coupe).
+        far_clip_m: profondeur du clip arrière dans le sens du regard
+            (default 20 m — typique pour traverser un bâtiment de bord
+            en bord).
         height_buffer_m: marge au-dessus du top_elev_m pour inclure
             toiture / parapet (default 1 m).
 
@@ -145,15 +153,15 @@ def compute_section_view_bounds(
     basis_x = _cross(basis_y, basis_z)
     basis_x = _normalize(basis_x)
 
-    # BBox en repère LOCAL, symétrique autour d'Origin :
+    # BBox en repère LOCAL, symétrique en X/Y autour d'Origin :
     # X: ±half-section-length (le long de la section line).
     # Y: ±half_height (vertical, centré sur center_z = milieu élévation).
-    # Z: de -far_clip à 0 (Max.Z = 0 = plan de coupe ; négatif = profondeur
-    #    dans le sens du regard ; +near_clip permis pour inclure la surface
-    #    juste derrière le plan de coupe).
+    # Z: [-far_clip_m, 0] où Max.Z = 0 = plan de coupe (= trait dans le
+    #    plan), et Min.Z = -far_clip_m = fond de la vue (profondeur dans
+    #    le sens du regard, dans la direction opposée à BasisZ).
     half_len = section_length / 2.0
     bbox_min = (-half_len, -half_height, -far_clip_m)
-    bbox_max = (half_len, half_height, near_clip_m)
+    bbox_max = (half_len, half_height, 0.0)
 
     return SectionViewBounds(
         origin_m=origin,

@@ -83,16 +83,16 @@ def test_vertical_section_view_left():
 
 
 def test_bbox_dimensions_match_section_length_and_height():
-    """BBox symétrique autour d'Origin (convention Revit).
+    """BBox symétrique en X/Y autour d'Origin, Max.Z=0 (cut plane).
 
     Total height = top - bottom + buffer = 7m → half = 3.5m.
     Origin.Z = bottom + half = 0 + 3.5 = 3.5 (centre vertical).
-    BBox Y local = ±3.5 (symétrique).
+    Z range : [-far_clip, 0] = [-20, 0] (pas de near_clip côté viewer).
     """
     r = compute_section_view_bounds(
         [0, 0], [10, 0], "down",
         bottom_elev_m=0.0, top_elev_m=6.0, height_buffer_m=1.0,
-        far_clip_m=20.0, near_clip_m=1.0,
+        far_clip_m=20.0,
     )
     # X span = section length 10m → half-length each side.
     assert r.bbox_min_m[0] == pytest.approx(-5.0)
@@ -100,11 +100,23 @@ def test_bbox_dimensions_match_section_length_and_height():
     # Y span symétrique : ±3.5.
     assert r.bbox_min_m[1] == pytest.approx(-3.5)
     assert r.bbox_max_m[1] == pytest.approx(3.5)
-    # Z span = -far_clip to +near_clip.
+    # Z span = [-far_clip, 0] : cut plane à Max.Z=0, fond à Min.Z=-20.
     assert r.bbox_min_m[2] == pytest.approx(-20.0)
-    assert r.bbox_max_m[2] == pytest.approx(1.0)
+    assert r.bbox_max_m[2] == pytest.approx(0.0)
     # Origin.Z = centre vertical (3.5m above ground).
     assert r.origin_m[2] == pytest.approx(3.5)
+
+
+def test_max_z_is_cut_plane_at_zero():
+    """Revit convention : Max.Z (local) = plan de coupe = 0 (à l'Origin).
+
+    Rien ne doit être visible côté viewer (Z > 0). C'est le fix runtime
+    2026-05-13 : avant, Max.Z=+1m plaçait le cut plane 1m offset du
+    trait → user voyait coupe et fond inversés.
+    """
+    r = compute_section_view_bounds([0, 0], [5, 0], "down", far_clip_m=15.0)
+    assert r.bbox_max_m[2] == 0.0
+    assert r.bbox_min_m[2] == -15.0
 
 
 def test_section_length_computed():
