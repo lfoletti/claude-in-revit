@@ -272,8 +272,14 @@ def test_vote_opening_in_elevation_yes_with_linteau():
 
 @p7_available
 def test_p7_sud_elevation_votes_yes_for_south_exterior_wall():
-    """Sur P7, le mur extérieur Sud (y=-1.17) doit voter yes confiance 1
-    depuis l'élévation Sud."""
+    """Sur P7, le mur extérieur Sud (y=-1.17, horizontal E-W) doit voter
+    yes depuis l'élévation Sud.
+
+    Note V3.2 : confidence ajustée à 0.3 (les dalles aux niveaux sont
+    désormais exclues du compte overlap_h, ce qui réduit la confidence
+    par rapport à V2). Reste yes parce que overlap_v (côtés latéraux du
+    mur) demeure positif.
+    """
     from pathlib import Path
     from lib.dwg_reader import parse
     for f in Path(P7_DIR).glob("*Sud*.dxf"):
@@ -283,6 +289,6 @@ def test_p7_sud_elevation_votes_yes_for_south_exterior_wall():
             (-9.49, -1.17), (-5.36, -1.17), 0.0, 3.0, ev,
         )
         assert v.answer is True
-        assert v.confidence >= 0.9
+        assert v.confidence >= 0.3
         return
     pytest.skip("Élévation Sud not found in P7")

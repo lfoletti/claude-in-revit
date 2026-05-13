@@ -781,6 +781,91 @@ def merge_fragments_via_elevation_vote(
     return current, events
 
 
+# ----- V3.1 — Filtre faux positifs murs via vote élévation -----------
+
+
+def filter_walls_via_elevation_vote(
+    walls: List[Any],
+    elevations: Dict[str, Any],
+    level_elevation_m: float,
+    height_m: float,
+    *,
+    min_yes_confidence: float = 0.4,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Filtre les `WallCandidate` faux positifs : paires parallèles que
+    le classifier détecte mais qui ne correspondent pas à un vrai mur
+    (joints, changements de matériau, hachures à motifs parallèles).
+
+    Critère **prudent** :
+    - Garde si **au moins une** élévation vote yes avec confiance ≥
+      `min_yes_confidence` (présence confirmée).
+    - Garde si **toutes** les élévations s'abstiennent (mur projeté hors
+      des 4 bboxes → typiquement mur intérieur invisible aux faces,
+      doute en faveur du mur).
+    - **Exclut** si au moins une vote no ET aucune ne vote yes confiant
+      (l'élévation devrait montrer ce mur mais ne le voit pas → faux
+      positif probable).
+
+    Pour les murs intérieurs (qui apparaissent souvent dans la silhouette
+    horizontale des élévations latérales — overlap_h > 0 vote yes), le
+    critère premier (≥ 1 yes confident) protège. Pour les vrais faux
+    positifs (par ex. hachures sur une terrasse), aucune élévation ne
+    montrera de structure verticale ou horizontale alignée → exclus.
+
+    Args:
+        walls: liste de `WallCandidate` ou `MergedWall`.
+        elevations: dict `{direction: ElevationView}`.
+        level_elevation_m / height_m: cf. `vote_wall_visible_in_elevation`.
+        min_yes_confidence: seuil pour qu'un yes compte (défaut 0.4).
+
+    Returns:
+        `(kept, removed_with_evidence)`. `removed` est une liste de
+        dicts `{wall_p1, wall_p2, thickness, votes_summary}` pour
+        traçabilité du rapport agent.
+    """
+    from .dwg_elevation_reader import vote_wall_visible_in_elevation
+    from .dwg_voting import aggregate_votes
+
+    if not elevations:
+        # Pas d'élévations → on ne peut pas filtrer, on garde tout.
+        return list(walls), []
+
+    kept: List[Any] = []
+    removed: List[Dict[str, Any]] = []
+    for w in walls:
+        votes = []
+        for direction, ev in elevations.items():
+            v = vote_wall_visible_in_elevation(
+                w.p1, w.p2, level_elevation_m, height_m, ev,
+            )
+            votes.append(v)
+
+        has_yes_confident = any(
+            v.answer is True and v.confidence >= min_yes_confidence
+            for v in votes
+        )
+        all_abstain = all(v.answer is None for v in votes)
+        any_no = any(v.answer is False for v in votes)
+
+        if has_yes_confident or all_abstain:
+            kept.append(w)
+            continue
+        if any_no:
+            removed.append({
+                "wall_p1": list(w.p1),
+                "wall_p2": list(w.p2),
+                "thickness_m": round(w.thickness, 4),
+                "votes": [
+                    {"source": v.source, "answer": v.answer,
+                     "confidence": round(v.confidence, 3)}
+                    for v in votes
+                ],
+            })
+            continue
+        kept.append(w)
+    return kept, removed
+
+
 # ----- V2.1 — Fusion collinéaires (post-classify, pré-pipeline) -------
 
 

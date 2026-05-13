@@ -3178,6 +3178,25 @@ def create_continuous_walls_many(
         total_fusion_events += len(events)
         fusion_events_detail.extend(events)
 
+    # --- 3bis. Filtre faux positifs via vote élévation (V3.1) ----------
+    # User runtime P7 : « l'élévation n'indique aucun mur, alors que
+    # trois murs ont été modélisés ». Le classifier détecte des paires
+    # parallèles qui ne sont pas des vrais murs (joints, hachures,
+    # changements de matériau). On les filtre si les élévations les
+    # voient mais votent no — i.e. le DXF élévation est cohérent et
+    # contredit la présence du mur.
+    total_walls_filtered = 0
+    filtered_walls_detail: List[Dict[str, Any]] = []
+    for pr in plan_records:
+        level_elev = level_elev_by_ref[pr["item"]["level_ref"]]
+        height_m = float(pr["item"].get("height_m") or 3.0)
+        kept, removed = dwg_plan_openings.filter_walls_via_elevation_vote(
+            pr["walls"], elevations, level_elev, height_m,
+        )
+        pr["walls"] = kept
+        total_walls_filtered += len(removed)
+        filtered_walls_detail.extend(removed)
+
     # --- 4. Dédup thicknesses + get_or_create types ---------------------
     seen_buckets: Set[int] = set()
     unique_thicknesses_m: List[float] = []
@@ -3261,6 +3280,8 @@ def create_continuous_walls_many(
         "walls_per_file": walls_per_file,
         "fusion_events": total_fusion_events,
         "fusion_events_detail": fusion_events_detail[:20],  # truncate
+        "walls_filtered_via_vote": total_walls_filtered,
+        "filtered_walls_detail": filtered_walls_detail[:20],
         "types_created": types_result["created_count"],
         "types_reused": types_result["reused_count"],
         "types": types_result["types"],

@@ -215,19 +215,49 @@ def vote_wall_visible_in_elevation(
             elev_x_range=[bx_min, bx_max],
         )
 
-    # Cherche des A-WALL lines dans la zone projetée.
-    overlap_h = 0.0  # somme des longueurs des lignes horizontales chevauchant x_range
-    overlap_v = 0.0  # somme des longueurs des lignes verticales dans x_range
+    # **Restriction par orientation** (V3.2) : une élévation ne « voit »
+    # de face qu'un mur perpendiculaire à sa direction de regard. Un mur
+    # E-W (horizontal au plan) est vu de face par les élévations Nord/Sud
+    # uniquement. Un mur N-S (vertical au plan) par Est/Ouest. Les
+    # autres élévations le voient « de profil » (= juste un trait fin
+    # de l'épaisseur, signal très faible) — on les fait s'abstenir.
+    # Bug runtime P7 session t : sans cette restriction, les dalles
+    # horizontales (lignes A-WALL aux Y des niveaux) donnaient un faux
+    # vote yes pour des murs intérieurs vus en silhouette latérale.
+    wall_dx_world = wall_p2[0] - wall_p1[0]
+    wall_dy_world = wall_p2[1] - wall_p1[1]
+    wall_is_ew = abs(wall_dx_world) > abs(wall_dy_world)
+    wall_is_ns = not wall_is_ew
+    relevant = (
+        (elevation.direction in ("Nord", "Sud") and wall_is_ew)
+        or (elevation.direction in ("Est", "Ouest") and wall_is_ns)
+    )
+    if not relevant:
+        return abstain(
+            "elevation_{}".format(elevation.direction),
+            reason="elevation views wall from the side (not perpendicular)",
+        )
+
+    # Cherche des A-WALL lines dans la zone projetée. **Exclure** les
+    # lignes horizontales alignées avec les niveaux (= dalles).
+    level_tol_m = 0.10
+    overlap_h = 0.0
+    overlap_v = 0.0
     h_lines_count = 0
     v_lines_count = 0
     for line in elevation.a_wall_lines:
         x_l, x_r = sorted((line.p1[0], line.p2[0]))
         y_l, y_h = sorted((line.p1[1], line.p2[1]))
-        # Filter par y_range (la ligne doit toucher le rectangle y).
         if y_h < y_min_w - 1e-3 or y_l > y_max_w + 1e-3:
             continue
         if line.is_horizontal:
-            # Overlap horizontal avec x_range.
+            y_line = (y_l + y_h) / 2.0
+            is_floor_line = any(
+                abs(y_line - lv) <= level_tol_m
+                for lv in elevation.levels_y
+            )
+            if is_floor_line:
+                continue
             ov = max(0.0, min(x_max_w, x_r) - max(x_min_w, x_l))
             if ov > 0:
                 overlap_h += ov
