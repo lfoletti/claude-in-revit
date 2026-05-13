@@ -2472,15 +2472,9 @@ def add_openings_to_walls_many(
         elev = level_elev_by_id[lvl_ref]
         walls_by_level.setdefault(elev, []).append((nid, node))
 
-    # 6. FamilyType auto-detection.
-    if door_family_type_ref is None:
-        door_family_type_ref = _find_default_family_type(kg, "Doors")
-    if window_family_type_ref is None:
-        window_family_type_ref = _find_default_family_type(kg, "Windows")
-
-    # 7. Pour chaque opening, vote orientation + trouve host wall.
-    door_items: List[Dict[str, Any]] = []
-    window_items: List[Dict[str, Any]] = []
+    # 6. Première passe : pour chaque opening, vote orientation, classify
+    # door/window, find host wall, accumule (kind, w, h) pour bulk types.
+    pending_openings: List[Dict[str, Any]] = []  # [{co, host_ref, hp1, hp2, kind, w, h}]
     orphan_count = 0
     unmatched_count = 0
     orientation_stats = {"EW": 0, "NS": 0, "unknown": 0}
@@ -2493,7 +2487,6 @@ def add_openings_to_walls_many(
             unmatched_count += 1
             continue
 
-        # Vote orientation.
         orientation, _ev = dwg_plan_openings.vote_opening_orientation_via_elevations(
             opening_xy, sill_m, height_m, width_m, elevations,
         )
@@ -2502,7 +2495,6 @@ def add_openings_to_walls_many(
         else:
             orientation_stats[orientation] += 1
 
-        # Find host wall.
         candidate_walls = walls_by_level.get(co["level_elevation_m"], [])
         best_host = None
         best_perp = float("inf")
@@ -2516,7 +2508,6 @@ def add_openings_to_walls_many(
             dx, dy = wp2[0] - wp1[0], wp2[1] - wp1[1]
             wall_is_ew = abs(dx) > abs(dy)
             wall_orient = "EW" if wall_is_ew else "NS"
-            # Restrict par orientation si déterminée.
             if orientation is not None and wall_orient != orientation:
                 continue
             thick = float(wnode.get("thickness", 0.20))
@@ -2536,40 +2527,83 @@ def add_openings_to_walls_many(
         if best_host is None:
             orphan_count += 1
             continue
-
-        host_ref, hp1, hp2, hthick = best_host
+        host_ref, hp1, hp2, _ = best_host
         kind = dwg_plan_openings.classify_opening_kind(sill_m, height_m)
         if kind == "unknown":
             unmatched_count += 1
             continue
+        pending_openings.append({
+            "co": co,
+            "host_ref": host_ref,
+            "hp1": hp1, "hp2": hp2,
+            "kind": kind,
+            "width_m": float(width_m),
+            "height_m": float(height_m),
+            "sill_m": sill_m,
+            "opening_xy": opening_xy,
+        })
 
-        # Project position sur centerline du mur hôte.
-        proj_pos = dwg_plan_openings.project_pos_onto_wall_centerline(
-            opening_xy, hp1, hp2,
+    # 7. Bulk get_or_create types custom (DXF_WIN_WxH / DXF_DOOR_WxH).
+    from .. import llm_protocol
+    registry = llm_protocol.get_registry()
+    opening_type_entry = registry.get("openings_get_or_create_dxf_type_many")
+    types_result = {"types": [], "created_count": 0, "reused_count": 0}
+    if pending_openings and opening_type_entry is not None:
+        type_items = [
+            {"kind": po["kind"], "width_m": po["width_m"], "height_m": po["height_m"]}
+            for po in pending_openings
+        ]
+        types_result = opening_type_entry.fn(
+            kg=kg, doc=doc, items=type_items,
         )
-        family_ref = (
-            door_family_type_ref if kind == "door"
-            else window_family_type_ref
+    # Build mapping (kind, w_cm, h_cm) → llm_id.
+    type_ref_by_dims: Dict[Tuple[str, int, int], str] = {}
+    for t in types_result["types"]:
+        key = (
+            t["kind"],
+            int(round(t["width_m"] * 100)),
+            int(round(t["height_m"] * 100)),
         )
-        if family_ref is None:
+        type_ref_by_dims[key] = t["llm_id"]
+
+    # Fallback overrides utilisateur (si pas DXF custom dispo).
+    if door_family_type_ref is None:
+        door_family_type_ref = _find_default_family_type(kg, "Doors")
+    if window_family_type_ref is None:
+        window_family_type_ref = _find_default_family_type(kg, "Windows")
+
+    # 8. Build opening items avec types custom.
+    door_items: List[Dict[str, Any]] = []
+    window_items: List[Dict[str, Any]] = []
+    for po in pending_openings:
+        w_cm = int(round(po["width_m"] * 100))
+        h_cm = int(round(po["height_m"] * 100))
+        type_ref = type_ref_by_dims.get((po["kind"], w_cm, h_cm))
+        if type_ref is None:
+            # Fallback générique.
+            type_ref = (
+                door_family_type_ref if po["kind"] == "door"
+                else window_family_type_ref
+            )
+        if type_ref is None:
             unmatched_count += 1
             continue
-
+        proj_pos = dwg_plan_openings.project_pos_onto_wall_centerline(
+            po["opening_xy"], po["hp1"], po["hp2"],
+        )
         item = {
-            "kind": kind,
-            "host_wall_ref": host_ref,
-            "family_type_ref": family_ref,
+            "kind": po["kind"],
+            "host_wall_ref": po["host_ref"],
+            "family_type_ref": type_ref,
             "position": [proj_pos[0], proj_pos[1]],
-            "sill_height": sill_m,
+            "sill_height": po["sill_m"],
         }
-        if kind == "door":
+        if po["kind"] == "door":
             door_items.append(item)
         else:
             window_items.append(item)
 
-    # 8. Crée openings.
-    from .. import llm_protocol
-    registry = llm_protocol.get_registry()
+    # 9. Crée openings via openings_create_many.
     openings_entry = registry.get("openings_create_many")
     all_items = door_items + window_items
     if all_items and openings_entry is not None:
@@ -2578,11 +2612,13 @@ def add_openings_to_walls_many(
         inner = None
 
     note = (
-        "Phase 2b : {} portes + {} fenêtres hostées via vote orientation. "
-        "{} orphelins (pas de mur hôte trouvé), {} non matchés "
-        "(sill/height/family manquant). Orientations : EW={}, NS={}, "
+        "Phase 2b : {} portes + {} fenêtres hostées via vote orientation, "
+        "{} types DXF custom créés / {} réutilisés. {} orphelins (pas de "
+        "mur hôte trouvé), {} non matchés. Orientations : EW={}, NS={}, "
         "unknown={}".format(
-            len(door_items), len(window_items), orphan_count, unmatched_count,
+            len(door_items), len(window_items),
+            types_result["created_count"], types_result["reused_count"],
+            orphan_count, unmatched_count,
             orientation_stats["EW"], orientation_stats["NS"],
             orientation_stats["unknown"],
         )
@@ -2596,6 +2632,9 @@ def add_openings_to_walls_many(
         "openings_orphan": orphan_count,
         "openings_unmatched": unmatched_count,
         "orientation_stats": orientation_stats,
+        "opening_types_created": types_result["created_count"],
+        "opening_types_reused": types_result["reused_count"],
+        "opening_types": types_result["types"],
         "inner_openings": inner,
         "note": note,
     }

@@ -268,6 +268,343 @@ def _create_opening_revit_path(
 # ----- Tools -------------------------------------------------------------
 
 
+# ----- DXF custom opening type creation (Phase 2b) ---------------------
+#
+# Pour les openings importés depuis DXF avec des dimensions variables
+# (W × H), on crée des FamilyType custom à dimensionnement précis :
+# - `DXF_WIN_<Wcm>x<Hcm>cm` pour les fenêtres
+# - `DXF_DOOR_<Wcm>x<Hcm>cm` pour les portes
+#
+# Pattern analogue à walls_get_or_create_dxf_type. Duplique un
+# FamilySymbol existant, ajuste Width/Height via BuiltInParameter,
+# active le nouveau type. Idempotent par lookup KG sur le nom.
+
+
+def _dxf_opening_type_name(
+    kind: str, width_m: float, height_m: float, *, bucket_cm: int = 1,
+) -> str:
+    """Nom canonique : `DXF_WIN_60x95cm` ou `DXF_DOOR_80x210cm`."""
+    if kind not in ("door", "window"):
+        raise ValueError("kind must be 'door' or 'window'")
+    w_cm = int(round(width_m * 100 / bucket_cm)) * bucket_cm
+    h_cm = int(round(height_m * 100 / bucket_cm)) * bucket_cm
+    prefix = "DXF_DOOR_" if kind == "door" else "DXF_WIN_"
+    return "{}{}x{}cm".format(prefix, w_cm, h_cm)
+
+
+def _find_dxf_opening_type_in_kg(
+    kg: ProjectKG, target_name: str, category: str,
+) -> Optional[str]:
+    """Cherche un FamilyType vivant nommé `target_name` dans la
+    catégorie donnée (Doors/Windows). Retourne llm_id ou None."""
+    for nid in kg.find_by_type("FamilyType"):
+        node = kg.get_node(nid)
+        if node.get("deleted_at_turn") is not None:
+            continue
+        if node.get("category") != category:
+            continue
+        # Le KG stocke `type_name` (cf. _column_type_to_attrs pattern).
+        if node.get("type_name") == target_name:
+            return nid
+    return None
+
+
+def _validate_or_drop_stale_opening_binding(
+    kg: ProjectKG, doc: Any, llm_id: str,
+) -> bool:
+    """Valide qu'un FamilyType node KG pointe encore sur un FamilySymbol
+    vivant en Revit. Pattern analogue à walls. Bug runtime DXF type
+    stale → ArgumentException."""
+    if doc is None:
+        return True
+    revit_id_raw = kg.get_revit_id(llm_id)
+    if revit_id_raw is None:
+        kg.soft_delete(llm_id)
+        return False
+    from Autodesk.Revit.DB import ElementId
+    elem = doc.GetElement(ElementId(revit_id_raw))
+    if elem is None:
+        kg.soft_delete(llm_id)
+        return False
+    return True
+
+
+def _find_base_opening_family_symbol(doc: Any, category: str) -> Any:
+    """Trouve un FamilySymbol simple à dupliquer dans la catégorie.
+
+    Préférence : le 1er FamilySymbol disponible (sans complication
+    poignée / variante). User changera après import si type complexe.
+    """
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInCategory, FilteredElementCollector, FamilySymbol
+    cat_map = {
+        "Doors": BuiltInCategory.OST_Doors,
+        "Windows": BuiltInCategory.OST_Windows,
+    }
+    bic = cat_map.get(category)
+    if bic is None:
+        return None
+    coll = FilteredElementCollector(doc).OfCategory(bic).WhereElementIsElementType()
+    for el in coll:
+        try:
+            if isinstance(el, FamilySymbol):
+                return el
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _create_dxf_opening_type_in_revit(
+    doc: Any, base_sym: Any, target_name: str,
+    width_m: float, height_m: float, kind: str,
+) -> int:
+    """Duplique un FamilySymbol et ajuste Width/Height.
+
+    Doit être appelé dans une `rp.transaction`. Active le nouveau type
+    (sinon NewFamilyInstance plus tard refusera).
+
+    Ajustement params :
+    - Windows : BuiltInParameter.WINDOW_WIDTH / WINDOW_HEIGHT, fallback
+      FAMILY_WIDTH_PARAM / FAMILY_HEIGHT_PARAM, fallback Lookup par nom
+      (FR/EN).
+    - Doors : BuiltInParameter.DOOR_WIDTH / DOOR_HEIGHT, fallback idem.
+    """
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import BuiltInParameter
+
+    new_sym = base_sym.Duplicate(target_name)
+
+    width_ft = rp.meters_to_internal(width_m)
+    height_ft = rp.meters_to_internal(height_m)
+
+    width_bips = (
+        [BuiltInParameter.WINDOW_WIDTH, BuiltInParameter.FAMILY_WIDTH_PARAM]
+        if kind == "window"
+        else [BuiltInParameter.DOOR_WIDTH, BuiltInParameter.FAMILY_WIDTH_PARAM]
+    )
+    height_bips = (
+        [BuiltInParameter.WINDOW_HEIGHT, BuiltInParameter.FAMILY_HEIGHT_PARAM]
+        if kind == "window"
+        else [BuiltInParameter.DOOR_HEIGHT, BuiltInParameter.FAMILY_HEIGHT_PARAM]
+    )
+
+    def _set_param(bips, target_ft, name_aliases):
+        for bip in bips:
+            p = new_sym.get_Parameter(bip)
+            if p is not None and not p.IsReadOnly:
+                try:
+                    if p.Set(target_ft):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        for name in name_aliases:
+            p = new_sym.LookupParameter(name)
+            if p is not None and not p.IsReadOnly:
+                try:
+                    if p.Set(target_ft):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        return False
+
+    _set_param(width_bips, width_ft, ("Largeur", "Width", "Largeur grossière"))
+    _set_param(height_bips, height_ft, ("Hauteur", "Height", "Hauteur grossière"))
+
+    # Active le type (obligatoire avant NewFamilyInstance).
+    if not new_sym.IsActive:
+        new_sym.Activate()
+        doc.Regenerate()
+
+    return int(new_sym.Id.Value)
+
+
+def _create_dxf_opening_type_kg_only(
+    kg: ProjectKG, kind: str, target_name: str,
+    width_m: float, height_m: float,
+) -> str:
+    """KG-only path : crée le node FamilyType avec attrs."""
+    category = "Windows" if kind == "window" else "Doors"
+    return kg.add_node("FamilyType", {
+        "family_name": "DXF Generic " + ("Window" if kind == "window" else "Door"),
+        "type_name": target_name,
+        "category": category,
+        "width_m": float(width_m),
+        "height_m": float(height_m),
+    })
+
+
+@tool(name="openings_get_or_create_dxf_type", tier=1)
+def get_or_create_dxf_opening_type(
+    kg: ProjectKG,
+    doc: Any,
+    kind: str,
+    width_m: float,
+    height_m: float,
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cherche ou crée un FamilyType custom `DXF_WIN_WxH` ou
+    `DXF_DOOR_WxH` (Phase 2b).
+
+    Use case : import DXF avec openings de dimensions variables — chaque
+    paire (W, H) bucketée crée un FamilyType dédié avec ces dimensions
+    précises. L'user refinera après import.
+
+    Concepts: fenêtre, porte, type, dxf, dimensionnement, phase 2b,
+              opening, custom
+    Phrases: "crée le type fenêtre pour ces dimensions",
+             "get or create opening type"
+    Similar: walls_get_or_create_dxf_type, openings_create_many
+
+    Args:
+        kind: "door" | "window".
+        width_m / height_m: dimensions en mètres.
+        bucket_cm: granularité (défaut 1cm).
+        base_type_ref: llm_id d'un FamilyType template, sinon auto-find.
+
+    Returns:
+        {"ok": bool, "llm_id": str, "name": str, "kind": str,
+         "width_m": float, "height_m": float, "created": bool,
+         "revit_id": int | None}
+    """
+    if kind not in ("door", "window"):
+        raise ValueError("kind must be 'door' or 'window'")
+    if not isinstance(width_m, (int, float)) or width_m <= 0:
+        raise ValueError("width_m must be a positive number")
+    if not isinstance(height_m, (int, float)) or height_m <= 0:
+        raise ValueError("height_m must be a positive number")
+
+    bucketed_w_cm = int(round(width_m * 100 / bucket_cm)) * bucket_cm
+    bucketed_h_cm = int(round(height_m * 100 / bucket_cm)) * bucket_cm
+    bucketed_w_m = bucketed_w_cm / 100.0
+    bucketed_h_m = bucketed_h_cm / 100.0
+    target_name = _dxf_opening_type_name(kind, width_m, height_m, bucket_cm=bucket_cm)
+    category = "Windows" if kind == "window" else "Doors"
+
+    existing = _find_dxf_opening_type_in_kg(kg, target_name, category)
+    if existing is not None and _validate_or_drop_stale_opening_binding(
+        kg, doc, existing,
+    ):
+        node = kg.get_node(existing)
+        return {
+            "ok": True, "llm_id": existing, "name": target_name, "kind": kind,
+            "width_m": float(node.get("width_m", bucketed_w_m)),
+            "height_m": float(node.get("height_m", bucketed_h_m)),
+            "created": False,
+            "revit_id": kg.get_revit_id(existing),
+        }
+
+    if doc is None:
+        llm_id = _create_dxf_opening_type_kg_only(
+            kg, kind, target_name, bucketed_w_m, bucketed_h_m,
+        )
+        return {
+            "ok": True, "llm_id": llm_id, "name": target_name, "kind": kind,
+            "width_m": bucketed_w_m, "height_m": bucketed_h_m,
+            "created": True, "revit_id": None,
+        }
+
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        from .. import revit_primitives as rp
+        from Autodesk.Revit.DB import ElementId
+        base_sym = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_sym = _find_base_opening_family_symbol(doc, category)
+        if base_sym is None:
+            raise ValueError(
+                "No {} FamilySymbol available in this project. Charge "
+                "une famille porte/fenêtre puis réessaye, ou passe "
+                "`base_type_ref` explicitement.".format(category)
+            )
+
+    from .. import revit_primitives as rp
+    with rp.transaction(doc, "openings.get_or_create_dxf_type"):
+        revit_id = _create_dxf_opening_type_in_revit(
+            doc, base_sym, target_name, bucketed_w_m, bucketed_h_m, kind,
+        )
+        llm_id = _create_dxf_opening_type_kg_only(
+            kg, kind, target_name, bucketed_w_m, bucketed_h_m,
+        )
+        kg.set_revit_id(llm_id, revit_id)
+
+    return {
+        "ok": True, "llm_id": llm_id, "name": target_name, "kind": kind,
+        "width_m": bucketed_w_m, "height_m": bucketed_h_m,
+        "created": True, "revit_id": revit_id,
+    }
+
+
+@tool(name="openings_get_or_create_dxf_type_many", tier=1)
+def get_or_create_dxf_opening_type_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+    bucket_cm: int = 1,
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Bulk : crée N FamilyType custom DXF_WIN_*/DXF_DOOR_* en une Tx.
+
+    Dédup interne sur le triplet (kind, w_bucket, h_bucket).
+
+    Args:
+        items: liste de `{kind: 'door'|'window', width_m, height_m}`.
+
+    Returns:
+        {"ok": bool, "types": [{kind, width_m, height_m, name, llm_id,
+            revit_id, created}, ...],
+         "created_count": int, "reused_count": int}
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    # Dédup.
+    seen_names: Set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            raise ValueError("items[{}] must be a dict".format(i))
+        k = it.get("kind")
+        w = it.get("width_m")
+        h = it.get("height_m")
+        if k not in ("door", "window"):
+            raise ValueError("items[{}]: kind invalid".format(i))
+        if not isinstance(w, (int, float)) or w <= 0:
+            raise ValueError("items[{}]: width_m invalid".format(i))
+        if not isinstance(h, (int, float)) or h <= 0:
+            raise ValueError("items[{}]: height_m invalid".format(i))
+        name = _dxf_opening_type_name(k, w, h, bucket_cm=bucket_cm)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        unique.append({"kind": k, "width_m": w, "height_m": h})
+
+    types_payload: List[Dict[str, Any]] = []
+    created = 0
+    reused = 0
+    for it in unique:
+        # Délégation au tool unitaire (ouvre sa propre Tx Revit).
+        r = get_or_create_dxf_opening_type(
+            kg=kg, doc=doc, kind=it["kind"],
+            width_m=it["width_m"], height_m=it["height_m"],
+            bucket_cm=bucket_cm, base_type_ref=base_type_ref,
+        )
+        types_payload.append(r)
+        if r["created"]:
+            created += 1
+        else:
+            reused += 1
+    return {
+        "ok": True, "types": types_payload,
+        "created_count": created, "reused_count": reused,
+    }
+
+
 @tool(name="openings_create_door", tier=1)
 def create_door(
     kg: ProjectKG,
