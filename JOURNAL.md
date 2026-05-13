@@ -14,6 +14,242 @@
 
 ---
 
+## 2026-05-13 (session m) — UC1 Phase 1 import projet : 6 étapes livrées + 11 fixes runtime + Floor type + UI dialogs
+
+### Contexte & objectif
+
+Session marathon issue d'un cadrage user explicite : « ce process
+devrait être décomposé de manière plus détaillée avant de faire des
+tests ». L'import projet (« importe ce projet <dossier> ») est
+redécoupé en **6 sous-étapes auditables avec gate user entre chaque** :
+
+1. Identifier coupes/plans
+2. Situer les traits de coupe dans le plan
+3. Vérifier l'échelle plan ↔ coupes
+4. Identifier la nomenclature des layers
+5. Reconcile niveaux DXF ↔ Revit
+6. Linker les DXF dans Revit (références visuelles)
+
+Strict : **STOP après Phase 1 (setup uniquement), pas de création de
+murs/ouvertures/sols** — c'est la Phase 2.
+
+### Phases livrées (Phase 1 complète à 6/6)
+
+**Étape 1 — `dwg_inspect_sections` + `DxfImportContext`** (commits
+`39d2f57`, `9824df4`, `8d5f418`). Module `lib/dwg_section_reader.py` :
+classify_dxf, parse_block_id (regex tolérant `V1`/`V2` après bug
+runtime), parse_block_dimensions, read_levels avec 4 sources fallback,
+read_section_openings, match_openings par block_id. Tool tier-2
+`dwg_inspect_sections(directory=...)` avec convention « importe ce
+projet C:/... ». Nœud KG `DxfImportContext` singleton-ish + 4 tools
+`dxf_context_*` pour persistance entre tours.
+
+**Étape 2 — `dwg_find_section_markers`** (commits `1751d06`, `a5652ae`).
+Détection sur layer `G-ANNO-SYMB` (Revit AIA export). LINEs + INSERTs
+aux endpoints, discrimination « Coupe ... » vs « Elévation ... » via
+block name. Amélioration : `inferred_view_dir` calculé depuis la
+rotation du bloc marqueur (default direction +Y, CCW rotation). Le
+tool expose `all_inferred_confidently` pour que l'agent procède sans
+confirmation systématique.
+
+**Étape 3 — `dwg_verify_section_scale`** (commit `1751d06`). Sanity
+check drift entre ||p2-p1|| du trait et X-extent A-WALL de la coupe.
+Bug user : « la grande coupe à la place de la petite ». Fix dédié
+commit `33a0757` : **nouveau tool `dxf_assign_coupes_to_traits`** qui
+brute-force toutes les permutations N coupes × N traits et retourne
+l'assignment optimal par minimum drift total. Sur P7 : drift 9.89m
+(optimal) vs 14.60m (swap), 33% mieux.
+
+**Étape 4 — `dwg_identify_source`** (commit `aea8fb0`). Convention
+AIA / ISO / other. Heuristique sur ratio de layers matching. P7 et
+Projet4 sont AIA confidence 1.0.
+
+**Étape 5 — `levels_reconcile_with_dxf`** (commit `f18cf72`). Diff
+3 passes (match exact, name only mismatch, elev only mismatch).
+Output `summary_for_dialog` formaté pour dialog groupé. Règle user
+explicite : niveaux exigent TOUJOURS validation, mais GROUPÉE en
+1 dialog (cascade sur les hôtes = raison de garder l'user dans la
+boucle même quand l'inférence est sûre).
+
+**Étape 6 — `views_create_section` + `views_link_cad` +
+`views_open_3d`** (commits `ec94977`, `c2f0cd4`). Création ViewSection
+Revit avec math BBox/Transform isolée dans `section_view_geom.py`
+(testable hors-Revit, 13 tests pure-Python). Link CAD avec
+`ImportPlacement.Origin` + translation post-link pour aligner sur
+le cut plane. Fin de Phase 1 : `views_open_3d` active la vue 3D
+par défaut pour validation visuelle immédiate.
+
+**`ui_confirm_choices` / `ui_confirm_yes_no`** (commit `f68ca2e`).
+TaskDialog Revit modale, option A retenue par user (vs vraie
+non-bloquante dock pane = trop d'effort V0). Convention : 1 clic
+au lieu de tapoter une réponse texte. **Règle UX importante** (feedback
+memory `feedback-user-confirmation-when-doubt`) : confirmer
+uniquement en cas de doute, pas systématiquement. Exception
+niveaux.
+
+### Convention DXF (0,0) Revit section export — résolue via P7
+
+User a fourni un mini-projet **asymétrique** P7 pour dériver la
+convention sans bruit de symétrie. Preuve flagrante : A-WALL bbox du
+plan = X[-15589.6, +1610.4], Y[-1274.5, +8925.5]. A-WALL bbox de
+Coupe 1 (verticale) X = [-1274.5, +8925.5] = **EXACT match** plan Y.
+A-WALL bbox de Coupe 2 (horizontale) X = [-15589.6, +1610.4] =
+**EXACT match** plan X. Aucun décalage le long du cut.
+
+**Convention finale** (commit `c40a308`) :
+- Coupe verticale (cut along world Y) : DXF X ↔ world Y identité,
+  DXF (0,0) → world `(X_cut, 0, 0)`
+- Coupe horizontale (cut along world X) : DXF X ↔ world X identité,
+  DXF (0,0) → world `(0, Y_cut, 0)`
+
+Implémentation : `views_link_cad` détecte vertical/horizontal via
+`BasisX.X` (≈ 0 pour vertical, > 0.5 pour horizontal), translate
+en conséquence. **Pas** `view.Origin` (= midpoint du trait) qui
+incluait un offset incorrect le long de la section direction.
+
+Cf. mémoire `project-dxf-section-anchor-investigation` mise à jour.
+
+### Floor / Sol type (UC2 V0)
+
+Commit `d5ecc30`. User a demandé en milieu de session : « peux-tu
+ajouter les ops Sol/dalle, ils seront testés avec les premiers
+imports de coupes ». Livré complet :
+
+- Schema KG `Floor` + `FloorType` (project_kg.py)
+- Module `lib/tools/floors.py` : `floors_create`, `floors_create_many`,
+  `floors_delete`, `floors_delete_many`. Validation boundary
+  (≥ 3 sommets, pas de doublons adjacents, dédup trailing). Aire
+  via shoelace côté KG, lue depuis `HOST_AREA_COMPUTED` côté Revit.
+- Catalog : `catalog_list_floors` + `catalog_list_floor_types`.
+- Revit primitives + kg_sync (scan FloorType + Floor dans
+  full_rescan).
+- Preprocess auto-scan : `sols?/dalles?/planchers?/slabs?` →
+  `catalog_list_floors`.
+- 25 tests.
+
+### 11 fixes runtime itératifs (debug Phase 1)
+
+User a fait 4-5 tests runtime successifs avec retours détaillés (logs
++ screenshots 3D). Chaque retour a déclenché un fix précis :
+
+1. **Scope Phase 1** (`40e4c15`) — agent créait 66 murs au lieu de
+   s'arrêter. Règle explicite system prompt « STOP après linkage ».
+2. **ImportColorMode** (`40e4c15`) — `PreserveColorMode` n'existe
+   pas en Revit 2025. Mapping `by_layer` redirigé vers `Preserved`.
+3. **BBox center vs bottom** (`40e4c15`, `305f27f`) — itéré 2 fois.
+   Origin.Z = bottom_elev (pas center) pour aligner DXF y=0 sur
+   world Z=0 (= Niveau 0).
+4. **clr.Reference** (`e233a50`) — PythonNet 3.x ship dans pyRevit
+   Master a dropped `clr.Reference[Type]()`. Convention moderne :
+   tuple-return pour les `out` params .NET. `result = doc.Link(...)`
+   puis unpacking `ok, out_id = result`.
+5. **`floor_plan_view_revit_id`** (`305f27f`) — agent n'avait pas
+   l'id de la vue plan pour linker le plan DXF. Exposé via
+   `catalog_list_levels` en runtime Revit.
+6. **BasisZ + Min.Z/Max.Z** (`17965e8`, `80ea0db`) — itéré 2 fois.
+   Convention finale : BasisZ = +look (sens du regard), Min.Z=0
+   (cut plane), Max.Z=+far_clip (back of view). Avant : BasisZ=-look
+   + Max.Z=0 ne fonctionnait pas comme attendu.
+7. **MoveElement sur élément verrouillé** (`345a54b`) — Revit auto-
+   épingle les links avec OrientToView=True. Fix : unpin avant
+   MoveElement.
+8. **restore_pinned** (`8721430`) — user a demandé de re-pingler après
+   l'alignement (comportement Revit standard).
+9. **Coupe-swap** (`33a0757`) — agent matchait par ordre des fichiers
+   (alphabétique) au lieu de l'ordre des markers (par longueur).
+   Tool `dxf_assign_coupes_to_traits` brute-force la bonne
+   permutation par min drift.
+10. **Translation par convention vraie** (`c40a308`) — `view.Origin`
+    incluait un offset midpoint incorrect le long de la section.
+    Convention P7-derived appliquée.
+11. **`views_open_3d`** (`c2f0cd4`) — auto-activation de la vue 3D
+    en fin de Phase 1 pour validation visuelle immédiate.
+
+### Validation finale (P7 runtime test 5e itération)
+
+```
+Tools utilisés : dwg_inspect_sections, levels_reconcile_with_dxf,
+dwg_find_section_markers, catalog_list_levels, ui_confirm_yes_no,
+dxf_assign_coupes_to_traits, dxf_context_register_inspection,
+views_create_section × 2, dxf_context_register_section_line × 2,
+views_link_cad × 4, dxf_context_register_linked_view × 4,
+views_open_3d
+```
+
+User confirme : « alignements corrects :-) ».
+
+- 4 DXF linkés (2 plans + 2 coupes) aux bons positions
+- 2 ViewSections créées, niveaux 0/3/6m alignés
+- Coupe 1 (DXF petit) → trait vertical 14.84m ✓ (anti-swap)
+- Coupe 2 (DXF grand) → trait horizontal 22.45m ✓
+- Vue 3D auto-active en fin de phase
+
+### Mémoires écrites
+
+- `feedback-user-confirmation-when-doubt` : confirmation uniquement
+  en cas de doute, exception niveaux (validation toujours mais
+  groupée).
+- `project-uc1-coupes-priority` : géo-ref AVANT extraction hauteurs.
+- `project-dxf-layer-conventions` : AIA standard, à étendre pour
+  ArchiCAD/ISO/BS1192.
+- `project-dxf-section-anchor-investigation` : convention DXF (0,0)
+  Revit section RÉSOLUE (initialement « en cours »).
+
+### Validation cumulée
+
+**500 tests verts** (353 en début de session → +147). Suite
+couvre :
+- 32 tests `test_dwg_sections` (section_reader + find_markers +
+  verify_scale + identify_source + reconcile + projet4
+  integration)
+- 13 tests `test_section_view_geom` (math BBox pure)
+- 12 tests `test_dxf_context` (persistance)
+- 11 tests `test_views` (views_create_section + link_cad +
+  register_linked_view + open_3d)
+- 25 tests `test_floors` (Floor/Sol complet)
+- 11 tests `test_ui` (confirm_choices, confirm_yes_no)
+- + tests existants étendus pour nouveaux tools
+
+### État final & reste à faire
+
+**Phase 1 import projet : PRODUCTION-READY** sur projets AIA. Workflow
+runtime stable, validation visuelle via vue 3D auto-active.
+
+**Phase 2 ouverte** : « crée les murs depuis le plan ». L'agent
+réutilisera `dwg_import_walls` (avec garde-fou anti-section). Probable
+chantier suivant : enrichir les ouvertures avec hauteurs sill/head
+extraites des coupes (via `DxfImportContext.section_lines` persisté).
+
+**Dettes ouvertes (notées en cours de session) :**
+- Orientation fenêtre dans le mur (task #10) — Phase 2 sujet.
+- Marqueurs d'élévation standalone (task — V0 algo requires LINE,
+  V1 = pass standalone INSERTs).
+- Convention DXF Projet4 (offset Y -8000mm) — pas la même que P7.
+  Hypothèse : version d'export ou option Revit différente. À
+  ré-investiguer si on retombe dessus.
+- Auto-création niveaux depuis coupes (task #16) — `levels_create_many`
+  existe, manque la guidance prompt.
+
+### Méta : leçons de session
+
+1. **Convention Revit empirique > docs** : 3 itérations BasisZ
+   nécessaires car la doc Revit API était ambiguë. Le test asymétrique
+   (P7) a tranché en 5 minutes ce qui résistait depuis 1h. Toujours
+   préférer un cas asymétrique pour dériver une convention.
+2. **Gate user entre étapes Phase 1** marche en pratique — l'agent
+   s'arrête, l'user voit, valide. Sans ce gate, l'agent aurait commit
+   les murs dès le 1er tour (cf. test session avant fix `40e4c15`).
+3. **Tool design > prompt engineering** : `dxf_assign_coupes_to_traits`
+   livré comme tool plutôt qu'instruction prompt = comportement
+   déterministe et auditable. Le prompt seul ne suffisait pas pour
+   le matching optimal.
+4. **`run live test` côté Revit > tests synthétiques** pour les
+   conventions API peu documentées. Les tests pure-Python n'auraient
+   jamais découvert le bug `clr.Reference` ou le pinning auto de
+   OrientToView.
+
+---
+
 ## 2026-05-13 (session l) — UC1 Phase 4 coupes : inventaire + dwg_section_reader + tool dwg_inspect_sections
 
 ### Contexte & objectif
