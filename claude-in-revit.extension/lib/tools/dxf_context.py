@@ -369,3 +369,177 @@ def register_linked_view(
         "linked_view_index": len(linked) - 1,
         "total_linked_views": len(linked),
     }
+
+
+# ----- dxf_context_register_linked_view_many ---------------------------
+
+
+@tool(name="dxf_context_register_linked_view_many", tier=1)
+def register_linked_view_many(
+    kg: ProjectKG,
+    entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Enregistre N linked views en **un seul** appel + une seule
+    modification du context.
+
+    Pattern bulk : économise ~1 token call par link. Pour 8 DXFs
+    linkés Phase 1 import, économie 7 appels = ~500-700 tokens.
+
+    Concepts: bulk, batch, lien, link, view, vue, dxf, context, plusieurs
+    Phrases: "enregistre tous les liens", "batch register links"
+    Similar: dxf_context_register_linked_view, views_link_cad_many
+
+    Args:
+        entries: liste de dicts `{file_path, link_revit_id,
+            view_revit_id, view_kind, view_name?}`. Validation
+            identique au tool unitaire.
+
+    Returns:
+        {"ok": bool, "context_llm_id": str, "count": int,
+         "total_linked_views": int}
+    """
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("entries must be a non-empty list")
+
+    # Pre-validate all entries.
+    validated: List[Dict[str, Any]] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError("entries[{}] must be a dict".format(i))
+        fp = entry.get("file_path")
+        link_rid = entry.get("link_revit_id")
+        view_rid = entry.get("view_revit_id")
+        view_kind = entry.get("view_kind")
+        view_name = entry.get("view_name")
+        if not isinstance(fp, str) or not fp.strip():
+            raise ValueError("entries[{}]: file_path required".format(i))
+        if not isinstance(link_rid, int) or link_rid <= 0:
+            raise ValueError(
+                "entries[{}]: link_revit_id required (positive int)".format(i)
+            )
+        if not isinstance(view_rid, int) or view_rid <= 0:
+            raise ValueError(
+                "entries[{}]: view_revit_id required (positive int)".format(i)
+            )
+        if view_kind not in ("plan", "section", "elevation"):
+            raise ValueError(
+                "entries[{}]: view_kind must be plan/section/elevation".format(i)
+            )
+        item: Dict[str, Any] = {
+            "file_path": fp,
+            "link_revit_id": link_rid,
+            "view_revit_id": view_rid,
+            "view_kind": view_kind,
+        }
+        if view_name is not None:
+            item["view_name"] = view_name
+        validated.append(item)
+
+    nid = _find_live_context(kg)
+    if nid is None:
+        nid = kg.add_node(_NODE_TYPE, {
+            "directory": "",
+            "files": [],
+            "section_lines": [],
+            "linked_views": [],
+        })
+
+    node = kg.get_node(nid)
+    linked = list(node.get("linked_views", []))
+    linked.extend(validated)
+    kg.modify_node(nid, {"linked_views": linked})
+
+    return {
+        "ok": True,
+        "context_llm_id": nid,
+        "count": len(validated),
+        "total_linked_views": len(linked),
+    }
+
+
+# ----- dxf_context_register_section_line_many --------------------------
+
+
+@tool(name="dxf_context_register_section_line_many", tier=1)
+def register_section_line_many(
+    kg: ProjectKG,
+    section_lines: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Enregistre N section lines en **un seul** appel.
+
+    Pattern bulk pour économiser les round-trips quand l'agent a
+    plusieurs traits de coupe à persister (typique : 2-4 par projet).
+
+    Concepts: bulk, batch, section, coupe, trait, plusieurs, plan
+    Phrases: "enregistre tous les traits de coupe", "batch section lines"
+    Similar: dxf_context_register_section_line, dwg_find_section_markers
+
+    Args:
+        section_lines: liste de dicts `{coupe_path, plan_p1, plan_p2,
+            view_dir, name?, confirmed_by_user?, scale_verified?,
+            drift_pct?}`. Validation identique au tool unitaire.
+
+    Returns:
+        {"ok": bool, "context_llm_id": str, "count": int,
+         "total_section_lines": int}
+    """
+    if not isinstance(section_lines, list) or not section_lines:
+        raise ValueError("section_lines must be a non-empty list")
+
+    validated: List[Dict[str, Any]] = []
+    for i, sl in enumerate(section_lines):
+        if not isinstance(sl, dict):
+            raise ValueError("section_lines[{}] must be a dict".format(i))
+        coupe_path = sl.get("coupe_path")
+        p1 = sl.get("plan_p1")
+        p2 = sl.get("plan_p2")
+        view_dir = sl.get("view_dir")
+        if not isinstance(coupe_path, str) or not coupe_path.strip():
+            raise ValueError(
+                "section_lines[{}]: coupe_path required".format(i)
+            )
+        if not (isinstance(p1, list) and len(p1) == 2):
+            raise ValueError(
+                "section_lines[{}]: plan_p1 must be [x, y]".format(i)
+            )
+        if not (isinstance(p2, list) and len(p2) == 2):
+            raise ValueError(
+                "section_lines[{}]: plan_p2 must be [x, y]".format(i)
+            )
+        if view_dir not in ("left", "right", "up", "down"):
+            raise ValueError(
+                "section_lines[{}]: view_dir must be left/right/up/down".format(i)
+            )
+        entry: Dict[str, Any] = {
+            "name": sl.get("name"),
+            "coupe_path": coupe_path,
+            "plan_p1": [float(p1[0]), float(p1[1])],
+            "plan_p2": [float(p2[0]), float(p2[1])],
+            "view_dir": view_dir,
+            "confirmed_by_user": bool(sl.get("confirmed_by_user", False)),
+            "scale_verified": bool(sl.get("scale_verified", False)),
+        }
+        if sl.get("drift_pct") is not None:
+            entry["drift_pct"] = float(sl["drift_pct"])
+        validated.append(entry)
+
+    nid = _find_live_context(kg)
+    if nid is None:
+        nid = kg.add_node(_NODE_TYPE, {
+            "directory": "",
+            "files": [],
+            "section_lines": [],
+            "linked_views": [],
+        })
+
+    node = kg.get_node(nid)
+    section_lines_existing = list(node.get("section_lines", []))
+    section_lines_existing.extend(validated)
+    kg.modify_node(nid, {"section_lines": section_lines_existing})
+
+    return {
+        "ok": True,
+        "context_llm_id": nid,
+        "count": len(validated),
+        "total_section_lines": len(section_lines_existing),
+    }

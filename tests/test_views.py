@@ -95,6 +95,74 @@ def test_open_3d_kg_only_returns_placeholder(kg_fresh):
     assert "doc is None" in payload["note"]
 
 
+def test_link_cad_many_kg_only(kg_fresh, tmp_path):
+    """Branche doc=None : retourne placeholders pour chaque link."""
+    dxf1 = tmp_path / "a.dxf"
+    dxf1.write_text("0\nEOF\n")
+    dxf2 = tmp_path / "b.dxf"
+    dxf2.write_text("0\nEOF\n")
+    result = llm_protocol.dispatch_tool_use(
+        "views_link_cad_many",
+        {"links": [
+            {"file_path": str(dxf1), "view_revit_id": 42},
+            {"file_path": str(dxf2), "view_revit_id": 43},
+        ]},
+        "t1", kg_fresh,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 2
+    assert len(payload["links"]) == 2
+    assert all(link["link_revit_id"] is None for link in payload["links"])
+
+
+def test_link_cad_many_rejects_empty(kg_fresh):
+    result = llm_protocol.dispatch_tool_use(
+        "views_link_cad_many", {"links": []}, "t1", kg_fresh,
+    )
+    assert result["is_error"] is True
+
+
+def test_link_cad_many_rejects_missing_path(kg_fresh, tmp_path):
+    result = llm_protocol.dispatch_tool_use(
+        "views_link_cad_many",
+        {"links": [{"file_path": "/nope.dxf", "view_revit_id": 1}]},
+        "t1", kg_fresh,
+    )
+    assert result["is_error"] is True
+
+
+def test_create_section_many_kg_only(kg_fresh):
+    """Branche doc=None : geometry computed, revit_id=None."""
+    result = llm_protocol.dispatch_tool_use(
+        "views_create_section_many",
+        {"items": [
+            {"name": "Coupe A", "p1_m": [0, 0], "p2_m": [10, 0], "view_dir": "down"},
+            {"name": "Coupe B", "p1_m": [5, -5], "p2_m": [5, 5], "view_dir": "right"},
+        ]},
+        "t1", kg_fresh,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 2
+    assert all(s["revit_id"] is None for s in payload["sections"])
+    assert payload["sections"][0]["section_length_m"] == 10.0
+    assert payload["sections"][1]["section_length_m"] == 10.0
+
+
+def test_create_section_many_rejects_duplicate_names(kg_fresh):
+    result = llm_protocol.dispatch_tool_use(
+        "views_create_section_many",
+        {"items": [
+            {"name": "Same", "p1_m": [0, 0], "p2_m": [5, 0], "view_dir": "down"},
+            {"name": "Same", "p1_m": [10, 0], "p2_m": [15, 0], "view_dir": "down"},
+        ]},
+        "t1", kg_fresh,
+    )
+    assert result["is_error"] is True
+    assert "duplicate" in result["content"].lower()
+
+
 def test_link_cad_kg_only_returns_placeholder(kg_fresh, tmp_path):
     dxf = tmp_path / "fake.dxf"
     dxf.write_text("0\nSECTION\n2\nENDSEC\n0\nEOF\n")

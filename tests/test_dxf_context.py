@@ -241,6 +241,72 @@ def test_register_section_line_persists_user_confirmation_flag(kg_fresh):
 # ----- Integration : inspection → section_line → get -----------------
 
 
+def test_register_linked_view_many_bulk(kg_fresh):
+    """Bulk register : 4 linked views en 1 appel."""
+    entries = [
+        {"file_path": f"/tmp/f{i}.dxf", "link_revit_id": 100 + i,
+         "view_revit_id": 50 + i, "view_kind": "section",
+         "view_name": f"V{i}"}
+        for i in range(4)
+    ]
+    result = llm_protocol.dispatch_tool_use(
+        "dxf_context_register_linked_view_many",
+        {"entries": entries}, "t1", kg_fresh,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 4
+    assert payload["total_linked_views"] == 4
+    # Verify via get
+    r2 = llm_protocol.dispatch_tool_use("dxf_context_get", {}, "t2", kg_fresh)
+    p2 = json.loads(r2["content"])
+    assert len(p2["linked_views"]) == 4
+
+
+def test_register_linked_view_many_rejects_bad_view_kind(kg_fresh):
+    result = llm_protocol.dispatch_tool_use(
+        "dxf_context_register_linked_view_many",
+        {"entries": [
+            {"file_path": "/tmp/f.dxf", "link_revit_id": 1,
+             "view_revit_id": 2, "view_kind": "elevation"},  # valid now
+            {"file_path": "/tmp/g.dxf", "link_revit_id": 3,
+             "view_revit_id": 4, "view_kind": "garbage"},  # invalid
+        ]},
+        "t1", kg_fresh,
+    )
+    assert result["is_error"] is True
+
+
+def test_register_section_line_many_bulk(kg_fresh):
+    """Bulk register section lines : 3 traits en 1 appel."""
+    sls = [
+        {
+            "coupe_path": f"/tmp/c{i}.dxf",
+            "plan_p1": [0.0, float(i)],
+            "plan_p2": [10.0, float(i)],
+            "view_dir": "up",
+            "name": f"Coupe {i}",
+        }
+        for i in range(3)
+    ]
+    result = llm_protocol.dispatch_tool_use(
+        "dxf_context_register_section_line_many",
+        {"section_lines": sls}, "t1", kg_fresh,
+    )
+    payload = json.loads(result["content"])
+    assert payload["ok"] is True
+    assert payload["count"] == 3
+    assert payload["total_section_lines"] == 3
+
+
+def test_register_section_line_many_rejects_empty(kg_fresh):
+    result = llm_protocol.dispatch_tool_use(
+        "dxf_context_register_section_line_many",
+        {"section_lines": []}, "t1", kg_fresh,
+    )
+    assert result["is_error"] is True
+
+
 def test_full_phase1_flow_persists_across_turns(kg_fresh):
     """Simule : tour 1 inspect+register ; tour 2 register section_line ;
     tour 3 get retourne tout. Pattern attendu côté agent runtime."""
