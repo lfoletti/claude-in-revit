@@ -7510,27 +7510,78 @@ def _meta_register_dxf_context(
     return {"section_lines_registered": section_lines_count}
 
 
+def _coupe_y_extent_m(
+    path: Path,
+    scale_override: Optional[float] = None,
+    height_buffer_m: float = 0.5,
+) -> Optional[Tuple[float, float]]:
+    """Lit le Y extent (en mètres post-conversion) du contenu structurel
+    d'un DXF coupe : LINEs sur A-WALL, A-FLOR, A-FLOR-LEVL, S-COLS.
+
+    Use case : adapter `bottom_elev_m` / `top_elev_m` de la ViewSection
+    Revit à la hauteur effective du DXF coupe (= inclure fondations si
+    Y < 0, acrotères/toiture si Y > top_level). Évite que des éléments
+    DXF importés tombent hors du frustum de la ViewSection.
+
+    Returns:
+        `(y_min - buffer, y_max + buffer)` en mètres, ou None si le
+        fichier ne contient aucune LINE pertinente.
+    """
+    try:
+        entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+    except Exception:  # noqa: BLE001
+        return None
+    ys: List[float] = []
+    for e in entities:
+        if e.kind != "LINE":
+            continue
+        if e.layer not in (
+            "A-WALL", "A-FLOR", "A-FLOR-LEVL", "S-COLS", "S-STRS",
+        ):
+            continue
+        for pt in e.coords:
+            ys.append(pt[1])
+    if not ys:
+        return None
+    return (round(min(ys) - height_buffer_m, 3),
+            round(max(ys) + height_buffer_m, 3))
+
+
 def _meta_create_section_views(
     kg: ProjectKG,
     doc: Any,
     section_assignment: List[Dict[str, Any]],
     top_elev_m: float = 6.0,
+    scale_override: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Crée les vues Section Revit pour chaque coupe assignée.
     Retourne la liste des sections créées avec leur revit_id, indexée par
-    coupe_path pour le link_cad subséquent. doc=None → no-op (test path)."""
+    coupe_path pour le link_cad subséquent. doc=None → no-op (test path).
+
+    Pour chaque coupe : lit le Y extent du DXF (`_coupe_y_extent_m`) et
+    fixe `bottom_elev_m` / `top_elev_m` per-item pour que le bbox de la
+    ViewSection englobe exactement le contenu du DXF (fondations sous
+    Z=0 + toiture + acrotères inclus). Fallback au top-level `top_elev_m`
+    si la lecture DXF échoue.
+    """
     if doc is None or not section_assignment:
         return []
     from .views import create_section_many as _create_sections
     items = []
     for entry in section_assignment:
-        items.append({
-            "name": "Coupe " + Path(entry["coupe_path"]).stem.split(" - ")[-1],
+        coupe_path = Path(entry["coupe_path"])
+        y_extent = _coupe_y_extent_m(coupe_path, scale_override=scale_override)
+        item = {
+            "name": "Coupe " + coupe_path.stem.split(" - ")[-1],
             "p1_m": entry["plan_p1"],
             "p2_m": entry["plan_p2"],
             "view_dir": entry["view_dir"],
             "x_axis_convention": entry.get("x_axis_convention", "identity"),
-        })
+        }
+        if y_extent is not None:
+            item["bottom_elev_m"] = y_extent[0]
+            item["top_elev_m"] = y_extent[1]
+        items.append(item)
     result = _create_sections(
         kg=kg, doc=doc, items=items, top_elev_m=top_elev_m,
     )
@@ -8014,10 +8065,13 @@ def import_project_execute(
         section_assignment=audit.get("section_assignment") or [],
     )
 
-    # 4. Create section views in Revit.
+    # 4. Create section views in Revit. Per-coupe Y extent depuis le
+    # DXF (= fondations + toiture inclues) ; fallback top-level si lecture
+    # DXF échoue.
     coupes_with_sections = _meta_create_section_views(
         kg, doc, audit.get("section_assignment") or [],
         top_elev_m=height_per_level_m * 2,
+        scale_override=scale_override,
     )
 
     # 5. Link all DXFs in their respective views + register the mapping.

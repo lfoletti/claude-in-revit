@@ -228,10 +228,25 @@ def create_section_many(
                 "items[{}]: x_axis_convention must be identity|reversed|None "
                 "(got {!r})".format(i, x_axis_conv)
             )
+        # Per-item override des extents verticaux. Si None → fallback
+        # au top-level bottom_elev_m / top_elev_m du tool. Utilisé par
+        # _meta_create_section_views pour matcher la hauteur DXF coupe.
+        item_bottom = item.get("bottom_elev_m")
+        item_top = item.get("top_elev_m")
+        if item_bottom is not None and not isinstance(item_bottom, (int, float)):
+            raise ValueError(
+                "items[{}]: bottom_elev_m must be a number or None".format(i)
+            )
+        if item_top is not None and not isinstance(item_top, (int, float)):
+            raise ValueError(
+                "items[{}]: top_elev_m must be a number or None".format(i)
+            )
         specs.append({
             "name": name.strip(),
             "p1_m": p1, "p2_m": p2, "view_dir": view_dir,
             "x_axis_convention": x_axis_conv,
+            "bottom_elev_m": float(item_bottom) if item_bottom is not None else None,
+            "top_elev_m": float(item_top) if item_top is not None else None,
         })
 
     # KG-only : compute bounds + return placeholders.
@@ -240,7 +255,14 @@ def create_section_many(
         for spec in specs:
             bounds = compute_section_view_bounds(
                 spec["p1_m"], spec["p2_m"], spec["view_dir"],
-                bottom_elev_m=bottom_elev_m, top_elev_m=top_elev_m,
+                bottom_elev_m=(
+                    spec["bottom_elev_m"] if spec["bottom_elev_m"] is not None
+                    else bottom_elev_m
+                ),
+                top_elev_m=(
+                    spec["top_elev_m"] if spec["top_elev_m"] is not None
+                    else top_elev_m
+                ),
                 far_clip_m=far_clip_m, height_buffer_m=height_buffer_m,
                 x_axis_convention=spec["x_axis_convention"],
             )
@@ -293,7 +315,14 @@ def create_section_many(
         for spec in specs:
             bounds = compute_section_view_bounds(
                 spec["p1_m"], spec["p2_m"], spec["view_dir"],
-                bottom_elev_m=bottom_elev_m, top_elev_m=top_elev_m,
+                bottom_elev_m=(
+                    spec["bottom_elev_m"] if spec["bottom_elev_m"] is not None
+                    else bottom_elev_m
+                ),
+                top_elev_m=(
+                    spec["top_elev_m"] if spec["top_elev_m"] is not None
+                    else top_elev_m
+                ),
                 far_clip_m=far_clip_m, height_buffer_m=height_buffer_m,
                 x_axis_convention=spec["x_axis_convention"],
             )
