@@ -14,6 +14,138 @@
 
 ---
 
+## 2026-05-14 (session w) — Méta-tool import projet + règle de pré-validation pushbutton
+
+### Contexte & objectif
+
+Session v a livré le driver dryrun + reset_dxf pushbutton + graphify MCP +
+(tentative avortée) auto-sync hook. À la fin de session, user a fait un
+import complet DXF P7 en runtime Revit : 19 walls / 13 windows / 2 floors,
+**13 api_calls + 50K input tokens** pour un seul tour. Constat : la
+réduction tokens espérée des changements de session v n'est pas visible
+ici (ils ne touchaient pas ce path).
+
+Objectif session w : attaquer la vraie source de coût — l'**orchestration
+LLM step-by-step** de ~14 sous-tools pour un import projet. Bundle dans
+un méta-tool Python qui orchestre déterministiquement, le LLM ne fait
+plus que `audit + ui_confirm + execute` (4 round-trips au lieu de 13).
+
+### Décisions architecturales
+
+- **2 stages : audit + execute** (4 calls LLM au lieu de 13).
+  - `dwg_import_project_audit(directory)` : read-only Phase 1 complète.
+    Retourne plan consolidé (gate_status, files classifiés, section
+    assignment, level_actions_proposed, summary_for_dialog).
+  - `dwg_import_project_execute(directory, level_actions, ...)` : applique
+    Phase 1.5 + Phase 2 complète, ouvre 3D. Re-run Phase 1 cheap en interne
+    pour ne pas avoir à persister l'état entre audit et execute (token-
+    efficient et stateless).
+- **Dialogs user préservés** entre audit et execute via `ui_confirm_yes_no`
+  (warnings) et `ui_confirm_choices` (niveaux). Pattern human-in-the-loop
+  inchangé.
+- **Pipeline interne extensible** : un helper privé `_meta_phase*_*(...)`
+  par étape (apply_level_actions, register_context, create_sections,
+  link_cad, phase2a_walls, phase2b_openings, phase2c_floors, open_3d).
+  Ajouter une micro-step (toiture, mappage types DXF, etc.) = ajouter un
+  helper + 1 ligne dans l'orchestrator. Pas de framework.
+- **Mode offline (`doc=None`)** : `_meta_simulate_linked_views_offline`
+  injecte des linked_views synthétiques pour que la fusion vote-élévation
+  tourne en mode test → mêmes comptes que runtime Revit.
+
+### Phase A — Règle de pré-validation pushbutton (process)
+
+Suite des crashes Refresh KG en début de session, l'user a formalisé une
+nouvelle règle de processus à inscrire en tête de CLAUDE.md :
+
+> Toute fonction destinée à être appelée par le LLM doit d'abord exister
+> comme pushbutton dédié dans `LLM.tab/development.panel/`. Le LLM est le
+> **stade final d'intégration**, pas le premier consommateur.
+
+Stages de validation, du plus rapide au plus coûteux :
+1. Tests offline (pytest, dryrun) — couvre la logique pure
+2. **Pushbutton dev** — premier contact Revit live, valide la fonction
+   sur projet réel choisi par user
+3. `@tool` decorator + LLM call — smoke test d'intégration, pas test fonctionnel
+
+Inscrit dans CLAUDE.md sous nouvelle section « Process de développement »,
+juste avant « Coding policies ». Conséquence concrète pour cette session :
+les méta-tools sont tagués `tier=3` (DEV, invisible au LLM) jusqu'à
+validation user via dev pushbuttons.
+
+### Phase B — Méta-tools `dwg_import_project_audit` / `..._execute`
+
+`claude-in-revit.extension/lib/tools/dwg_import.py` (+~450 lignes en fin
+de fichier) :
+
+- 8 helpers privés `_meta_*` pour les phases
+- 1 helper `_meta_run_phase1_audit` réutilisé par les 2 tools (audit
+  expose, execute re-run interne)
+- 2 tools tagués `tier=3` (DEV, à bumper en `tier=2` après validation)
+- Contract I/O documenté en docstrings (concepts/phrases/similar respectent
+  la convention)
+
+### Phase C — Pushbuttons dev pour pré-validation
+
+`claude-in-revit.extension/LLM.tab/development.panel/` :
+
+- `dev_import_audit.pushbutton/` : FolderBrowserDialog → run audit
+  read-only → affiche plan structuré (gate_status, files, section
+  assignment, level actions, summary_for_dialog, next_step).
+- `dev_import_execute.pushbutton/` : FolderBrowserDialog → run audit
+  → confirm dialog Yes/No avec récap → run execute → affiche résumé
+  consolidé (Phase 1 setup + Phase 2a/b/c + view_3d_opened).
+
+Pattern UI identique aux autres pushbuttons (shebang, sys.path fixup,
+__revit__ bare-name, defensive shell BaseException + traceback).
+
+### Validation
+
+- **Smoke test offline (doc=None) sur P7** : audit + execute reproduisent
+  **exactement** les comptes du runtime Revit live de session v :
+  - 3 levels (N0/N1/N2 = 0/3/6m)
+  - 19 walls (9 N0 + 10 N1, 7 fusion_events via vote élévation)
+  - 13 windows + 2 oversize rejetés (sur 15 plan_openings_detected)
+  - 2 floors (1 N0 + 1 N1, N2 skippé toiture)
+  - 1 FamilyType `DXF_WIN_*`, 2 WallTypes `DXF_WALL_*`, 1 FloorType `DXF_FLOOR_*`
+- **9 tests pytest** dans `tests/test_dwg_import_project.py` (audit
+  classification, section assignment, level actions, read-only,
+  end-to-end match dryrun, abort sur errors, refuse sur warnings sans
+  proceed_flag, idempotence niveaux).
+- **621 tests verts** (612 → 621 = +9), 0 régression.
+
+### Estimation gain tokens (à mesurer runtime)
+
+| Mesure | Avant (session v runtime) | Estimé après méta-tool |
+|---|---|---|
+| api_calls | 13 | 4 (audit + ~2 confirm + execute) |
+| input tokens | 50,823 | ~15K |
+| output tokens | 5,979 | ~2K |
+| cache_read | 550,735 | ~150K |
+| latence end-user | ~1-2 min | ~20-40s |
+
+Réduction estimée ~70%, à confirmer par mesure runtime au prochain import
+P7 user (après bump tier=3→tier=2 + update system prompt).
+
+### État final & reste à faire
+
+- **Pas de bump tier=3→tier=2 dans ce commit** : respecte la règle « LLM
+  en stade final ». User doit d'abord cliquer `dev_import_audit` puis
+  `dev_import_execute` sur un projet réel (P7, P8) pour valider en Revit
+  live.
+- **System prompt** : sera mis à jour DANS UN COMMIT SÉPARÉ après validation
+  user. Remplace les ~14 étapes de pipeline manuel par 4 (audit + confirms
+  + execute). Pipeline manuel reste documenté comme fallback.
+- **Mesure tokens runtime** : à faire dès que system prompt updated. Si
+  réduction <50%, investiguer pourquoi.
+
+### Bugs trouvés
+
+Aucun nouveau bug pendant la session w. Le smoke test offline est tombé
+en plein dans le mille au premier essai, ce qui confirme la valeur du
+dryrun + des tests pytest dèjà en place pour itérer rapidement.
+
+---
+
 ## 2026-05-14 (session v) — Driver dryrun offline + golden P7 + règle d'or pure-Python
 
 ### Contexte & objectif
