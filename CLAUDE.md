@@ -117,6 +117,21 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 - **Citations réglementaires** : format `<corpus_id>#<ancre>` (ex : `rcv-2024#hauteur-sous-plafond`, `aeai-2015#dpi-15-15-§3.2`). Toujours inclure `version` du corpus dans le rapport.
 - **Disclaimer audit UC8** : « assistance, pas validation réglementaire » — à inclure en tête de chaque rapport généré.
 
+## Process de développement
+
+- **Pré-validation par pushbutton AVANT exposition LLM. Le LLM est le stade final d'intégration, pas le premier consommateur.** Toute nouvelle fonction / pipeline destinée à être appelée par le LLM doit d'abord exister comme **pushbutton dédié** dans `LLM.tab/development.panel/` (préfixe `dev_` pour distinguer du `agent.panel` user-facing). Cliquer le pushbutton appelle la fonction avec des inputs choisis manuellement (FolderBrowserDialog, etc.) et affiche le résultat brut.
+
+  **Pourquoi** : on a déjà perdu des heures sur des crashes Revit / bugs latents qui auraient été captés en 30 secondes par un clic manuel — `floor_type_ref` capté par le dryrun (session v), hook auto-sync exposé direct au LLM puis abandon coûteux (session v). Le LLM n'est pas un terrain de test : ses round-trips coûtent du temps + tokens, son orchestration masque où ça plante, et son non-déterminisme ralentit la reproduction. Quand le LLM finit par appeler la fonction, c'est pour vérifier que **l'intégration agent fonctionne** (descriptions de tool comprises, paramètres bien typés, séquençage correct) — pas que la fonction elle-même calcule juste.
+
+  **Stages de validation** (du plus rapide au plus coûteux, à passer dans l'ordre) :
+    1. **Tests offline** — `pytest`, `scripts/dxf_dryrun.py`, ou équivalent. Cycle ~5s. Couvre logique pure-Python, fixtures fixes.
+    2. **Pushbutton dev** — `LLM.tab/development.panel/dev_X.pushbutton/`. Cycle ~30s (clic + dialog). Couvre les chemins Revit-aware (Tx, regen, FilteredElementCollector, etc.) sur un projet réel choisi par l'user. **Premier contact avec Revit live.**
+    3. **`@tool` decorator + LLM call** — expose la fonction à l'agent. Cycle ~minutes (prompt + round-trips API). Couvre l'intégration : le LLM comprend-il quand appeler ? les descriptions Concepts/Phrases/Similar sont-elles suffisantes ? les params sont-ils bien typés pour qu'il devine la bonne valeur ? **Smoke test d'intégration, pas test fonctionnel.**
+
+  **Quand ça s'applique** : nouvelle tool top-level (tier=1 ou tier=2), nouveau pipeline méta (`dwg_import_project_*`, futur `audit_conformity_*`), refonte non-triviale d'un tool existant. **Pas** pour les helpers privés `_phase*_*` (couverts par leur tool wrapper) ni les bug fixes ponctuels.
+
+  Cf. exemples `dev_import_audit.pushbutton/` et `dev_import_execute.pushbutton/` créés en session w.
+
 ## Coding policies
 
 - **Règle d'or — pure-Python d'abord, LLM en dernier recours** : si une partie du processus (ou le processus entier) peut être réalisée en pur Python, localement, déterministe, **cette voie est toujours préférable** à la sollicitation du LLM. Le LLM est un orchestrateur coûteux (tokens + latence + non-déterminisme) ; on ne s'en sert que là où le jugement, la flexibilité linguistique ou la combinaison libre de tools est strictement nécessaire. Conséquences concrètes : (a) tester et itérer hors-LLM dès que la logique est calculable (cf. `scripts/dxf_dryrun.py`) ; (b) préférer un `dwg_*` qui calcule plutôt qu'un prompt qui demande au LLM de calculer ; (c) avant d'ajouter une instruction au system prompt, demander « est-ce qu'un préprocesseur déterministe ferait mieux le job ? » (cf. `preprocess.autoscan_payload`, `preprocess.infer_tier_max`) ; (d) les hooks Claude Code (`settings.json`) automatisent les tâches répétitives plus fiablement que des règles de comportement. Le LLM **orchestre** ; il ne calcule, ne parse, ne valide rien que Python sait faire seul.
