@@ -4395,6 +4395,61 @@ def _shoelace_area_2d(points: List[Tuple[float, float]]) -> float:
     return abs(s) / 2.0
 
 
+def _collect_floor_holes_per_level(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+) -> Dict[float, List[Dict[str, Any]]]:
+    """Lit les trous (cages d'escalier, patios, atria) depuis les plans DXF
+    et les indexe par élévation de niveau.
+
+    Pour chaque plan référencé dans `DxfImportContext.files` :
+    1. Détermine son niveau via `_plan_path_to_level_elev` (mapping
+       linked_views.view_name ↔ Level.name).
+    2. `read_floor_holes_from_plan(entities)` énumère les closed polylines
+       sur `A-FLOR-STAIR/OPEN/PATIO/ATRIUM` (exclut OVHD par défaut).
+    3. Stocke chaque trou sous forme `{layer, kind, points: [[x,y], ...]}`.
+
+    Returns:
+        `{level_elevation_m → [{layer, kind, points}, ...]}`.
+        Niveaux sans trous = absents du dict (le caller défaute à []).
+    """
+    from .dxf_context import _find_live_context
+    plan_level_elev = _plan_path_to_level_elev(kg)
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+
+    out: Dict[float, List[Dict[str, Any]]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "plan":
+            continue
+        plan_path = fi.get("path")
+        if not plan_path:
+            continue
+        elev = plan_level_elev.get(plan_path)
+        if elev is None:
+            continue
+        pp = Path(plan_path)
+        if not pp.exists():
+            continue
+        try:
+            ents, _meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        holes = dwg_section_reader.read_floor_holes_from_plan(ents)
+        if not holes:
+            continue
+        bucket = out.setdefault(round(float(elev), 3), [])
+        for h in holes:
+            bucket.append({
+                "layer": h.layer,
+                "kind": h.kind,
+                "points": [[float(x), float(y)] for x, y in h.points],
+            })
+    return out
+
+
 def _slab_thicknesses_per_level(
     kg: ProjectKG,
     scale_override: Optional[float],
@@ -4571,9 +4626,16 @@ def create_floors_many(
             pass
         # Sinon : pas de skip (P7 cas typique).
 
-    # 4. Build per-level items : boundary, thickness, level_ref.
+    # 3bis. Détecte les trous (cages d'escalier, patios, atria) par niveau
+    # depuis les plans DXF — closed polylines sur A-FLOR-STAIR/OPEN/PATIO.
+    # `holes_by_elev[elev]` = list of {layer, kind, points}. Plans sans trous
+    # absents du dict.
+    holes_by_elev = _collect_floor_holes_per_level(kg, scale_override)
+
+    # 4. Build per-level items : boundary, thickness, level_ref, holes.
     floor_items_raw: List[Dict[str, Any]] = []
     thicknesses_unique: Set[int] = set()
+    holes_count_by_kind: Dict[str, int] = {}
     for elev in target_elevs:
         thk = thk_by_elev[elev]
         wall_pts: List[Tuple[float, float]] = []
@@ -4599,7 +4661,20 @@ def create_floors_many(
                 inflated.append((cx + vx * k, cy + vy * k))
             hull = inflated
         boundary = [[round(p[0], 4), round(p[1], 4)] for p in hull]
-        area_m2 = round(_shoelace_area_2d(hull), 4)
+        # Holes for this level (cages d'escalier / patios / atria). Stripped
+        # to just `points` for the floors.create_many contract ; `layer`/`kind`
+        # kept in the summary for visibility.
+        raw_holes = holes_by_elev.get(round(elev, 3), [])
+        holes_pts: List[List[List[float]]] = []
+        for h in raw_holes:
+            holes_pts.append([[round(p[0], 4), round(p[1], 4)] for p in h["points"]])
+            holes_count_by_kind[h["kind"]] = holes_count_by_kind.get(h["kind"], 0) + 1
+        # Net area : outer (shoelace) − sum(hole areas).
+        gross = _shoelace_area_2d(hull)
+        net = gross
+        for h_pts in holes_pts:
+            net -= _shoelace_area_2d([(p[0], p[1]) for p in h_pts])
+        area_m2 = round(max(net, 0.0), 4)
         thk_cm = int(round(thk * 100 / bucket_cm)) * bucket_cm
         thicknesses_unique.add(thk_cm)
         floor_items_raw.append({
@@ -4607,6 +4682,7 @@ def create_floors_many(
             "level_elevation_m": elev,
             "thickness_m": thk_cm / 100.0,
             "boundary": boundary,
+            "holes": holes_pts,
             "area_m2": area_m2,
         })
 
@@ -4651,12 +4727,15 @@ def create_floors_many(
         type_ref = type_ref_by_cm.get(thk_cm)
         if type_ref is None:
             continue
-        floors_items.append({
+        item: Dict[str, Any] = {
             "floor_type_ref": type_ref,
             "level_ref": it["level_ref"],
             "boundary": it["boundary"],
             "area_m2": it["area_m2"],
-        })
+        }
+        if it.get("holes"):
+            item["holes"] = it["holes"]
+        floors_items.append(item)
         floors_per_level[it["level_elevation_m"]] = (
             floors_per_level.get(it["level_elevation_m"], 0) + 1
         )
@@ -4669,13 +4748,21 @@ def create_floors_many(
             kg=kg, doc=doc, items=floors_items,
         )
 
+    holes_total = sum(holes_count_by_kind.values())
+    holes_note = (
+        " {} trou(s) détecté(s) ({}).".format(
+            holes_total,
+            ", ".join("{}={}".format(k, v) for k, v in sorted(holes_count_by_kind.items())),
+        ) if holes_total else ""
+    )
     note = (
         "Phase 2c : {} sol(s) créé(s) sur {} niveau(x). "
-        "{} FloorType DXF créé(s) / {} réutilisé(s). Épaisseurs : {}."
+        "{} FloorType DXF créé(s) / {} réutilisé(s). Épaisseurs : {}.{}"
         .format(
             len(floors_items), len(floors_per_level),
             types_result["created_count"], types_result["reused_count"],
             sorted(thicknesses_unique),
+            holes_note,
         )
     )
 
@@ -4686,6 +4773,7 @@ def create_floors_many(
         "types_created": types_result["created_count"],
         "types_reused": types_result["reused_count"],
         "types": types_result["types"],
+        "holes_count_by_kind": holes_count_by_kind,
         "inner_floors": inner_floors,
         "note": note,
     }
@@ -5525,6 +5613,9 @@ def _meta_phase2c_floors(
         "floors_per_level": result.get("floors_per_level"),
         "types_created": result.get("types_created"),
         "types_reused": result.get("types_reused"),
+        # Phase 2c V2 : trous détectés (cages d'escalier, patios, atria).
+        # Vide si aucun trou (cas P7).
+        "holes_count_by_kind": result.get("holes_count_by_kind") or {},
     }
 
 

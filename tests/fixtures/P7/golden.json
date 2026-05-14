@@ -2029,6 +2029,7 @@
         "revit_id": null
       }
     ],
+    "holes_count_by_kind": {},
     "inner_floors": {
       "ok": true,
       "count": 2,

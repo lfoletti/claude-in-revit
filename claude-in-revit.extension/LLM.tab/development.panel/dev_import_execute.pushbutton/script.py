@@ -117,6 +117,11 @@ def _format_result(result) -> str:
     lines.append("Phase 2c floors :")
     lines.append("  floors_created_count : {}".format(p2c.get("floors_created_count")))
     lines.append("  per_level            : {}".format(p2c.get("floors_per_level")))
+    holes = p2c.get("holes_count_by_kind") or {}
+    if holes:
+        lines.append("  trous détectés       : {}".format(
+            ", ".join("{}={}".format(k, v) for k, v in sorted(holes.items()))
+        ))
     lines.append("")
     lines.append("view_3d_opened : {}".format(result.get("view_3d_opened")))
     lines.append("")
