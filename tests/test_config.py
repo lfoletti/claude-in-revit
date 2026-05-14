@@ -84,3 +84,43 @@ def test_kg_path_for_appends_suffix(fake_home):
 def test_history_path_for_appends_suffix(fake_home):
     expected = fake_home / ".config" / "claude-in-revit" / "projects" / "abc123.history.json"
     assert config.history_path_for("abc123") == expected
+
+
+def test_pending_diffs_path_for_appends_suffix(fake_home):
+    expected = (
+        fake_home / ".config" / "claude-in-revit" / "projects"
+        / "abc123.pending_diffs.jsonl"
+    )
+    assert config.pending_diffs_path_for("abc123") == expected
+
+
+def test_hooks_sentinel_starts_absent(fake_home):
+    assert not config.are_hooks_disabled()
+    assert config.hooks_disabled_file() == (
+        fake_home / ".config" / "claude-in-revit" / "hooks.disabled"
+    )
+
+
+def test_hooks_sentinel_toggle_on(fake_home):
+    state = config.set_hooks_disabled(True)
+    assert state is True
+    assert config.are_hooks_disabled()
+    assert config.hooks_disabled_file().exists()
+
+
+def test_hooks_sentinel_toggle_off(fake_home):
+    config.set_hooks_disabled(True)
+    state = config.set_hooks_disabled(False)
+    assert state is False
+    assert not config.are_hooks_disabled()
+    assert not config.hooks_disabled_file().exists()
+
+
+def test_hooks_sentinel_toggle_idempotent(fake_home):
+    # set_hooks_disabled(False) when sentinel is already absent — no crash.
+    state = config.set_hooks_disabled(False)
+    assert state is False
+    # set_hooks_disabled(True) twice — no crash, still True.
+    config.set_hooks_disabled(True)
+    state = config.set_hooks_disabled(True)
+    assert state is True

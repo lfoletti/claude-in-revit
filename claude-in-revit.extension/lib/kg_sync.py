@@ -1344,6 +1344,140 @@ def ingest_revit_element(kg: ProjectKG, doc: Any, element: Any) -> str:
     )
 
 
+# ----- pending diffs (auto-sync hook consumer) -------------------------
+
+
+def consume_pending_diffs(kg: ProjectKG, doc: Any) -> Dict[str, Any]:
+    """Apply queued `doc-changed` events to the KG and clear the buffer.
+
+    The pyRevit `hooks/doc-changed.py` appends one JSONL record per non-LLM
+    Revit transaction commit, with the added/modified/deleted ElementIds.
+    This function is called at the start of each agent turn (cf.
+    `prompt.pushbutton/script.py`) — paresseusement, jamais inside the
+    hook itself (which is read-only re Revit).
+
+    V0 semantics by event kind :
+    - **modified** : if the Revit ID is bound to a KG node, call
+      `refresh_node_from_revit` to mirror live attrs. If unbound → skip
+      (probably an element we don't track : annotations, view-only refs).
+    - **deleted** : if bound, soft-delete the KG node. If unbound → skip.
+    - **added** : skipped in V0. The user must click *Refresh KG* to ingest
+      newly created elements. Rationale : auto-ingestion needs a "what's
+      a tracked category" policy that we don't want to bake before
+      we've seen the failure modes.
+
+    Idempotent : re-running on the same buffer is safe (refresh re-reads
+    state, soft-delete on already-deleted is a no-op). The buffer is
+    truncated only on success, so partial-apply crashes get retried.
+
+    Returns a compact summary :
+        {"ok": True, "records": N, "modified_applied": M, "deleted_applied": D,
+         "skipped_unbound": U, "skipped_added": A}
+    Empty buffer → `{"ok": True, "records": 0, ...}`. Caller decides
+    whether to surface to the user.
+    """
+    import json as _json
+
+    diffs_path = config.pending_diffs_path_for(kg.project_id)
+    if not diffs_path.exists():
+        return {
+            "ok": True, "records": 0,
+            "modified_applied": 0, "deleted_applied": 0,
+            "skipped_unbound": 0, "skipped_added": 0,
+        }
+
+    try:
+        raw = diffs_path.read_text(encoding="utf-8")
+    except OSError:
+        return {
+            "ok": False, "records": 0, "error": "buffer unreadable",
+            "modified_applied": 0, "deleted_applied": 0,
+            "skipped_unbound": 0, "skipped_added": 0,
+        }
+
+    records: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(_json.loads(line))
+        except (ValueError, _json.JSONDecodeError):
+            # Skip malformed lines (partial write during a crash). Don't
+            # abort the whole consume — log via the return summary later
+            # if we ever add structured logging.
+            continue
+
+    if not records:
+        # Empty after stripping; nothing to do but clean the file.
+        try:
+            diffs_path.unlink()
+        except FileNotFoundError:
+            pass
+        return {
+            "ok": True, "records": 0,
+            "modified_applied": 0, "deleted_applied": 0,
+            "skipped_unbound": 0, "skipped_added": 0,
+        }
+
+    modified_applied = 0
+    deleted_applied = 0
+    skipped_unbound = 0
+    skipped_added = 0
+
+    with kg.transaction():
+        for rec in records:
+            for rid in rec.get("added", []) or []:
+                # V0 : tracked categories not auto-ingested. The user
+                # clicks Refresh KG to materialise new walls/floors/etc.
+                skipped_added += 1
+            for rid in rec.get("modified", []) or []:
+                try:
+                    rid_int = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                llm_id = kg.find_by_revit_id(rid_int)
+                if llm_id is None:
+                    skipped_unbound += 1
+                    continue
+                fresh = refresh_node_from_revit(kg, doc, llm_id)
+                if fresh is not None:
+                    modified_applied += 1
+                else:
+                    skipped_unbound += 1
+            for rid in rec.get("deleted", []) or []:
+                try:
+                    rid_int = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                llm_id = kg.find_by_revit_id(rid_int)
+                if llm_id is None:
+                    skipped_unbound += 1
+                    continue
+                node = kg.get_node(llm_id)
+                if node.get("deleted_at_turn") is not None:
+                    # Already soft-deleted (idempotent retry).
+                    continue
+                kg.soft_delete(llm_id)
+                deleted_applied += 1
+
+    # Truncate only on full success — kg.transaction() commits if we got
+    # here, so the buffer is safe to clear.
+    try:
+        diffs_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    return {
+        "ok": True,
+        "records": len(records),
+        "modified_applied": modified_applied,
+        "deleted_applied": deleted_applied,
+        "skipped_unbound": skipped_unbound,
+        "skipped_added": skipped_added,
+    }
+
+
 # ----- @kg_synced decorator --------------------------------------------
 
 

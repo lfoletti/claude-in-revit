@@ -700,3 +700,168 @@ def test_kg_synced_propagates_revit_failure_and_restores_kg(tmp_path, monkeypatc
     # The body added a level, but the outer KG transaction caught the
     # commit-time exception and restored the snapshot. So the level is gone.
     assert kg.find_by_type("Level") == pre_levels
+
+
+# ----- consume_pending_diffs (auto-sync hook consumer) ------------------
+#
+# Mocks `refresh_node_from_revit` to avoid pulling on `Autodesk.Revit.DB`
+# (the real implementation does `doc.GetElement(ElementId(raw))`). We just
+# track which llm_ids were refreshed, which is enough to assert behavior.
+
+
+@pytest.fixture
+def fake_refresh(monkeypatch):
+    calls = []
+
+    def _fake(kg, doc, llm_id):
+        calls.append(llm_id)
+        # Mimic the real "returns dict on success, None on no binding".
+        return {"refreshed": True}
+
+    monkeypatch.setattr(kg_sync, "refresh_node_from_revit", _fake)
+    return calls
+
+
+def _seed_bound_wall(kg: ProjectKG, revit_id: int = 5001) -> str:
+    """Add a Wall node with a Revit binding and return its llm_id."""
+    kg.advance_turn()
+    level = kg.add_node("Level", {"name": "N00", "elevation": 0.0})
+    wt = kg.add_node("WallType", {"name": "STD200", "total_thickness": 0.2})
+    wall = kg.add_node("Wall", {
+        "type_ref": wt, "level_ref": level,
+        "p1": [0.0, 0.0], "p2": [3.0, 0.0],
+        "length": 3.0, "height": 3.0,
+    })
+    kg.set_revit_id(wall, revit_id)
+    return wall
+
+
+def test_consume_pending_diffs_empty_buffer_returns_zero_counts(fake_home, fake_refresh):
+    kg = ProjectKG("p-empty", persist_path=fake_home / "p-empty.kg.json")
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    assert summary["ok"] is True
+    assert summary["records"] == 0
+    assert summary["modified_applied"] == 0
+    assert summary["deleted_applied"] == 0
+    assert fake_refresh == []
+
+
+def _write_diffs(project_id: str, lines: list) -> Path:
+    """Write JSONL records to the project's pending_diffs buffer."""
+    import json as _j
+    path = config.pending_diffs_path_for(project_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(_j.dumps(line) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_consume_pending_diffs_modified_applies_refresh_when_bound(fake_home, fake_refresh):
+    kg = ProjectKG("p-mod", persist_path=fake_home / "p-mod.kg.json")
+    wall = _seed_bound_wall(kg, revit_id=5001)
+
+    _write_diffs("p-mod", [
+        {"ts": "2026-05-14T10:00:00Z", "tx_names": ["MoveWall"],
+         "added": [], "modified": [5001], "deleted": []},
+    ])
+
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    assert summary["ok"] is True
+    assert summary["records"] == 1
+    assert summary["modified_applied"] == 1
+    assert summary["skipped_unbound"] == 0
+    assert fake_refresh == [wall]
+
+
+def test_consume_pending_diffs_modified_skips_unbound_ids(fake_home, fake_refresh):
+    kg = ProjectKG("p-mod-unbound", persist_path=fake_home / "p-mod-unbound.kg.json")
+    _seed_bound_wall(kg, revit_id=5001)
+
+    _write_diffs("p-mod-unbound", [
+        {"ts": "x", "tx_names": ["t"], "added": [],
+         "modified": [9999], "deleted": []},  # 9999 is not in KG
+    ])
+
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    assert summary["modified_applied"] == 0
+    assert summary["skipped_unbound"] == 1
+    assert fake_refresh == []
+
+
+def test_consume_pending_diffs_deleted_soft_deletes_bound_nodes(fake_home, fake_refresh):
+    kg = ProjectKG("p-del", persist_path=fake_home / "p-del.kg.json")
+    wall = _seed_bound_wall(kg, revit_id=5001)
+    assert kg.get_node(wall).get("deleted_at_turn") is None
+
+    _write_diffs("p-del", [
+        {"ts": "x", "tx_names": ["DeleteWall"], "added": [],
+         "modified": [], "deleted": [5001]},
+    ])
+
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    assert summary["deleted_applied"] == 1
+    assert kg.get_node(wall).get("deleted_at_turn") is not None
+
+
+def test_consume_pending_diffs_added_ids_counted_as_skipped(fake_home, fake_refresh):
+    kg = ProjectKG("p-add", persist_path=fake_home / "p-add.kg.json")
+    _seed_bound_wall(kg, revit_id=5001)
+
+    _write_diffs("p-add", [
+        {"ts": "x", "tx_names": ["UserCreatedWall"],
+         "added": [7777, 8888], "modified": [], "deleted": []},
+    ])
+
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    assert summary["skipped_added"] == 2
+    assert summary["modified_applied"] == 0
+    assert summary["deleted_applied"] == 0
+
+
+def test_consume_pending_diffs_truncates_buffer_on_success(fake_home, fake_refresh):
+    kg = ProjectKG("p-trunc", persist_path=fake_home / "p-trunc.kg.json")
+    _seed_bound_wall(kg, revit_id=5001)
+    buf = _write_diffs("p-trunc", [
+        {"ts": "x", "tx_names": ["t"], "added": [],
+         "modified": [5001], "deleted": []},
+    ])
+    assert buf.exists()
+    kg_sync.consume_pending_diffs(kg, doc=object())
+    assert not buf.exists()
+
+
+def test_consume_pending_diffs_idempotent_on_already_deleted(fake_home, fake_refresh):
+    kg = ProjectKG("p-idem", persist_path=fake_home / "p-idem.kg.json")
+    wall = _seed_bound_wall(kg, revit_id=5001)
+    # Soft-delete it first.
+    kg.soft_delete(wall)
+
+    _write_diffs("p-idem", [
+        {"ts": "x", "tx_names": ["t"], "added": [],
+         "modified": [], "deleted": [5001]},
+    ])
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    # Already-deleted is a no-op (not double-deleted, not counted).
+    assert summary["deleted_applied"] == 0
+
+
+def test_consume_pending_diffs_skips_malformed_lines(fake_home, fake_refresh):
+    kg = ProjectKG("p-malformed", persist_path=fake_home / "p-malformed.kg.json")
+    _seed_bound_wall(kg, revit_id=5001)
+
+    # Write a mix of valid + malformed JSON to test resilience.
+    path = config.pending_diffs_path_for("p-malformed")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"ts":"x","tx_names":["t"],"added":[],"modified":[5001],"deleted":[]}\n'
+        '{not valid json\n'
+        '{"ts":"y","tx_names":["t"],"added":[],"modified":[],"deleted":[5001]}\n',
+        encoding="utf-8",
+    )
+    summary = kg_sync.consume_pending_diffs(kg, doc=object())
+    # 2 valid records (1 modified + 1 deleted), 1 malformed skipped silently.
+    assert summary["records"] == 2
+    assert summary["modified_applied"] == 1
+    assert summary["deleted_applied"] == 1

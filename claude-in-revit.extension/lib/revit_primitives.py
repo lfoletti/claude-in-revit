@@ -50,6 +50,9 @@ from Autodesk.Revit.DB import (  # noqa: F401  (Element re-exported for callers)
 # ----- Transactions ------------------------------------------------------
 
 
+AGENT_TX_PREFIX = "[LLM] "
+
+
 @contextmanager
 def transaction(doc, name):
     """Open a Revit `Transaction`, commit on success, roll back on exception.
@@ -59,12 +62,19 @@ def transaction(doc, name):
             pyRevit; available via `__revit__.ActiveUIDocument.Document`).
         name: Human-readable transaction name (appears in Revit's Undo stack).
 
+    The transaction name is **prefixed with `[LLM] `** so the `doc-changed`
+    pyRevit hook can distinguish our agent-driven mutations from user-driven
+    edits. The hook skips events whose transaction names start with this
+    prefix, avoiding double-processing (our `@kg_synced` path already mutates
+    the KG atomically when the agent acts). The prefix is visible in Revit's
+    Undo stack — informative, not noise.
+
     Re-raises any exception after rollback, so callers see the original
     stack trace. Guards against double-end states (a nested commit that
     already closed the transaction, or a transaction that was never
     started) via `HasStarted()` / `HasEnded()`.
     """
-    t = Transaction(doc, name)
+    t = Transaction(doc, AGENT_TX_PREFIX + name)
     t.Start()
     try:
         yield t

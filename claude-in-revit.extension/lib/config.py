@@ -38,9 +38,11 @@ ENV_VAR_NAME = "ANTHROPIC_API_KEY"
 PROJECTS_SUBDIR = "projects"
 KG_FILE_SUFFIX = ".kg.json"
 HISTORY_FILE_SUFFIX = ".history.json"
+PENDING_DIFFS_SUFFIX = ".pending_diffs.jsonl"
 SHARED_PARAMS_FILENAME = "shared_params.txt"
 ODA_PATH_FILENAME = "oda_converter_path.txt"
 ODA_ENV_VAR = "ODA_FILE_CONVERTER"
+HOOKS_DISABLED_FILENAME = "hooks.disabled"
 _ODA_DEFAULT_GLOBS = (
     r"C:\Program Files\ODA\ODAFileConverter*\ODAFileConverter.exe",
     r"C:\Program Files (x86)\ODA\ODAFileConverter*\ODAFileConverter.exe",
@@ -73,6 +75,56 @@ def projects_dir() -> Path:
 def kg_path_for(project_id: str) -> Path:
     """Return the on-disk KG path for a given project_id."""
     return projects_dir() / "{}{}".format(project_id, KG_FILE_SUFFIX)
+
+
+def pending_diffs_path_for(project_id: str) -> Path:
+    """Return the on-disk pending-diffs JSONL buffer for a given project.
+
+    Sits next to the KG and history files (cf. `kg_path_for`). The pyRevit
+    `doc-changed` hook appends one JSON record per Revit transaction
+    commit (excluding our agent's own `[LLM] *` transactions). The buffer
+    is consumed and truncated by `kg.consume_pending_diffs()` at the start
+    of each agent turn (cf. `prompt.pushbutton/script.py`).
+
+    Why JSONL : the hook runs inside Revit's UI thread, so we want O(1)
+    append; we also want the buffer to survive a crash between Revit and
+    the next agent click. JSONL = append-only line-oriented, easy to
+    truncate atomically.
+    """
+    return projects_dir() / "{}{}".format(project_id, PENDING_DIFFS_SUFFIX)
+
+
+def hooks_disabled_file() -> Path:
+    """Return the sentinel file that disables pyRevit auto-sync hooks.
+
+    Presence == hooks skip ; absence == hooks active. Toggled by the
+    `kg_autosync.pushbutton`. Lives in the per-user config dir (single
+    flag for the whole user, not per-project — V0 simplicity).
+    """
+    return config_dir() / HOOKS_DISABLED_FILENAME
+
+
+def are_hooks_disabled() -> bool:
+    """True if the sentinel file is present — hooks should early-return."""
+    return hooks_disabled_file().exists()
+
+
+def set_hooks_disabled(disabled: bool) -> bool:
+    """Toggle the sentinel file. Returns the new state (True if disabled).
+
+    Creates the parent config dir if needed. Safe to call when the file
+    already (does not) exist.
+    """
+    sentinel = hooks_disabled_file()
+    if disabled:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch(exist_ok=True)
+    else:
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+    return are_hooks_disabled()
 
 
 def history_path_for(project_id: str) -> Path:
