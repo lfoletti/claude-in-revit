@@ -14,6 +14,271 @@
 
 ---
 
+## 2026-05-14 (session v) — Driver dryrun offline + golden P7 + règle d'or pure-Python
+
+### Contexte & objectif
+
+Boucle de dev sur l'import DXF (Phase 1 → 2a/2b/2c) trop lente : chaque
+itération demandait édition code → restart Revit → Refresh KG → Prompt
+LLM → 10+ tool calls → constatation. Le journal récent (sessions r→u)
+montre que la quasi-totalité du pipeline est déterministe pure-Python ;
+seule la création Revit elle-même est en transaction. User a demandé
+un driver offline qui rejoue le pipeline complet sans LLM ni Revit, avec
+un golden test sur la fixture P7.
+
+### Décisions
+
+- **Règle d'or codée en CLAUDE.md** : « pure-Python d'abord, LLM en
+  dernier recours ». Inscrite tout en haut de `Coding policies` comme
+  méta-principe — toute partie d'un processus calculable en local est
+  préférable à une sollicitation LLM (tokens, latence, déterminisme).
+  Le driver dryrun est l'incarnation concrète de cette règle pour
+  l'import DXF.
+- **Approche driver : pas de monkey-patch, pas de fork.** Inspection
+  des leaf-tools (`walls_create_many`, `openings_create_many`,
+  `floors_create_many` + leurs `_get_or_create_dxf_type_many`) a montré
+  qu'ils ont déjà tous des fallbacks `if doc is None:` KG-only. Les
+  `rp.ensure_shared_param_binding(doc)` sont guardés. Donc le driver
+  passe simplement `doc=None` partout — le pipeline existant tourne en
+  KG-only sans aucune modification. Option B (refactor compute/apply
+  séparé) abandonnée comme prématurée.
+- **Fixture P7 dans le repo** : `tests/fixtures/P7/` (1.3 MB, 9 DXFs).
+  Le golden test tourne sans dépendance machine. Path absolu projet
+  remplacé par `<P>` à la sérialisation.
+
+### Phase A — Driver `scripts/dxf_dryrun.py`
+
+Orchestrateur qui mimique ce que le LLM fait en runtime :
+
+1. Bootstrap : `ProjectKG("dxf-dryrun")` en mémoire, pas de persistence.
+2. **Phase 1 read-only** : `check_planset_integrity`, `inspect_sections`,
+   `find_section_markers`, `assign_coupes_to_traits`, `levels_reconcile_with_dxf`.
+3. **KG seed** : crée les Levels via `levels_create_many(doc=None)`,
+   construit les `section_line_specs` en combinant `assignment.marker_index`
+   avec les `markers[mi].p1_m/p2_m/inferred_view_dir`, fabrique des
+   `linked_view_specs` avec des `revit_id` synthétiques (1_000_000+),
+   appelle `dxf_context_register_section_line_many` + `_linked_view_many`,
+   puis **`dxf_context_register_inspection`** pour matérialiser
+   `ctx.files` (critique — voir Bug 1 ci-dessous).
+4. **Phase 2** : `extract_wall_thicknesses_many`, `create_continuous_walls_many`,
+   `add_openings_to_walls_many`, `create_floors_many`, tous avec `doc=None`.
+5. **Dump** : `kg_final` (Level/Wall/WallType/FamilyType/Window/Door/FloorType/Floor),
+   normalisation paths absolus → `<P>`, écriture `dryrun_output.json`.
+
+Helpers : `_classify_dxfs` (plan/coupe/élévation par filename),
+`_fake_link_specs_for_dryrun` (synthèse `linked_views` avec view_name
+dérivé de `stem.split(" - ")[-1]` pour matcher la convention Revit
+"Niveau 0", "Élévation Est", etc.).
+
+### Phase B — Test golden `tests/test_dxf_dryrun_p7.py`
+
+Deux tests :
+- `test_p7_dryrun_matches_golden` : deep equality vs `golden.json` (76K),
+  avec un walker récursif qui imprime les 10 premiers paths divergents
+  pour rendre les régressions lisibles.
+- `test_p7_dryrun_key_counts` : assertions structurelles (3 levels, 19
+  walls, 13 windows, 2 floors, 15 plan openings, 2 oversize) — guard
+  contre la régénération à l'aveugle du golden.
+
+Procédure de régénération : `python -m scripts.dxf_dryrun` puis
+`cp dryrun_output.json golden.json` après inspection manuelle du diff.
+
+### Bug fixé en passant : `floor_type_ref` vs `type_ref`
+
+**Premier scalp du dryrun.** `create_floors_many` (dwg_import.py:4654)
+passait `type_ref` à `floors.create_many` qui exige `floor_type_ref`
+(cf. `_validate_floor_item` ligne 140). Phase 2c aurait crashé live
+en Revit dès le premier projet réel — bug latent jamais détecté car
+le smoke test session u retournait `0 floors` (paths obsolètes,
+court-circuit avant `floors_create_many`). Le driver a déclenché le
+chemin réel et levé l'erreur immédiatement. Fix : 1 ligne, `type_ref`
+→ `floor_type_ref`.
+
+### Bug fixé en passant : collector cherchait `ctx.files` sans seed
+
+**Deuxième scalp.** `_collect_plan_openings_world` (dwg_import.py:3279)
+itère `ctx.get("files")` pour trouver les plans à scanner. Or
+`dxf_context_register_linked_view_many` ne remplit QUE `linked_views`,
+pas `files` (qui est rempli par `dxf_context_register_inspection`).
+Sans appeler ce dernier, `_collect_plan_openings_world` retournait
+silencieusement `[]` → 0 openings détectées. En runtime Revit le LLM
+appelle bien `register_inspection` après `inspect_sections` (système
+prompt l'instruit), donc invisible. Le driver l'a manqué. Fix : driver
+appelle `dxf_context_register_inspection(kg, directory, inspection)`
+après les deux register_*_many.
+
+### Validation
+
+**Driver run** : 4.88s end-to-end sur P7 (vs minutes de cycle Revit).
+
+**Numériques alignés avec runtime session u** :
+- 3 levels (N0/N1/N2 = 0/3/6m).
+- 19 walls (9 N0 + 10 N1) — match exact.
+- 15 plan openings détectées, 13 windows créées + 2 oversize rejetées
+  — match exact (avant fix oversize gate de session u : 0 ; après : 13).
+- 0 doors (P7 n'a pas de portes dans les exports DXF).
+- 2 floors (1 N0 + 1 N1, N2 skippé comme toiture).
+
+**Tests** : `tests/test_dxf_dryrun_p7.py` 2/2 verts en 7.93s. Suite
+complète **599 tests verts, 0 régression**.
+
+### Bénéfice mesurable
+
+Boucle de dev Phase 2 :
+- Avant : `édition → restart Revit (~30s) → Refresh KG → Prompt → LLM
+  enchaîne 10+ tools (~60-120s) → constat`. ≈ 2-3 minutes/itération,
+  + coût tokens, + besoin que Revit soit ouvert.
+- Après : `édition → python -m scripts.dxf_dryrun → cat
+  dryrun_output.json` ou `pytest tests/test_dxf_dryrun_p7.py`. **5-8s,
+  0 tokens, 0 Revit**.
+
+Couvre 90% des régressions structurelles. Les 10% restants (refus Revit
+sur géom dégénérée, stale binding FamilyType, etc.) restent à valider
+dans Revit, mais avec un cycle beaucoup plus court vu qu'on attaque
+Revit avec un pipeline déjà sain.
+
+### Phase D — Auto-sync Revit→KG via hook DocumentChanged + toggle
+
+User : « est-ce que la mise à jour du KG projet pourrait être déclenchée
+par Revit lui-même ? ». Investigation → oui via `Application.DocumentChanged`
+event, exposé en pyRevit par convention de fichier (`hooks/doc-changed.py`).
+Compatible CPython 3.12 pour le handler simple (lecture EventArgs), pas
+pour `IUpdater` (interface .NET — à éviter en CPython, issue #692). Détails
+techniques + verdict dans la conversation pré-implémentation.
+
+**Architecture livrée** : Revit pousse les ElementIds modifiés/supprimés
+après chaque commit → hook les enqueue dans un JSONL buffer par projet →
+consommé paresseusement au début du prochain tour agent (jamais inside
+le hook, qui doit rester read-only et < 10 ms).
+
+#### Fichiers créés/modifiés
+
+- `lib/revit_primitives.py:67` : préfixe `[LLM] ` ajouté à **toutes** les
+  Tx Revit (chokepoint unique `rp.transaction`). 60+ callsites couverts
+  par 1 ligne. Constante `AGENT_TX_PREFIX` exportée pour le hook.
+- `lib/config.py` : `pending_diffs_path_for(project_id)`,
+  `hooks_disabled_file()`, `are_hooks_disabled()`, `set_hooks_disabled(bool)`.
+  File sentinel `~/.config/claude-in-revit/hooks.disabled` — présence =
+  mode MANUEL, absence = mode AUTO.
+- `lib/kg_sync.py` : nouvelle fonction `consume_pending_diffs(kg, doc)`.
+  V0 semantics : `modified` → `refresh_node_from_revit` si bound, `deleted`
+  → `soft_delete` si bound, `added` → skip (user clique Refresh KG pour
+  ingérer nouveaux éléments). Idempotent (refresh re-lit, soft-delete
+  déjà-deleted = no-op). Truncate atomique en succès.
+- `hooks/doc-changed.py` : nouveau dossier `hooks/` + handler. Early-skip
+  si sentinel présent OU si toutes les `tx_names` commencent par
+  `[LLM] `. Append JSONL avec `{ts, tx_names, added, modified, deleted}`.
+  Defensive shell `BaseException → ~/.config/claude-in-revit/last_hook_error.txt`
+  pour debug post-mortem (jamais re-throw — un crash de hook gèlerait
+  les commits Revit).
+- `LLM.tab/agent.panel/kg_autosync.pushbutton/` : bundle.yaml + script.py.
+  Toggle UI mono-clic. Confirm dialog Yes/No (default=No) qui affiche
+  l'état actuel + le futur. Pas de redémarrage Revit nécessaire (le
+  hook lit le sentinel à chaque event).
+- `prompt.pushbutton/script.py` : appel `kg_sync.consume_pending_diffs(kg, doc)`
+  juste après `kg_sync.open_or_create(doc)`. Surface dans la dialog
+  finale **uniquement si** des mutations ont eu lieu (silence sur no-op).
+- Tests `tests/test_kg_sync.py` (+8) et `tests/test_config.py` (+5) :
+  empty buffer, modified bound/unbound, deleted bound/unbound, added skipped,
+  truncate-on-success, idempotence sur already-deleted, JSON malformé,
+  sentinel start/toggle/idempotence.
+
+#### Décisions architecturales
+
+| Question | Décision | Pourquoi |
+|---|---|---|
+| Filtre user-vs-agent | Préfixe `[LLM] ` dans `rp.transaction` | Chokepoint unique, 1 ligne au lieu de 60. Visible dans l'Undo stack Revit — informatif, pas du bruit |
+| Buffer format | JSONL append-only | O(1) append, survit aux crashes Revit, lisible humain pour debug, truncation atomique |
+| Quand consommer | Au début de `run_turn()` dans le prompt pushbutton | Paresseux, jamais dans le hook (Revit interdit la mutation côté hook, issue #1659) |
+| Added IDs en V0 | Skip + compteur `skipped_added` surface dans dialog | Auto-ingest demande policy "tracked category" qu'on ne veut pas baker avant d'avoir vu les failure modes |
+| Toggle persistant | File sentinel `hooks.disabled` | Simplest UX, lecture O(1) dans le hook, persiste entre sessions, scope user-wide (pas par projet en V0) |
+| Refresh KG / drift detection | Gardés comme fallback | Manual mode reste supporté + filet de sécurité pour les édits hors session Revit |
+| `IUpdater` (DMU) | Skip V0 | Implémenter une interface .NET en CPython est fragile (issue pyRevit #692, GC issues). Si besoin de réagir *pendant* la Tx user, on l'écrira en C# compilé plus tard |
+
+#### Discipline du hook (≤ 10 ms)
+
+Le handler tourne sur le thread UI Revit, synchroniement avec d'autres
+extensions. Pour ne jamais geler perceptiblement :
+
+- Lecture EventArgs uniquement (déjà en mémoire côté Revit, microsecondes)
+- Filtre tx_name par préfixe (string compare, sub-microseconde)
+- Append JSONL via `open("a") + write + close` (~1-5 ms Windows typique)
+- **Aucune** mutation KG, **aucun** I/O réseau, **aucun** lock, **aucune** Tx Revit
+
+Coût mesuré théorique : < 5 ms par event sur batch normal, < 50 ms même
+sur transactions massives (1000+ elements). User ne perçoit jamais.
+
+#### Validation
+
+- **612 tests verts** (599 → 612 = +13 nouveaux pour le consume + sentinel).
+  Pas de régression.
+- Runtime Revit à valider sur projet réel : éditer un mur hors agent,
+  cliquer Prompt sans Refresh KG → vérifier que le mur modifié est
+  reflété dans le KG (et que dialog mentionne "1 node rafraîchi").
+
+#### Reste à faire
+
+- **Pas de `doc-opened.py` en V0**. Si le user édite un projet Revit
+  fermé (collègue qui modifie un fichier partagé), pas de hook. Drift
+  détection existante (compare attrs avant queries lourdes) couvre.
+  Hook `doc-opened.py` léger (hash + count) à ajouter en V1 si pattern
+  observé.
+- **`added` IDs sont ignorés en V0**. User clique Refresh KG pour
+  ingérer un mur créé manuellement. Si le besoin se fait sentir, ajouter
+  un `auto_ingest_added=True` flag + policy "tracked categories" (Wall,
+  Floor, Room, Door, Window, Column).
+- **Buffer growth bound** : pas de garde-fou actuel. Si user fait un
+  batch ops massif puis n'ouvre jamais Prompt, le buffer croît. À borner
+  (1 MB → rotation) si rencontré en pratique.
+- **Doc-opened drift-check léger** : `kg_sync.open_or_create()` pourrait
+  comparer un hash KG vs hash Revit pour proposer un Refresh auto. Déferé.
+
+---
+
+### Phase C — Pushbutton `reset_dxf` (UI direct, bypass LLM)
+
+Quick win identifié pendant la discussion pré-driver : actuellement,
+pour reset les imports DXF entre 2 itérations dev, l'user devait
+ouvrir le Prompt et taper « reset des imports DXF » → tour LLM →
+appel `kg_reset_dxf_imports` (tier-2). Coût : ~80-150 tokens overhead
++ 1 round-trip API + dépendance disponibilité Anthropic.
+
+Livré : `claude-in-revit.extension/LLM.tab/agent.panel/reset_dxf.pushbutton/`
+(bundle.yaml + script.py). Flow :
+1. Dry-run pour inventaire ciblé (sans mutation).
+2. Si inventaire vide → dialog « rien à reset », early-out.
+3. Confirm TaskDialog Yes/No (default=No) listant ce qui sera supprimé.
+4. Si Yes : appel `kg_reset_dxf_imports(kg, doc, dry_run=False)`.
+5. Dialog résultat avec totaux + already_gone + tour KG.
+
+Le pushbutton appelle directement `dwg_import.kg_reset_dxf_imports`
+(bypass registry, bypass tier-2 routing) — c'est une fonction Python
+ordinaire, le `@tool` decorator l'expose dans le registry mais ne
+gêne pas l'appel direct. Atomicité préservée par le tool lui-même
+(Tx KG + Tx Revit imbriquées, rollback symétrique).
+
+Pattern identique à `refresh_kg.pushbutton` : shebang `#! python3`,
+sys.path fixup, `__revit__` bare-name + `HOST_APP` fallback, guard
+PathName vide, defensive shell `BaseException + traceback`.
+
+Bénéfice : 1 clic au lieu de 1 tour LLM. Indépendant d'Anthropic.
+
+### Reste à faire
+
+- **Lever les warnings ezdxf pyparsing** (PyparsingDeprecationWarning
+  bruit dans la sortie pytest) — upstream, on attend.
+- **Étendre fixtures** : ajouter un 2e projet test (plan en L, ArchiCAD)
+  pour stress-tester le pipeline au-delà de P7-rectangle.
+- **Refactor `dwg_import.py`** (4873 lignes) en sous-modules
+  `phase1_*`/`phase2a_*`/`phase2b_*`/`phase2c_*`/`_collectors.py` —
+  navigation actuelle pénible. Pré-requis pour la suite : pas urgent
+  tant que le pipeline est stable.
+- **Code KG via graphify** — user a évoqué l'intérêt d'un graphe du
+  code. Prochain pas naturel maintenant que le dryrun + reset sont
+  en place.
+
+---
+
 ## 2026-05-13 (session u) — Cross-validation multi-source openings + Phase 2c sols
 
 ### Contexte & objectif
