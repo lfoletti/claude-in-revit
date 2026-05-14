@@ -1,0 +1,8 @@
+title: DEV Flag 3D Suspects
+tooltip: |
+  Lance `dwg_flag_3d_suspects_in_view` sur la vue active : peint en
+  rouge les éléments suspects (unconfirmed_in_3d = ≥ 1 vue 3D dit
+  'absent') et en jaune les sans-évidence (no_3d_evidence = aucune
+  vue 3D ne se prononce). Couvre walls + floors + columns + openings.
+  Réversible via DEV Clear Overrides.
+author: Lauro Foletti

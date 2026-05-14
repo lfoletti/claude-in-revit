@@ -140,7 +140,7 @@ def parse(
 
     for entity in doc.modelspace():
         try:
-            converted = _convert_entity(entity, factor)
+            converted = _convert_entity(entity, factor, doc=doc)
         except _SkipEntity:
             continue
         entities.append(converted)
@@ -248,7 +248,78 @@ class _SkipEntity(Exception):
     omitted from the output (unsupported kind, malformed coords, …)."""
 
 
-def _convert_entity(entity: Any, factor: float) -> DwgEntity:
+def _block_bbox_2d(
+    doc: Any, block_name: str, factor: float,
+) -> Optional[Tuple[float, float]]:
+    """Calcule le bbox 2D (XY) d'un bloc DXF à partir de ses entités de
+    définition. Retourne `(width_m, depth_m)` en mètres post-conversion,
+    ou None si le bloc est vide / introuvable / ne contient que des
+    entités sans géométrie 2D extractible.
+
+    Use case : déduire les dimensions de section d'un INSERT (e.g.
+    une colonne HEA160 dessinée comme un H 16×15.2 cm dans le bloc)
+    pour set les params `b`/`h` du FamilySymbol Revit dupliqué.
+
+    Pris en charge : `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`,
+    `INSERT` (nested block — récursion avec offset). Les autres entités
+    (TEXT, HATCH, etc.) sont ignorées.
+    """
+    try:
+        block = doc.blocks[block_name]
+    except KeyError:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    xs: List[float] = []
+    ys: List[float] = []
+    for e in block:
+        try:
+            kind = e.dxftype()
+            if kind == "LINE":
+                xs.extend([float(e.dxf.start.x), float(e.dxf.end.x)])
+                ys.extend([float(e.dxf.start.y), float(e.dxf.end.y)])
+            elif kind == "LWPOLYLINE":
+                for x, y, *_ in e.get_points("xyb"):
+                    xs.append(float(x)); ys.append(float(y))
+            elif kind == "POLYLINE":
+                for v in e.vertices:
+                    xs.append(float(v.dxf.location.x))
+                    ys.append(float(v.dxf.location.y))
+            elif kind == "CIRCLE":
+                cx, cy, r = float(e.dxf.center.x), float(e.dxf.center.y), float(e.dxf.radius)
+                xs.extend([cx - r, cx + r])
+                ys.extend([cy - r, cy + r])
+            elif kind == "ARC":
+                # Approximation : bbox = bbox du cercle plein. Sur-
+                # estime pour les arcs partiels mais acceptable comme
+                # majorant pour les profils de colonnes (qui sont
+                # généralement convexes).
+                cx, cy, r = float(e.dxf.center.x), float(e.dxf.center.y), float(e.dxf.radius)
+                xs.extend([cx - r, cx + r])
+                ys.extend([cy - r, cy + r])
+            elif kind == "INSERT":
+                # Bloc imbriqué : récursion avec décalage du point
+                # d'insertion. Ignore rotation/scale du nested INSERT
+                # (cas rare pour les blocs de colonnes ; à raffiner
+                # si besoin).
+                sub_bbox = _block_bbox_2d(doc, e.dxf.name, factor=1.0)
+                if sub_bbox is not None:
+                    ix, iy = float(e.dxf.insert.x), float(e.dxf.insert.y)
+                    sw, sh = sub_bbox
+                    xs.extend([ix, ix + sw])
+                    ys.extend([iy, iy + sh])
+        except Exception:  # noqa: BLE001
+            continue
+
+    if not xs:
+        return None
+    width = (max(xs) - min(xs)) * factor
+    depth = (max(ys) - min(ys)) * factor
+    return (width, depth)
+
+
+def _convert_entity(entity: Any, factor: float, doc: Any = None) -> DwgEntity:
     """Dispatch sur le DXF type de l'entité. Lève `_SkipEntity` pour les
     kinds non supportés en V0 (HATCH, SPLINE, DIMENSION, IMAGE, …).
     """
@@ -313,17 +384,25 @@ def _convert_entity(entity: Any, factor: float) -> DwgEntity:
     if dxftype == "INSERT":
         # Block reference (porte, fenêtre, mobilier — typiquement).
         insertion = _point_m(entity.dxf.insert, factor)
+        block_name = entity.dxf.name
+        # Calcul bbox du bloc référencé (utile pour dimensions de
+        # section dans Phase 2d colonnes). None si bloc vide/inconnu.
+        block_bbox = (
+            _block_bbox_2d(doc, block_name, factor) if doc is not None else None
+        )
+        attrs: Dict[str, Any] = {
+            "block_name": block_name,
+            "rotation_deg": float(entity.dxf.rotation),
+            "scale": [
+                float(entity.dxf.xscale),
+                float(entity.dxf.yscale),
+                float(entity.dxf.zscale),
+            ],
+        }
+        if block_bbox is not None:
+            attrs["block_bbox_m"] = list(block_bbox)
         return DwgEntity(
-            kind="INSERT", layer=layer, coords=[insertion],
-            attrs={
-                "block_name": entity.dxf.name,
-                "rotation_deg": float(entity.dxf.rotation),
-                "scale": [
-                    float(entity.dxf.xscale),
-                    float(entity.dxf.yscale),
-                    float(entity.dxf.zscale),
-                ],
-            },
+            kind="INSERT", layer=layer, coords=[insertion], attrs=attrs,
         )
 
     if dxftype in ("TEXT", "MTEXT"):

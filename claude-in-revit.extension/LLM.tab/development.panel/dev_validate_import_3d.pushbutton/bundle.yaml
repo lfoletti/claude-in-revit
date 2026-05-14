@@ -1,0 +1,8 @@
+title: DEV Validate 3D
+tooltip: |
+  Pré-validation manuelle de `dwg_validate_import_3d` (meta).
+  Pour chaque Wall / Floor / Column vivant du KG : compte les
+  crossings avec les coupes et vérifie la confirmation. Identifie
+  les éléments fantômes (View Range artifacts) à supprimer en UI.
+  Read-only, sûr à cliquer.
+author: Lauro Foletti

@@ -14,6 +14,345 @@
 
 ---
 
+## 2026-05-14 (session x) — Cross-validation 3D post-import, Phase 2d colonnes, fix mirror XREF coupes
+
+### Contexte & objectif
+
+Session w avait livré le méta-tool import projet (audit + execute) en
+4 round-trips et le pipeline floors avec face-tracing + trous. Session x
+attaque trois chantiers identifiés au fur et à mesure des runtimes user :
+
+1. **Cross-validation 3D des dalles** (parallèle Phase 2.1 walls) — user :
+   « cross-validation des dalles par les coupes ».
+2. **Phase 2d colonnes** (gap structurel : P2 Poteaux+dalles avait 30
+   colonnes par étage non-importées, le pipeline s'arrêtait aux walls/
+   floors/openings).
+3. **Fixes audit** révélés par P2 : scale_drift faux positif sur projets
+   sans murs en coupe (Coupe 3 = poteaux uniquement = `coupe_extent=0`),
+   idempotence views.create_section_many (collision Name sur re-run),
+   et le **dedup inter-niveaux walls** introduit puis retiré comme
+   logique trop fragile.
+4. **Validation 3D post-import** consolidée — user : « ce n'est jamais
+   "juste le plan", c'est un ensemble 3D ». Sortie : pour chaque élément
+   créé (Wall/Floor/Column/Opening), vérifier qu'au moins une vue 3D
+   (coupe ou élévation) le voit. Sinon → suspect fantôme.
+5. **Bug mirror XREF longitudinales P2** : les coupes longitudinales
+   apparaissent miroitées dans le XREF DXF. Découvert en fin de session,
+   long debug pour trouver la cause racine.
+
+### Décisions architecturales clefs
+
+- **Tools de validation post-création** suivent le pattern reconcile :
+  un par catégorie d'élément, agrégé via meta `dwg_validate_import_3d`.
+  Read-only ; sortie = listes de suspects + summary, aucune
+  suppression auto. L'user décide.
+- **Élévations comme source 3D centrale pour murs façade + fenêtres**
+  (user : « les élévations sont déterminantes pour les fenêtres et les
+  murs de façade »). Le tooling élévation existait déjà
+  (`dwg_elevation_reader.vote_wall/opening_visible_in_elevation`),
+  réutilisé tel quel. Pour P7 ça rapatrie 11/19 murs de
+  `unconfirmed`/`no_crossings` à `confirmed`.
+- **Types DXF_COL_\<famille>_\<type> placeholder** alignés avec
+  DXF_WALL_* et DXF_FLOOR_* — aucune assomption matériau (HEA acier,
+  béton, bois traités identiquement). L'user remappe vers les vraies
+  familles après import.
+- **Auto-extraction des dimensions de section** depuis le bbox du BLOCK
+  DXF référencé par chaque INSERT — pour P2 HEA160, bbox = 160×152mm
+  = norme EN 10025 exacte. Set `b`/`h` du placeholder Revit automatique-
+  ment. Pareil pour béton (BA_COL 30x30, etc.) — le block_name ne suffit
+  pas à inférer les dimensions, le bbox géométrique oui.
+- **Coloriage suspects en rouge/jaune** via
+  `View.SetElementOverrides()` — rouge = unconfirmed, jaune =
+  no_3d_evidence. Réversible via `views_clear_element_overrides`.
+  Permet à l'user d'inspecter visuellement en 3D les éléments qu'il
+  faudrait peut-être supprimer.
+
+### Phase A — `dwg_reconcile_plan_section_floors` (cross-val dalles)
+
+Symétrique exacte de `reconcile_plan_section_walls` mais sur les dalles.
+Pour chaque Floor du KG : intersecter son contour 2D avec chaque
+section_line, identifier le segment `[x_cut_min, x_cut_max]` à
+l'intérieur de la dalle dans le repère DXF coupe, chercher une paire
+top/bot dans cette coupe au bon Z, comparer épaisseur + extent.
+
+Statuts : `ok`, `thickness_mismatch`, `extent_partial`,
+`no_section_pair_at_z`, `no_section_pair_at_x` + `section_slabs_unmatched`
+(paire coupe sans pendant plan = dalle fantôme).
+
+Sur P7 réel : 5 matches OK (couverture 98-99 %) + 1 `extent_partial` sur
+Coupe 2 (couverture 63 %) — divergence entre face-tracing des murs
+(contour dalle ~17m de cut) et paire A-FLOR détectée en coupe (~10.8m).
+Signal exactement ce qu'on attendait.
+
+Helper pure-python : `_polygon_line_intersections`, `_point_in_polygon`,
+`_floor_cut_intervals_in_section` (gère les holes correctement →
+intervalles multiples). 12 tests unitaires + 1 test intégration P7.
+
+### Phase B — Fixes audit révélés par P2
+
+#### B.1 `_BUILDING_EXTENT_LAYERS` : A-WALL ∪ A-FLOR ∪ S-COLS
+
+Le check `scale_drift` calculait `coupe_extent_m = max(x) - min(x)` sur
+les `A-WALL LINE` seulement. Pour P2 Coupe 3 (= cut sur zone poteaux
+uniquement, **0 A-WALL LINE**) : extent = 0 → drift 100% → `drift_error`
+→ gate abort. Faux positif systématique.
+
+Fix : centraliser via `_BUILDING_EXTENT_LAYERS` (dict layer → kinds
+acceptés). A-WALL (LINE), A-FLOR (LINE), S-COLS (LINE + INSERT). Match
+exact sur le layer name → exclut `S-COLS-IDEN` (labels) qui inflaterait.
+4 sites refactorisés (`_coupe_a_wall_extent_m` renommé
+`_coupe_building_extent_m`, `dwg_verify_section_scale`, 2 sites dans
+`import_project_audit`). Résultat sur P2 : drift max passe de 100 % à
+33 % (warning, plus error).
+
+#### B.2 Idempotence `views_create_section_many`
+
+User a re-run un import → `ArgumentException: Name must be unique` sur
+`view.Name = spec["name"]` (les ViewSections du run précédent existaient
+déjà). Fix : avant la création, list les ViewSections du doc par nom ;
+si nom déjà présent → réutiliser (no-op). Output enrichi de
+`reused_count` / `created_count` + flag `reused` par section.
+
+#### B.3 Dedup inter-niveaux walls (= ajouté puis retiré)
+
+User a observé sur P2 : « j'ai des murs en trop pour P2, au niveau 2 »
+(plan d'étage Revit exporté montre par View Range les éléments du
+niveau inférieur). Première tentative : `wall_inter_level_dedup.py`
+qui détecte les murs d'un niveau supérieur dont la centerline est
+couverte par l'union des murs collinéaires d'un niveau inférieur.
+Mode `full_coverage_only=True` (100 % des murs du niveau = doublons)
+pour éviter de casser P7 où N1 stack des murs porteurs sur N0
+(50% match = empilage légitime).
+
+**Retiré** suite à un faux positif sur P2 Niveau 1 (apartment dont
+les 5 murs périmètre matchent un subset des 8 murs N0 base) :
+100 % de match → tous skippés → niveau vidé à tort. La logique
+géométrique seule ne distingue pas « empilage intentionnel » de
+« View Range artifact ».
+
+User a tranché : « ce n'est jamais "juste le plan", c'est un ensemble
+3D ». L'approche correcte = cross-validation 3D (cf. Phase D). Module
+`wall_inter_level_dedup.py` conservé (20 tests) comme outillage
+d'audit futur, désactivé en production.
+
+### Phase C — Phase 2d colonnes (P2)
+
+**Gap identifié** : P2 avait 30/60/30 INSERTs S-COLS par niveau,
+0 colonne importée. Aucun pont DWG → Column.
+
+#### Stratégie en 4 stages (cf. policy CLAUDE.md)
+
+1. **Stage 0 — observation** sur P2 : block_name pattern Revit
+   `Poteau HE-A - HEA160-\<instance_id>-Niveau N`, rotations
+   homogènes 0°, scales 1.0, 30 positions par étage. Le suffix
+   `-Niveau N` reflète l'export plan, PAS le niveau de la colonne
+   dans Revit (ne pas se fier).
+2. **Stage 1 — helper pur** `lib/dwg_plan_columns.py` :
+   `parse_column_block_name`, `extract_columns_from_entities`,
+   `dedup_columns_within_plans` (per-level mode, **pas
+   d'aggregation cross-level** — user a clarifié : « 30 par étage
+   × 3 = 90 colonnes total » suivant convention Revit structurelle
+   1 colonne par storey).
+3. **Stage 2 — types placeholder** `columns_get_or_create_dxf_type_many` :
+   pour chaque `(family, type)` unique, duplique un FamilySymbol
+   poteau générique du projet + renomme `DXF_COL_<famille>_<type>`.
+   Set automatique des params `b`/`h` (auto-détecté parmi
+   `b`/`Width`/`Largeur` et `h`/`Depth`/`Profondeur`/`Hauteur`) à
+   partir du bbox 2D du BLOCK DXF.
+4. **Stage 3 — tool wrapper** `dwg_create_columns_many` + Stage 4
+   tests + pushbutton DEV.
+
+#### Bug DXF reader
+
+`_convert_entity` lisait bien `entity.dxf.name` mais ne calculait pas
+le bbox du BLOCK référencé. Ajouté `_block_bbox_2d(doc, block_name,
+factor)` qui itère les entités de la définition BLOCK et retourne
+`(width_m, depth_m)` via min/max XY. Attaché à
+`attrs["block_bbox_m"]` de chaque INSERT. Récursif sur les blocs
+imbriqués.
+
+Sur P2 HEA160 : bbox extrait = `(0.160, 0.152)` m → exactement la
+norme EN 10025. Toutes les 30 colonnes au N0 ont bbox identique.
+Le placeholder Revit `DXF_COL_Poteau HE-A_HEA160` se crée avec
+ces dimensions, **résolvant la 2e plainte user** : « elles sont
+beaucoup plus larges que dans le fichier original » (avant : placeholder
+héritait du base symbol 30×30 cm).
+
+#### Tool bonus : `columns_create_rectangular_concrete_types_many`
+
+User a demandé en parenthèse : « fonction pour créer une nouvelle
+famille de colonne en béton armé structurel, type 16x16, 22x22,
+30x30 ». Discussion : créer une .rfa from scratch via API serait
+2-3 jours (FamilyDocument séparé, template .rft, géométrie
+paramétrique). Décision : **dupliquer des types** dans une famille
+rectangulaire béton existante (`M_Concrete-Rectangular-Column` ou
+équivalent FR du template structural). Pattern de nommage
+`BA_COL_<w>x<h>`. Auto-détection famille base par priorité
+(structural+concrete+rectangulaire → struct+rect → struct → arch+
+concrete). Tests KG-only sur 16x16/22x22/30x30 + variantes
+rectangle + bois/béton/acier.
+
+### Phase D — Validation 3D existence post-import
+
+User : « d'abord la cross-validation de l'existence d'éléments d'après
+la 3D ».
+
+4 tools tier=2 (`dwg_validate_walls_3d_existence`,
+`_floors_`, `_columns_`, `_openings_3d_existence`) + meta
+`dwg_validate_import_3d`. Verdict par élément :
+
+- `confirmed` : ≥ 1 YES (coupe ok/ambig OU élévation YES)
+- `unconfirmed` : ≥ 1 NO (coupe sans match ou élévation contradictoire)
+- `no_3d_evidence` : 0 YES, 0 NO partout (aucune vue ne peut juger)
+- + `thickness_mismatch_only` (walls), `extent_partial` (floors)
+  pour les sous-cas
+
+#### Élévations cruciales pour façades + fenêtres
+
+Sans élévation : sur P7, 8/19 murs confirmés, 5/19 `unconfirmed`,
+6/19 `no_crossings` (murs façade non-coupés par aucun trait).
+
+Avec élévation (4 vues N/S/E/O P7) : **19/19 confirmés**. Les
+élévations rapatrient tout. Validation du principe user.
+
+#### `read_section_columns` (nouveau helper)
+
+Pour valider l'existence des colonnes en coupe, ajouté à
+`dwg_section_reader` la détection d'INSERT S-COLS + paires verticales
+S-COLS LINE. Pour colonnes (= points 2D, pas segments), distance
+point↔trait via `_distance_point_to_segment` au lieu d'intersection.
+
+#### Coloriage suspects (rouge/jaune)
+
+`views_override_element_colors_many` (tier=1) : générique, accepte
+`[{llm_id, color}]` + view_ref optionnel. Surcharge projection +
+cut + surface foreground avec solid fill pattern. Couleurs nommées
+(red/yellow/orange/...) ou RGB direct.
+
+`dwg_flag_3d_suspects_in_view` (tier=2, meta) : appelle
+`validate_import_3d`, peint en rouge les `unconfirmed`
+(+ `extent_partial` côté floors), jaune les `no_3d_evidence`.
+`views_clear_element_overrides` pour reset.
+
+### Phase E — Bug mirror XREF longitudinales P2
+
+User : « les coupes longitudinales sont miroitées sur l'axe, elles
+devraient être miroitées [pour être correctes] ».
+
+#### Investigation (long)
+
+Sur P2 4 coupes : 2 longitudinales miroitées dans le même sens
+(« l'est devient l'ouest dans les 2 cas »). Plusieurs hypothèses
+explorées et écartées :
+
+- **`view_dir` mal inféré** : non, les markers ont les rotations
+  attendues (180° pour Coupe 1 → down, 0° pour Coupe 4 → up).
+- **`basis_x` viewer's right inversé** : non, calcul cross product
+  est correct mathématiquement.
+- **Trait direction (p2-p1)** : Revit ne s'en sert pas pour BasisX.
+
+#### Bug racine
+
+L'auto-détection (qui teste les 2 conventions par cross-validation
+plan↔coupe) trouve correctement : Coupe 1 = `identity` (DXF X =
++world X), Coupe 4 = `reversed` (DXF X = -world X), confirmé par
+inspection directe des A-WALL bbox plan vs coupe. Fix tenté :
+modifier `bbox.Transform.BasisX` dans `compute_section_view_bounds`
+pour qu'il pointe dans la direction attendue.
+
+Diagnostic post-création (dump `view.RightDirection` Revit-side) :
+**Revit IGNORE notre `bbox.Transform.BasisX` dans `ViewSection.
+CreateSection` et re-dérive sa propre version** (= viewer's right
+classique, dépend uniquement de `view_dir`).
+
+```
+✗ Coupe 1  intended=[1, 0, 0]   actual=[-1, 0, 0]
+✓ Coupe 2  intended=[0, -1, 0]  actual=[0, -1, 0]    (no flip needed)
+✗ Coupe 3  intended=[0, 1, 0]   actual=[0, -1, 0]
+✗ Coupe 4  intended=[-1, 0, 0]  actual=[1, 0, 0]
+```
+
+#### Fix final : post-link `MirrorElements`
+
+Puisque Revit ignore le flip BasisX, on mirror le DXF link APRÈS le
+placement, via `ElementTransformUtils.MirrorElements(doc, [eid],
+plane, mirrorCopies=False)`. Plane = YZ pour traits horizontaux,
+XZ pour traits verticaux, passant par world (0, 0, 0) (compatible
+avec la convention DXF coupe d'origine).
+
+Wired dans `_link_cad_to_view` (paramètre `mirror_post_link=True/
+False`), `views.link_cad_many` (par-item `mirror_post_link`),
+`_meta_link_cad_for_all_dxfs` (calcule
+`need_mirror = (x_axis_convention is not None) and (basis_x_match is
+False)`).
+
+Validation user : **« c'est bon pour l'orientation »**. Les 3 coupes
+miroitées (Coupe 1, 3, 4) sont maintenant correctement orientées.
+Coupe 2 (basis_x_match déjà ✓) reste inchangée.
+
+#### Auto-détection convention X axis
+
+`dwg_coherence.detect_section_x_axis_convention(plan_walls,
+section_line, section_walls_in_coupe)` teste les 2 conventions par
+matching mur plan ↔ section_wall (par épaisseur + position).
+Confidence = `(winner - loser) / max(walls_crossed, 1)`. Intégré
+dans `import_project_audit` qui ajoute `x_axis_convention` à
+chaque entrée de `section_assignment`. Propagé via le meta-pipeline
+jusqu'à `_link_cad_to_view`.
+
+### Pushbuttons housekeeping
+
+User : « tu peux retirer des pushbuttons, pour faire de la place :
+clear overrides, create columns, audit import, reconcile floors ».
+Supprimés. Restent dans `LLM.tab/development.panel/` :
+`dev_import_execute`, `dev_validate_import_3d`, `dev_flag_suspects`.
+
+### Validation
+
+- **729 tests verts** en fin de session (vs 622 début).
+- Test golden P7 (`test_p7_dryrun_matches_golden`) régénéré 2 fois
+  (changements de payload sur `create_continuous_walls_many` puis
+  retrait des champs dedup).
+- Test d'intégration P7 ajouté pour chaque validation 3D
+  (`test_tool_validate_walls/floors/import_3d_meta_p7`).
+- Smoke test live Revit P2 : 12 murs / 12 fenêtres / 3 sols / 90
+  poteaux créés. Orientation XREF coupes correcte. Coloriage
+  rouge/jaune fonctionne (non-mesuré formellement mais code de la
+  pipeline traversé sans crash).
+
+### État final & reste à faire
+
+**Pipeline import projet complet désormais :**
+
+1. `dwg_import_project_audit(directory)` — gate + plan
+2. `dwg_import_project_execute(directory, level_actions, ...)` —
+   Phase 1.5 + 2a + 2b + 2c + 2d (colonnes) + ouvre 3D
+3. `dwg_validate_import_3d` — validation 3D consolidée des 4 catégories
+4. `dwg_flag_3d_suspects_in_view` — coloriage des suspects
+
+**Gaps pour V1+** :
+
+- **UC8 compliance audit** — pas démarré, gros chantier.
+- **UC6 vision** (esquisse → modèle) — pas démarré.
+- **Escaliers** — parenthèse ouverte session x, parquée option A
+  (detect+report) ou B (auto-creation StairsEditScope fragile).
+- **Toitures pentues** — actuellement dalle plate au niveau max,
+  pas de vraie `Roof` Revit.
+- **Convention X axis ambiguë (0 mur croisé)** : pour Coupe 3 de
+  P2, détection a abouti à `identity` par défaut (ambiguous, 0 mur).
+  Si convention réelle = reversed → mirror appliqué dans le mauvais
+  sens. À mitiger en V1 (fallback : tester aussi avec sols / poteaux
+  pour confidence supplémentaire, ou warning visible).
+- **Module `wall_inter_level_dedup`** conservé dead-code mais avec
+  20 tests. À utiliser comme outillage d'audit (pas auto-suppression)
+  dans une future itération.
+- **`compute_section_view_bounds.x_axis_convention` paramètre** : le
+  code est conservé mais Revit l'ignore (cf. Phase E). Pourrait
+  être retiré ; gardé comme documentation du bug et pour le
+  diagnostic `intended vs actual`.
+
+---
+
 ## 2026-05-14 (session w) — Méta-tool import projet + règle de pré-validation pushbutton
 
 ### Contexte & objectif

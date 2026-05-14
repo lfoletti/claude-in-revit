@@ -1463,6 +1463,139 @@ def read_section_walls(
     return out
 
 
+# ----- Colonnes observées en coupe (Phase 2d.2 validation 3D) ----------
+#
+# Convention Revit-AIA : en coupe, un poteau apparaît typiquement comme
+# un INSERT sur S-COLS au x_cut de la colonne (l'export Revit met le
+# bloc à la position projetée). Plus rarement comme une paire verticale
+# de LINEs S-COLS. Le détecteur capture les deux cas.
+#
+# `x_cut_m` = X dans le repère DXF coupe = world Y (trait vertical) ou
+# world X (trait horizontal). Pour valider une colonne plan à
+# `(x_col, y_col)` : `expected_x_cut = y_col` (vert) ou `x_col` (horiz),
+# et chercher un SectionColumn à cette abscisse (± tol).
+
+
+_LAYER_COLUMNS_SECTION = "S-COLS"
+
+
+@dataclass
+class SectionColumn:
+    """Une colonne observée dans un DXF de coupe.
+
+    `x_cut_m` : position X dans le repère coupe.
+    `kind` : "insert" (bloc S-COLS) ou "line_pair" (paire verticale).
+    `width_m` : largeur estimée si `kind="line_pair"` (sinon None).
+    `y_bottom_m` / `y_top_m` : extension verticale visible (utile pour
+    vérifier que la colonne couvre le bon niveau ; pour `kind="insert"`,
+    c'est la position d'insertion ± hauteur block bbox si dispo).
+    `block_name` : pour traçabilité (kind=insert uniquement).
+    """
+    x_cut_m: float
+    kind: str
+    width_m: Optional[float]
+    y_bottom_m: float
+    y_top_m: float
+    layer: str
+    block_name: Optional[str] = None
+
+
+def read_section_columns(
+    entities: List[DwgEntity],
+    *,
+    min_width_m: float = 0.05,
+    max_width_m: float = 1.50,
+    vertical_tol_rad: float = math.radians(5.0),
+) -> List[SectionColumn]:
+    """Extrait les colonnes visibles dans un DXF de coupe (layer S-COLS).
+
+    Deux modes de détection :
+
+    1. **INSERTs** sur S-COLS (pattern le plus courant — Revit export
+       par défaut) : chaque INSERT = 1 colonne à son insertion x.
+       Le bbox du bloc (si présent dans `attrs["block_bbox_m"]`) donne
+       width × height de la section.
+    2. **Paires verticales de LINEs** S-COLS : fallback pour les
+       exports où les colonnes sont dessinées comme rectangles ouverts.
+       Réutilise la même logique que `read_section_walls` mais sur
+       S-COLS et avec bornes de largeur plus serrées (5cm à 1.5m).
+
+    Args:
+        entities: liste de `DwgEntity` du DXF coupe.
+        min_width_m / max_width_m: bornes de largeur (m). Défaut
+            adaptés à poteaux courants (HEA160 = 16cm, mégastructures
+            jusqu'à 1.5m).
+        vertical_tol_rad: tolérance d'angle pour « vertical ».
+
+    Returns:
+        Liste de `SectionColumn`, triée par `x_cut_m`.
+    """
+    out: List[SectionColumn] = []
+
+    # 1. INSERTs sur S-COLS.
+    for e in entities:
+        if e.layer != _LAYER_COLUMNS_SECTION or e.kind != "INSERT":
+            continue
+        if not e.coords:
+            continue
+        pt = e.coords[0]
+        bbox = e.attrs.get("block_bbox_m")
+        width = None
+        y_bot = float(pt[1])
+        y_top = float(pt[1])
+        if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 2:
+            width = float(bbox[0])
+            # Block bbox typiquement la section transversale (XY),
+            # pas la hauteur. On ne peut pas inférer y_top/y_bot de
+            # façon fiable. Garder y_top=y_bot=insertion y.
+        out.append(SectionColumn(
+            x_cut_m=round(float(pt[0]), 6),
+            kind="insert",
+            width_m=width,
+            y_bottom_m=round(y_bot, 6),
+            y_top_m=round(y_top, 6),
+            layer=e.layer,
+            block_name=str(e.attrs.get("block_name") or ""),
+        ))
+
+    # 2. Paires verticales de LINEs sur S-COLS (fallback).
+    from . import dwg_classifier as _cls
+    segments = _cls.extract_straight_segments(
+        entities, layer_filter=[_LAYER_COLUMNS_SECTION],
+    )
+    pairs, _rejected = _cls.detect_wall_segments(
+        segments,
+        min_thickness_m=min_width_m,
+        max_thickness_m=max_width_m,
+    )
+    for w in pairs:
+        dx = w.p2[0] - w.p1[0]
+        dy = w.p2[1] - w.p1[1]
+        angle = math.atan2(dy, dx)
+        if angle < 0:
+            angle += math.pi
+        if angle >= math.pi:
+            angle -= math.pi
+        delta = abs(angle - math.pi / 2.0)
+        delta = min(delta, math.pi - delta)
+        if delta > vertical_tol_rad:
+            continue
+        x_cut = (w.p1[0] + w.p2[0]) / 2.0
+        y_bottom = min(w.p1[1], w.p2[1])
+        y_top = max(w.p1[1], w.p2[1])
+        out.append(SectionColumn(
+            x_cut_m=round(x_cut, 6),
+            kind="line_pair",
+            width_m=round(w.thickness, 6),
+            y_bottom_m=round(y_bottom, 6),
+            y_top_m=round(y_top, 6),
+            layer=w.layer,
+        ))
+
+    out.sort(key=lambda sc: sc.x_cut_m)
+    return out
+
+
 # ----- Reconcile niveaux DXF ↔ KG (Étape 5 Phase 1) ---------------------
 
 

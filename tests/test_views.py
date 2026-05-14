@@ -145,7 +145,10 @@ def test_create_section_many_kg_only(kg_fresh):
     payload = json.loads(result["content"])
     assert payload["ok"] is True
     assert payload["count"] == 2
+    assert payload["created_count"] == 2
+    assert payload["reused_count"] == 0
     assert all(s["revit_id"] is None for s in payload["sections"])
+    assert all(s["reused"] is False for s in payload["sections"])
     assert payload["sections"][0]["section_length_m"] == 10.0
     assert payload["sections"][1]["section_length_m"] == 10.0
 

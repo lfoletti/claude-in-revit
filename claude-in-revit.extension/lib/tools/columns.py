@@ -8,7 +8,7 @@ poteaux qui n'exposent pas ce paramètre lèvent un message actionnable.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ._helpers import bulk_summary, stamp_llm_id
 from ..llm_protocol import tool
@@ -630,3 +630,718 @@ def create_grid_irregular(
                 "height": height,
             })
     return create_many(kg=kg, doc=doc, items=items)
+
+
+# ----- DXF import : get-or-create ColumnType (placeholder DXF_COL_*) ---
+#
+# Phase 2d — création / réutilisation d'un `ColumnType` KG pour chaque
+# paire `(family_name, type_name)` extraite d'un DXF (cf. `dwg_plan_
+# columns.parse_column_block_name`).
+#
+# Stratégie alignée avec `DXF_WALL_<thk>cm` et `DXF_FLOOR_<thk>cm` :
+# on crée un **placeholder générique** `DXF_COL_<famille>_<type>` en
+# dupliquant un FamilySymbol de poteau générique du projet (le 1er
+# trouvé dans les catégories `Columns` / `StructuralColumns`). Aucune
+# assomption sur le matériau réel : HEA acier, poteau béton, bois, etc.
+# encodés dans le nom mais matérialisés par une famille placeholder.
+# L'user remappe vers les vraies familles après import (même flow que
+# les types DXF_WALL_/DXF_FLOOR_).
+
+
+def _dxf_column_type_name(family_name: str, type_name: str) -> str:
+    """Forge le nom du ColumnType DXF placeholder : ``DXF_COL_<family>_<type>``.
+
+    Le nom encode la métadonnée du block DXF original pour la traçabilité.
+    Sanitize les caractères non-Revit-compatibles (``\\``, ``/``, ``:``,
+    ``{``, ``}``, ``;``, ``<``, ``>``, ``?``, ``|``).
+    """
+    def _sanitize(s: str) -> str:
+        forbidden = "\\/:;{}<>?|"
+        return "".join(c if c not in forbidden else "_" for c in s).strip()
+    return "DXF_COL_{}_{}".format(_sanitize(family_name), _sanitize(type_name))
+
+
+def _find_dxf_column_type_in_kg_by_name(
+    kg: ProjectKG, target_name: str,
+) -> Optional[str]:
+    """Cherche un ColumnType KG vivant dont le `type_name` (rebaptisé en
+    DXF_COL_*) matche le placeholder cible."""
+    for nid in kg.find_by_type("ColumnType"):
+        attrs = kg.get_node(nid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        if attrs.get("type_name") == target_name:
+            return nid
+    return None
+
+
+def _find_generic_column_family_symbol(doc: Any):
+    """Cherche un FamilySymbol de poteau dans le projet, n'importe lequel.
+
+    Stratégie : le 1er FamilySymbol trouvé dans une catégorie
+    `Columns` ou `StructuralColumns` (insensible à la casse, EN+FR).
+    Préfère une catégorie `StructuralColumns` à `Columns` si les deux
+    existent (poteau S-COLS = structurel par défaut).
+
+    Retourne None si aucun poteau n'est chargé dans le projet (cas
+    template vide — user doit charger au moins une famille).
+    """
+    from Autodesk.Revit.DB import FamilySymbol, FilteredElementCollector
+    structural: Optional[Any] = None
+    architectural: Optional[Any] = None
+    for sym in FilteredElementCollector(doc).OfClass(FamilySymbol):
+        try:
+            cat = sym.Category
+            if cat is None:
+                continue
+            cat_name = (cat.Name or "").lower()
+            is_struct = (
+                "structural column" in cat_name
+                or "poteau" in cat_name and "structurel" in cat_name
+                or "poteau structurel" in cat_name
+                or "colonne structurel" in cat_name
+            )
+            is_arch = (
+                "column" in cat_name and not is_struct
+                or "poteau" in cat_name and not is_struct
+                or "colonne" in cat_name and not is_struct
+            )
+            if is_struct and structural is None:
+                structural = sym
+            elif is_arch and architectural is None:
+                architectural = sym
+            if structural is not None and architectural is not None:
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    return structural or architectural
+
+
+def _create_dxf_column_type_kg_only(
+    kg: ProjectKG, family_name: str, type_name: str, kind: str,
+) -> str:
+    """Crée un node KG ColumnType. Le `type_name` stocké est le nom
+    placeholder (`DXF_COL_*`) ; `family_name` reste celui d'origine
+    (= nom de la famille Revit du base placeholder)."""
+    return kg.add_node("ColumnType", {
+        "family_name": family_name,
+        "type_name": type_name,
+        "kind": kind,
+    })
+
+
+@tool(name="columns_get_or_create_dxf_type_many", tier=1)
+def get_or_create_dxf_type_many(
+    kg: ProjectKG,
+    doc: Any,
+    types: List[Dict[str, Any]],
+    base_type_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Crée (ou réutilise) N ColumnType placeholder ``DXF_COL_<famille>_<type>``
+    pour chaque paire `(family_name, type_name)` extraite d'un DXF.
+
+    Use case : pendant `dwg_create_columns_many`, on extrait toutes les
+    paires `(family_name, type_name)` distinctes apparaissant dans les
+    plans (via `dwg_plan_columns.parse_column_block_name`). Ce tool
+    crée un ColumnType placeholder pour chaque paire — pattern **strict-
+    ement aligné avec `walls_get_or_create_dxf_type_many` et
+    `floors_get_or_create_dxf_type_many`**.
+
+    **Placeholder générique, pas de match sur familles réelles** : pour
+    chaque paire, on **duplique un FamilySymbol de poteau générique**
+    déjà chargé dans le projet (le 1er trouvé dans Columns/StructuralColumns).
+    Le nouveau type est nommé `DXF_COL_<famille>_<type>` (e.g.
+    `DXF_COL_Poteau HE-A_HEA160`, `DXF_COL_Poteau béton_30x30`,
+    `DXF_COL_Poteau bois_BLC 200x200`). L'user remappe ensuite vers les
+    vraies familles HEA acier / béton paramétrique / bois après import,
+    comme pour les types DXF_WALL_*/DXF_FLOOR_*.
+
+    **Aucune assomption sur le matériau** — même comportement pour HEA
+    acier, béton, bois.
+
+    Concepts: poteau, column type, dxf, import, phase 2d, placeholder,
+              get or create, bulk, dxf_col, generic
+    Phrases: "crée les types de poteaux DXF nécessaires",
+             "get or create column types", "phase 2d types"
+    Similar: walls_get_or_create_dxf_type_many,
+             floors_get_or_create_dxf_type_many, columns_create_many
+
+    Args:
+        types: liste de dicts `{family_name, type_name, kind?}` :
+            - `family_name` : nom famille Revit source DXF (e.g. "Poteau HE-A").
+              Conservé comme métadonnée traçable dans le nom placeholder.
+            - `type_name` : nom du type Revit source DXF (e.g. "HEA160").
+            - `kind` (optionnel) : "structural" (défaut) ou "architectural".
+        base_type_ref: llm_id d'un ColumnType template à dupliquer.
+            Si None (défaut), cherche automatiquement un poteau générique
+            chargé dans le projet (préférence structurel).
+
+    Returns:
+        ``{"ok": bool, "types": [{family_name, type_name, kind, llm_id,
+            created, revit_id}, ...], "created_count": int,
+            "reused_count": int}``
+        - `type_name` dans le payload est le placeholder DXF_COL_<...>,
+          pas le type_name d'entrée.
+    """
+    if not isinstance(types, list) or not types:
+        raise ValueError("types must be a non-empty list")
+
+    # Dédup par placeholder name.
+    seen_names: Set[str] = set()
+    unique_specs: List[Dict[str, Any]] = []
+    for i, t in enumerate(types):
+        if not isinstance(t, dict):
+            raise ValueError("types[{}] must be a dict".format(i))
+        family = t.get("family_name")
+        type_ = t.get("type_name")
+        kind = t.get("kind", "structural")
+        width_m = t.get("width_m")
+        depth_m = t.get("depth_m")
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(
+                "types[{}]: family_name required (str)".format(i)
+            )
+        if not isinstance(type_, str) or not type_.strip():
+            raise ValueError(
+                "types[{}]: type_name required (str)".format(i)
+            )
+        if kind not in ("structural", "architectural"):
+            raise ValueError(
+                "types[{}]: kind must be structural|architectural, "
+                "got {!r}".format(i, kind)
+            )
+        if width_m is not None and (not isinstance(width_m, (int, float)) or width_m <= 0):
+            raise ValueError(
+                "types[{}]: width_m must be a positive number or None".format(i)
+            )
+        if depth_m is not None and (not isinstance(depth_m, (int, float)) or depth_m <= 0):
+            raise ValueError(
+                "types[{}]: depth_m must be a positive number or None".format(i)
+            )
+        placeholder_name = _dxf_column_type_name(family.strip(), type_.strip())
+        if placeholder_name in seen_names:
+            continue
+        seen_names.add(placeholder_name)
+        unique_specs.append({
+            "original_family": family.strip(),
+            "original_type": type_.strip(),
+            "placeholder_name": placeholder_name,
+            "kind": kind,
+            "width_m": float(width_m) if width_m is not None else None,
+            "depth_m": float(depth_m) if depth_m is not None else None,
+        })
+
+    out: List[Dict[str, Any]] = []
+    created_count = 0
+    reused_count = 0
+
+    # KG-only path (doc=None) : pas de duplication Revit, juste un node KG.
+    if doc is None:
+        for spec in unique_specs:
+            existing = _find_dxf_column_type_in_kg_by_name(
+                kg, spec["placeholder_name"],
+            )
+            if existing is not None:
+                node = kg.get_node(existing)
+                out.append({
+                    "family_name": node.get("family_name", spec["original_family"]),
+                    "type_name": spec["placeholder_name"],
+                    "kind": node.get("kind", spec["kind"]),
+                    "llm_id": existing,
+                    "created": False,
+                    "revit_id": None,
+                })
+                reused_count += 1
+            else:
+                nid = _create_dxf_column_type_kg_only(
+                    kg, spec["original_family"], spec["placeholder_name"],
+                    spec["kind"],
+                )
+                out.append({
+                    "family_name": spec["original_family"],
+                    "type_name": spec["placeholder_name"],
+                    "kind": spec["kind"],
+                    "llm_id": nid,
+                    "created": True,
+                    "revit_id": None,
+                })
+                created_count += 1
+        return {
+            "ok": True, "types": out,
+            "created_count": created_count, "reused_count": reused_count,
+        }
+
+    # Revit-backed path : duplique FamilySymbol générique et bind.
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    # Résoud le base FamilySymbol une fois.
+    if base_type_ref is not None:
+        if not kg.has_node(base_type_ref):
+            raise ValueError("Unknown base_type_ref: {}".format(base_type_ref))
+        base_eid_raw = kg.get_revit_id(base_type_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_type_ref {} has no Revit binding".format(base_type_ref)
+            )
+        base_sym = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_sym = _find_generic_column_family_symbol(doc)
+        if base_sym is None:
+            raise ValueError(
+                "Aucun FamilySymbol de poteau (Columns / StructuralColumns) "
+                "n'est chargé dans ce projet Revit. Charge au moins une "
+                "famille de poteau générique (.rfa) avant l'import — "
+                "elle servira de placeholder pour les DXF_COL_*."
+            )
+
+    # Auto-détecte les params b/h une fois sur le base symbol.
+    base_wp_name, base_wp = _find_dimension_param(
+        base_sym, _BA_COL_WIDTH_PARAM_CANDIDATES,
+    )
+    base_dp_name, base_dp = _find_dimension_param(
+        base_sym, _BA_COL_DEPTH_PARAM_CANDIDATES,
+    )
+
+    with rp.transaction(doc, "columns.get_or_create_dxf_type_many"):
+        for spec in unique_specs:
+            existing = _find_dxf_column_type_in_kg_by_name(
+                kg, spec["placeholder_name"],
+            )
+            if existing is not None:
+                # Valider que le binding Revit est encore vivant.
+                rid = kg.get_revit_id(existing)
+                rid_alive = False
+                if rid is not None:
+                    try:
+                        rid_alive = doc.GetElement(ElementId(rid)) is not None
+                    except Exception:  # noqa: BLE001
+                        rid_alive = False
+                if rid_alive:
+                    node = kg.get_node(existing)
+                    out.append({
+                        "family_name": node.get(
+                            "family_name", spec["original_family"],
+                        ),
+                        "type_name": spec["placeholder_name"],
+                        "kind": node.get("kind", spec["kind"]),
+                        "llm_id": existing,
+                        "created": False,
+                        "revit_id": rid,
+                    })
+                    reused_count += 1
+                    continue
+                # Stale binding : on tombe en création fraîche ci-dessous.
+            # Duplique le base FamilySymbol avec le placeholder name.
+            new_sym = base_sym.Duplicate(spec["placeholder_name"])
+            # Set les params dimensionnels si fournis (bbox bloc DXF).
+            # Sinon, le placeholder garde les params par défaut du base
+            # symbol (e.g. 30×30 cm) — l'user remappe manuellement.
+            dims_applied = False
+            if (spec.get("width_m") is not None
+                    and spec.get("depth_m") is not None
+                    and base_wp is not None and base_dp is not None):
+                from .. import revit_primitives as rp_
+                new_wp = new_sym.LookupParameter(base_wp_name)
+                new_dp = new_sym.LookupParameter(base_dp_name)
+                if new_wp is not None and new_dp is not None:
+                    new_wp.Set(rp_.meters_to_internal(spec["width_m"]))
+                    new_dp.Set(rp_.meters_to_internal(spec["depth_m"]))
+                    dims_applied = True
+            new_rid = int(new_sym.Id.Value)
+            nid = _create_dxf_column_type_kg_only(
+                kg, spec["original_family"], spec["placeholder_name"],
+                spec["kind"],
+            )
+            kg.set_revit_id(nid, new_rid)
+            out.append({
+                "family_name": spec["original_family"],
+                "type_name": spec["placeholder_name"],
+                "kind": spec["kind"],
+                "llm_id": nid,
+                "created": True,
+                "revit_id": new_rid,
+                "dimensions_applied": dims_applied,
+                "width_m": spec.get("width_m"),
+                "depth_m": spec.get("depth_m"),
+            })
+            created_count += 1
+
+    return {
+        "ok": True, "types": out,
+        "created_count": created_count, "reused_count": reused_count,
+    }
+
+
+# ----- BA_COL_<wxh> : types rectangulaires béton armé ------------------
+#
+# Tool utilitaire pour créer en bulk des types `BA_COL_<w>x<h>` dans
+# une famille de poteau rectangulaire béton existante (typiquement
+# `M_Concrete-Rectangular-Column` du template structural Revit, ou son
+# équivalent FR `Poteau béton rectangulaire`). Prefix `BA_COL` = Béton
+# Armé Colonne.
+#
+# Pourquoi pas créer une famille .rfa from scratch : trop coûteux pour
+# le besoin (cf. discussion 2026-05-14). Une famille rectangulaire
+# paramétrique existe par défaut dans tous les templates Revit
+# structurels — on duplique des types dedans.
+
+
+# Paramètres standards (insensible à la casse côté lookup) pour les
+# dimensions b (largeur) et h (profondeur). Ordre = priorité. La 1re
+# trouvée dans la famille est utilisée.
+_BA_COL_WIDTH_PARAM_CANDIDATES = ("b", "Width", "Largeur", "Largeur (b)", "B")
+_BA_COL_DEPTH_PARAM_CANDIDATES = (
+    "h", "Depth", "Profondeur", "Hauteur", "Height",
+    "Profondeur (h)", "H",
+)
+
+
+def _ba_col_type_name(width_cm: int, depth_cm: int) -> str:
+    """Nom du type : ``BA_COL_<w>x<h>`` en cm (entiers)."""
+    return "BA_COL_{}x{}".format(int(width_cm), int(depth_cm))
+
+
+def _find_rectangular_concrete_column_family_symbol(doc: Any):
+    """Cherche un FamilySymbol de poteau rectangulaire béton dans le
+    projet. Priorité décroissante :
+
+    1. Catégorie `StructuralColumns` + family name contient `concrete`/
+       `béton`/`beton`/`b.a.` ET `rectangulaire`/`rectangular`/`rect`.
+    2. Catégorie `StructuralColumns` + family name contient `rectangulaire`/
+       `rectangular` (toute matière).
+    3. Catégorie `StructuralColumns` (n'importe quel rectangle).
+    4. Catégorie `Columns` (architectural) + name `concrete`/`béton`.
+
+    Retourne None si rien de trouvé.
+    """
+    from Autodesk.Revit.DB import FamilySymbol, FilteredElementCollector
+    candidates_struct_concrete: List[Any] = []
+    candidates_struct_rect: List[Any] = []
+    candidates_struct_any: List[Any] = []
+    candidates_arch_concrete: List[Any] = []
+
+    for sym in FilteredElementCollector(doc).OfClass(FamilySymbol):
+        try:
+            cat = sym.Category
+            if cat is None:
+                continue
+            cat_name = (cat.Name or "").lower()
+            is_struct = (
+                "structural column" in cat_name
+                or "poteau structurel" in cat_name
+                or "poteaux porteurs" in cat_name
+                or "colonne structurel" in cat_name
+            )
+            is_col_arch = (
+                ("column" in cat_name or "poteau" in cat_name
+                 or "colonne" in cat_name) and not is_struct
+            )
+            if not (is_struct or is_col_arch):
+                continue
+            fam_name = (sym.Family.Name or "").lower()
+            is_concrete = (
+                "concrete" in fam_name or "béton" in fam_name
+                or "beton" in fam_name or "b.a." in fam_name
+                or "b a " in fam_name
+            )
+            is_rect = (
+                "rectangulaire" in fam_name or "rectangular" in fam_name
+                or "rect" in fam_name
+            )
+            if is_struct and is_concrete and is_rect:
+                candidates_struct_concrete.append(sym)
+            elif is_struct and is_rect:
+                candidates_struct_rect.append(sym)
+            elif is_struct:
+                candidates_struct_any.append(sym)
+            elif is_col_arch and is_concrete:
+                candidates_arch_concrete.append(sym)
+        except Exception:  # noqa: BLE001
+            continue
+    for bucket in (
+        candidates_struct_concrete,
+        candidates_struct_rect,
+        candidates_struct_any,
+        candidates_arch_concrete,
+    ):
+        if bucket:
+            return bucket[0]
+    return None
+
+
+def _find_dimension_param(sym: Any, candidates: tuple):
+    """Cherche le 1er param trouvé dans `sym` (FamilySymbol) parmi
+    `candidates`. Retourne (param_name, param_object) ou (None, None).
+    """
+    for name in candidates:
+        try:
+            p = sym.LookupParameter(name)
+        except Exception:  # noqa: BLE001
+            p = None
+        if p is not None:
+            return (name, p)
+    return (None, None)
+
+
+@tool(name="columns_create_rectangular_concrete_types_many", tier=1)
+def create_rectangular_concrete_types_many(
+    kg: ProjectKG,
+    doc: Any,
+    dimensions_cm: List[Dict[str, Any]],
+    base_family_ref: Optional[str] = None,
+    width_param: Optional[str] = None,
+    depth_param: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Crée (ou réutilise) N types ``BA_COL_<w>x<h>`` dans une famille de
+    poteau rectangulaire béton existante.
+
+    Use case : avant ou après import DXF (Phase 2d), l'user veut avoir
+    une palette de types béton armé prêts à l'emploi (16x16, 22x22,
+    30x30 typique pour villa / petit bâtiment). Ce tool évite de les
+    créer un par un dans le UI Revit (Project Browser → Families →
+    duplicate → rename → set params).
+
+    **Pas de création de famille `.rfa` from scratch** : on duplique
+    des types dans une famille existante (cf. discussion 2026-05-14 :
+    create-from-scratch via API est 10-50× plus coûteux pour aucun
+    gain sur du rectangulaire paramétrique standard).
+
+    Pré-requis : une famille de poteau rectangulaire est chargée dans
+    le projet (typique : `M_Concrete-Rectangular-Column.rfa` du
+    template structural Revit, ou son équivalent FR). Si aucune n'est
+    chargée, le tool lève une erreur actionnable.
+
+    Pattern de nommage : ``BA_COL_<w>x<h>`` (w, h en cm entiers).
+    Exemples : ``BA_COL_16x16``, ``BA_COL_22x22``, ``BA_COL_30x30``.
+
+    Concepts: poteau, column, béton, beton, ba, b.a., armé, rectangulaire,
+              type, bulk, batch, 16x16, 22x22, 30x30
+    Phrases: "crée les types béton armé 16x16, 22x22, 30x30",
+             "ajoute les types BA_COL", "bulk concrete column types"
+    Similar: columns_get_or_create_dxf_type_many, columns_create_many
+
+    Args:
+        dimensions_cm: liste de dicts `{width_cm: int, depth_cm: int}`.
+            Pour des poteaux carrés, mettre `width_cm == depth_cm`.
+            Doublons internes auto-dédoublonnés.
+        base_family_ref: llm_id d'un ColumnType template à utiliser.
+            Si None (défaut), auto-détecte une famille rectangulaire
+            structurelle béton dans le projet.
+        width_param: nom du paramètre largeur (auto-détecté si absent
+            parmi `b`/`Width`/`Largeur`).
+        depth_param: nom du paramètre profondeur (auto-détecté parmi
+            `h`/`Depth`/`Profondeur`/`Hauteur`).
+
+    Returns:
+        ``{"ok": bool, "types": [{width_cm, depth_cm, name, llm_id,
+            created, revit_id}, ...], "created_count": int,
+            "reused_count": int, "base_family_name": str,
+            "width_param_used": str, "depth_param_used": str}``
+    """
+    if not isinstance(dimensions_cm, list) or not dimensions_cm:
+        raise ValueError("dimensions_cm must be a non-empty list")
+
+    # Validation + dédup interne.
+    seen_keys: Set[Tuple[int, int]] = set()
+    unique_dims: List[Tuple[int, int]] = []
+    for i, d in enumerate(dimensions_cm):
+        if not isinstance(d, dict):
+            raise ValueError("dimensions_cm[{}] must be a dict".format(i))
+        w = d.get("width_cm")
+        h = d.get("depth_cm")
+        if not isinstance(w, (int, float)) or w <= 0:
+            raise ValueError(
+                "dimensions_cm[{}]: width_cm must be positive number".format(i)
+            )
+        if not isinstance(h, (int, float)) or h <= 0:
+            raise ValueError(
+                "dimensions_cm[{}]: depth_cm must be positive number".format(i)
+            )
+        wi, hi = int(round(w)), int(round(h))
+        if (wi, hi) in seen_keys:
+            continue
+        seen_keys.add((wi, hi))
+        unique_dims.append((wi, hi))
+
+    out: List[Dict[str, Any]] = []
+    created_count = 0
+    reused_count = 0
+
+    # KG-only path : juste créer les nodes (utile pour test offline).
+    if doc is None:
+        for (w, h) in unique_dims:
+            name = _ba_col_type_name(w, h)
+            existing = _find_dxf_column_type_in_kg_by_name(kg, name)
+            if existing is not None:
+                node = kg.get_node(existing)
+                out.append({
+                    "width_cm": w, "depth_cm": h,
+                    "name": name,
+                    "family_name": node.get("family_name", "BA_COL"),
+                    "llm_id": existing,
+                    "created": False, "revit_id": None,
+                })
+                reused_count += 1
+            else:
+                nid = _create_dxf_column_type_kg_only(
+                    kg, family_name="BA_COL", type_name=name,
+                    kind="structural",
+                )
+                out.append({
+                    "width_cm": w, "depth_cm": h,
+                    "name": name, "family_name": "BA_COL",
+                    "llm_id": nid,
+                    "created": True, "revit_id": None,
+                })
+                created_count += 1
+        return {
+            "ok": True, "types": out,
+            "created_count": created_count, "reused_count": reused_count,
+            "base_family_name": "BA_COL",  # placeholder kg-only
+            "width_param_used": None, "depth_param_used": None,
+        }
+
+    # Revit-backed path : duplique le base FamilySymbol, set les params.
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId
+
+    if base_family_ref is not None:
+        if not kg.has_node(base_family_ref):
+            raise ValueError(
+                "Unknown base_family_ref: {}".format(base_family_ref)
+            )
+        base_eid_raw = kg.get_revit_id(base_family_ref)
+        if base_eid_raw is None:
+            raise ValueError(
+                "base_family_ref {} has no Revit binding".format(base_family_ref)
+            )
+        base_sym = doc.GetElement(ElementId(base_eid_raw))
+    else:
+        base_sym = _find_rectangular_concrete_column_family_symbol(doc)
+        if base_sym is None:
+            raise ValueError(
+                "Aucune famille de poteau rectangulaire béton (catégorie "
+                "StructuralColumns + nom contenant 'rectangulaire'/'beton') "
+                "n'est chargée dans ce projet. Charge `M_Concrete-"
+                "Rectangular-Column.rfa` (ou ton équivalent FR) depuis "
+                "la Revit Library, puis relance — OU passe `base_family_"
+                "ref` explicitement."
+            )
+
+    # Activer le base symbol si nécessaire (pour pouvoir lire les params).
+    if not base_sym.IsActive:
+        # Activer demande une Tx — on ouvre la Tx ici pour tout.
+        pass
+
+    base_family_name = base_sym.Family.Name
+
+    # Auto-detect ou utiliser les param names fournis.
+    if width_param is not None:
+        wp_name, wp_obj = width_param, base_sym.LookupParameter(width_param)
+        if wp_obj is None:
+            raise ValueError(
+                "width_param {!r} non trouvé sur le FamilySymbol {!r}. "
+                "Params disponibles : {}".format(
+                    width_param, base_sym.Name,
+                    [p.Definition.Name for p in base_sym.Parameters],
+                )
+            )
+    else:
+        wp_name, wp_obj = _find_dimension_param(
+            base_sym, _BA_COL_WIDTH_PARAM_CANDIDATES,
+        )
+        if wp_obj is None:
+            raise ValueError(
+                "Aucun paramètre largeur trouvé sur {!r} parmi {}. "
+                "Passe `width_param` explicitement.".format(
+                    base_sym.Name, list(_BA_COL_WIDTH_PARAM_CANDIDATES),
+                )
+            )
+    if depth_param is not None:
+        dp_name, dp_obj = depth_param, base_sym.LookupParameter(depth_param)
+        if dp_obj is None:
+            raise ValueError(
+                "depth_param {!r} non trouvé sur le FamilySymbol {!r}. "
+                "Params disponibles : {}".format(
+                    depth_param, base_sym.Name,
+                    [p.Definition.Name for p in base_sym.Parameters],
+                )
+            )
+    else:
+        dp_name, dp_obj = _find_dimension_param(
+            base_sym, _BA_COL_DEPTH_PARAM_CANDIDATES,
+        )
+        if dp_obj is None:
+            raise ValueError(
+                "Aucun paramètre profondeur trouvé sur {!r} parmi {}. "
+                "Passe `depth_param` explicitement.".format(
+                    base_sym.Name, list(_BA_COL_DEPTH_PARAM_CANDIDATES),
+                )
+            )
+
+    with rp.transaction(doc, "columns.create_rectangular_concrete_types_many"):
+        # Activer le base symbol si pas déjà fait.
+        if not base_sym.IsActive:
+            base_sym.Activate()
+            doc.Regenerate()
+        for (w, h) in unique_dims:
+            name = _ba_col_type_name(w, h)
+            existing = _find_dxf_column_type_in_kg_by_name(kg, name)
+            if existing is not None:
+                rid = kg.get_revit_id(existing)
+                rid_alive = False
+                if rid is not None:
+                    try:
+                        rid_alive = doc.GetElement(ElementId(rid)) is not None
+                    except Exception:  # noqa: BLE001
+                        rid_alive = False
+                if rid_alive:
+                    out.append({
+                        "width_cm": w, "depth_cm": h,
+                        "name": name,
+                        "family_name": kg.get_node(existing).get(
+                            "family_name", base_family_name,
+                        ),
+                        "llm_id": existing,
+                        "created": False, "revit_id": rid,
+                    })
+                    reused_count += 1
+                    continue
+                # Stale binding → tombe en création.
+
+            # Duplique le base symbol avec le nouveau nom.
+            new_sym = base_sym.Duplicate(name)
+            # Set les params dimensionnels (mètres → internal feet).
+            w_internal = rp.meters_to_internal(w / 100.0)
+            h_internal = rp.meters_to_internal(h / 100.0)
+            # LookupParameter sur le NEW symbol (duplicate a ses propres params).
+            new_wp = new_sym.LookupParameter(wp_name)
+            new_dp = new_sym.LookupParameter(dp_name)
+            if new_wp is None or new_dp is None:
+                raise ValueError(
+                    "Param {}/{} introuvable sur le type dupliqué {!r}. "
+                    "Bug ou famille atypique.".format(wp_name, dp_name, name)
+                )
+            new_wp.Set(w_internal)
+            new_dp.Set(h_internal)
+            new_rid = int(new_sym.Id.Value)
+            nid = _create_dxf_column_type_kg_only(
+                kg, family_name=base_family_name, type_name=name,
+                kind="structural",
+            )
+            kg.set_revit_id(nid, new_rid)
+            out.append({
+                "width_cm": w, "depth_cm": h, "name": name,
+                "family_name": base_family_name,
+                "llm_id": nid,
+                "created": True, "revit_id": new_rid,
+            })
+            created_count += 1
+
+    return {
+        "ok": True, "types": out,
+        "created_count": created_count, "reused_count": reused_count,
+        "base_family_name": base_family_name,
+        "width_param_used": wp_name, "depth_param_used": dp_name,
+    }

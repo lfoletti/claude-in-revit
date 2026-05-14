@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 # Lookup view_dir (plan-natural) → vecteur de regard (world).
@@ -81,6 +81,7 @@ def compute_section_view_bounds(
     top_elev_m: float = 6.0,
     far_clip_m: float = 20.0,
     height_buffer_m: float = 1.0,
+    x_axis_convention: Optional[str] = None,
 ) -> SectionViewBounds:
     """Calcule le Transform + BBox pour `ViewSection.CreateSection`.
 
@@ -108,6 +109,12 @@ def compute_section_view_bounds(
             en bord).
         height_buffer_m: marge au-dessus du top_elev_m pour inclure
             toiture / parapet (default 1 m).
+        x_axis_convention: `"identity"` (défaut) ou `"reversed"`. Si
+            `"reversed"`, `basis_x` est inversé pour corriger un XREF
+            DXF miroité quand la source Revit a flippé la section
+            (FlipDirection). Détecté automatiquement par
+            `dwg_detect_section_orientations` en cross-validant murs
+            plan ↔ section_walls coupe. Cf. fix bug session 2026-05-14.
 
     Returns:
         `SectionViewBounds` avec origin, basis vectors, bbox min/max.
@@ -166,6 +173,37 @@ def compute_section_view_bounds(
     # orientation finale de BasisX (= right hand du viewer).
     basis_x = _cross(basis_z, basis_y)
     basis_x = _normalize(basis_x)
+    # **Convention X axis** (optionnel) : `x_axis_convention` décrit la
+    # direction du **DXF X axis en absolu** (= +world axis pour
+    # "identity", -world axis pour "reversed"). Le basis_x du calcul
+    # ci-dessus (= viewer's right) peut avoir +X ou -X composante selon
+    # view_dir. Si son signe ne matche pas la convention, on flip —
+    # sinon la link DXF apparaît miroitée. Cas P2 :
+    # - view_dir=down + DXF identity : default basis_x = -X, convention
+    #   demande +X → FLIP.
+    # - view_dir=up + DXF reversed : default basis_x = +X, convention
+    #   demande -X → FLIP.
+    # - view_dir=up + DXF identity : default basis_x = +X, convention
+    #   +X → no flip. (P7 case)
+    #
+    # Si `x_axis_convention is None` (défaut backward-compat), AUCUN
+    # ajustement n'est appliqué — basis_x reste viewer's right brut.
+    if x_axis_convention is not None:
+        if x_axis_convention not in ("identity", "reversed"):
+            raise ValueError(
+                "x_axis_convention must be 'identity', 'reversed' or "
+                "None, got {!r}".format(x_axis_convention)
+            )
+        trait_dx = p2[0] - p1[0]
+        trait_dy = p2[1] - p1[1]
+        is_horizontal_trait = abs(trait_dx) > abs(trait_dy)
+        if is_horizontal_trait:
+            current_sign = 1 if basis_x[0] > 0 else -1
+        else:
+            current_sign = 1 if basis_x[1] > 0 else -1
+        expected_sign = 1 if x_axis_convention == "identity" else -1
+        if current_sign != expected_sign:
+            basis_x = (-basis_x[0], -basis_x[1], -basis_x[2])
 
     # BBox en repère LOCAL :
     # X: ±half-section-length (symétrique le long de la section line).

@@ -908,24 +908,17 @@ def verify_section_scale(
     else:
         coupe_units_factor = coupe_meta["units_factor_to_m"]
 
-    # Coupe A-WALL X extent (in metres post-conversion).
-    xs: List[float] = []
-    for e in coupe_entities:
-        if e.layer != "A-WALL" or e.kind != "LINE":
-            continue
-        for pt in e.coords:
-            xs.append(pt[0])
-    if not xs:
-        # Fallback : use any LINE on any wall-like layer.
-        for e in coupe_entities:
-            if e.kind == "LINE":
-                for pt in e.coords:
-                    xs.append(pt[0])
-    if not xs:
+    # Coupe building X extent (in metres post-conversion). A-WALL ∪
+    # A-FLOR LINEs : robuste aux coupes sans mur (poteaux-dalles, P2).
+    coupe_extent_m = _building_extent_from_entities(coupe_entities)
+    if coupe_extent_m is None:
         return {
             "ok": False,
             "scale_match": False,
-            "warning": "Coupe contient aucune LINE — extent géométrique non calculable.",
+            "warning": (
+                "Coupe contient aucune LINE A-WALL ou A-FLOR — extent "
+                "géométrique non calculable."
+            ),
             "section_line_length_m": float(section_line_length_m),
             "coupe_a_wall_extent_m": 0.0,
             "drift_pct": float("inf"),
@@ -934,8 +927,6 @@ def verify_section_scale(
             "plan_units_factor": plan_units_factor,
             "coupe_units_factor": coupe_units_factor,
         }
-
-    coupe_extent_m = max(xs) - min(xs)
     sl_len = float(section_line_length_m)
     drift_m = abs(sl_len - coupe_extent_m)
     # drift_pct relatif à la valeur max (plus stable que relativement à
@@ -987,20 +978,58 @@ def verify_section_scale(
 # ----- 7. Assign coupes to traits (Phase 1 Étape 2.5 — fix swap) -------
 
 
-def _coupe_a_wall_extent_m(path: Path) -> Optional[float]:
-    """Helper : retourne l'étendue X des LINEs A-WALL d'un DXF coupe,
-    en mètres. None si le fichier n'a pas de A-WALL.
+# Layers utilisés comme proxy de l'étendue X d'un DXF coupe (= largeur
+# du bâtiment vue en coupe). Mapping `layer → allowed entity kinds` :
+# - `A-WALL` (LINE) : faces des murs coupés. Base historique.
+# - `A-FLOR` (LINE) : faces des dalles. Requis pour les projets dominés
+#   par les dalles où une coupe peut ne traverser aucun mur (cas P2
+#   Coupe 3 — poteaux + dalles uniquement).
+# - `S-COLS` (LINE + INSERT) : poteaux structurels. En coupe, un poteau
+#   peut être (a) un rectangle 4-LINEs, (b) un bloc INSERT à son point
+#   d'insertion. Inclus pour les projets poteaux-dominants où les
+#   colonnes étendent l'enveloppe au-delà de la dalle (P2 Coupe 3 :
+#   poteaux à 28m, dalle à 16m).
+#
+# Exclus : annotations (`G-ANNO-*`, `A-FLOR-LEVL`, `S-COLS-IDEN`,
+# `S-GRID`, etc.) qui peuvent dépasser largement le contour réel. Match
+# exact sur le nom de layer → `S-COLS-IDEN` ne matche pas `S-COLS`.
+#
+# `S-BEAM` (poutres) sera ajouté quand on aura un projet fixture pour
+# valider le comportement — pour P2/P7 c'est neutre.
+_BUILDING_EXTENT_LAYERS: Dict[str, Tuple[str, ...]] = {
+    "A-WALL": ("LINE",),
+    "A-FLOR": ("LINE",),
+    "S-COLS": ("LINE", "INSERT"),
+}
+
+
+def _building_extent_from_entities(entities: List[Any]) -> Optional[float]:
+    """X extent (max - min) des entités structurelles d'un DXF coupe,
+    en mètres post-conversion. Pour chaque layer dans `_BUILDING_EXTENT_
+    LAYERS`, ne prend que les `kind` autorisés (cf. mapping). Retourne
+    None si aucune entité pertinente.
     """
-    entities, _ = dwg_reader.parse(path)
     xs: List[float] = []
     for e in entities:
-        if e.layer != "A-WALL" or e.kind != "LINE":
+        allowed_kinds = _BUILDING_EXTENT_LAYERS.get(e.layer)
+        if not allowed_kinds:
+            continue
+        if e.kind not in allowed_kinds:
             continue
         for pt in e.coords:
             xs.append(pt[0])
     if not xs:
         return None
     return max(xs) - min(xs)
+
+
+def _coupe_building_extent_m(path: Path) -> Optional[float]:
+    """Helper : retourne l'étendue X du contour bâtiment d'un DXF coupe
+    (A-WALL ∪ A-FLOR LINEs), en mètres. None si le fichier n'a aucune
+    LINE pertinente.
+    """
+    entities, _ = dwg_reader.parse(path)
+    return _building_extent_from_entities(entities)
 
 
 @tool(name="dxf_assign_coupes_to_traits", tier=2)
@@ -1057,9 +1086,12 @@ def assign_coupes_to_traits(
         path = Path(p)
         if not path.exists():
             raise FileNotFoundError("Coupe not found: {}".format(path))
-        ext = _coupe_a_wall_extent_m(path)
+        ext = _coupe_building_extent_m(path)
         if ext is None:
-            raise ValueError("Coupe {} has no A-WALL LINEs".format(path.name))
+            raise ValueError(
+                "Coupe {} has no A-WALL or A-FLOR LINEs (rien à mesurer "
+                "comme contour bâtiment)".format(path.name)
+            )
         coupe_extents.append((str(path), ext))
 
     # Précalcul des longueurs de section markers.
@@ -1153,6 +1185,75 @@ def _match_to_dict(m: dwg_coherence.WallSectionMatch) -> Dict[str, Any]:
     if m.candidate_indices:
         out["candidate_indices"] = m.candidate_indices
     return out
+
+
+def _section_slab_to_dict(s: dwg_section_reader.SectionFloorSlab) -> Dict[str, Any]:
+    return {
+        "top_y_m": round(s.top_y_m, 4),
+        "bot_y_m": round(s.bot_y_m, 4),
+        "thickness_m": round(s.thickness_m, 4),
+        "x_min_m": round(s.x_min_m, 4),
+        "x_max_m": round(s.x_max_m, 4),
+    }
+
+
+def _floor_match_to_dict(m: dwg_coherence.FloorSectionMatch) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "plan_floor_index": m.plan_floor_index,
+        "plan_level_elevation_m": m.plan_level_elevation_m,
+        "plan_thickness_m": m.plan_thickness_m,
+        "section_line_index": m.section_line_index,
+        "section_line_name": m.section_line_name,
+        "coupe_path": m.coupe_path,
+        "cut_interval_m": list(m.cut_interval_m),
+        "status": m.status,
+    }
+    if m.section_slab_index is not None:
+        out["section_slab_index"] = m.section_slab_index
+    if m.section_top_y_m is not None:
+        out["section_top_y_m"] = m.section_top_y_m
+    if m.section_thickness_m is not None:
+        out["section_thickness_m"] = m.section_thickness_m
+    if m.thickness_drift_m is not None:
+        out["thickness_drift_m"] = m.thickness_drift_m
+    if m.coverage_ratio is not None:
+        out["coverage_ratio"] = m.coverage_ratio
+    return out
+
+
+def _collect_plan_floors_from_kg(kg: ProjectKG) -> List[Dict[str, Any]]:
+    """Sérialise les Floor vivants du KG en dicts consommables par
+    ``dwg_coherence.reconcile_plan_section_floors`` : résout
+    ``level_ref → elevation`` et ``type_ref → total_thickness``.
+
+    Les Floor sans boundary/level/type valides sont skippés silencieusement
+    (cas dégénéré — ne devrait pas exister après dwg_create_floors_many).
+    """
+    plan_floors: List[Dict[str, Any]] = []
+    for fid in sorted(kg.find_by_type("Floor")):
+        f = kg.get_node(fid)
+        if f.get("deleted_at_turn") is not None:
+            continue
+        boundary = f.get("boundary") or []
+        level_ref = f.get("level_ref")
+        type_ref = f.get("type_ref")
+        if not boundary or not level_ref or not type_ref:
+            continue
+        try:
+            lvl = kg.get_node(level_ref)
+            ft = kg.get_node(type_ref)
+        except KeyError:
+            continue
+        plan_floors.append({
+            "llm_id": fid,
+            "boundary": [list(p) for p in boundary],
+            "holes": [[list(p) for p in h] for h in (f.get("holes") or [])],
+            "elevation_m": float(lvl.get("elevation", 0.0)),
+            "thickness_m": float(ft.get("total_thickness", 0.0)),
+            "level_name": lvl.get("name"),
+            "type_name": ft.get("name"),
+        })
+    return plan_floors
 
 
 @tool(name="dwg_reconcile_plan_section_walls", tier=2)
@@ -1386,6 +1487,1642 @@ def reconcile_plan_section_walls(
         "walls_plan_not_crossed_indices": walls_not_crossed_payload,
         "walls_plan_not_crossed_truncated": walls_not_crossed_truncated,
         "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+@tool(name="dwg_reconcile_plan_section_floors", tier=2)
+def reconcile_plan_section_floors(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    z_tol_m: float = 0.05,
+    thickness_tol_m: float = 0.02,
+    coverage_min_ratio: float = 0.80,
+) -> Dict[str, Any]:
+    """Recoupe les dalles du plan (Floors du KG) avec celles observées
+    dans chaque coupe (Phase 2c.1 — symétrique de Phase 2.1 pour les murs).
+
+    Vérifie que chaque dalle créée par ``dwg_create_floors_many`` a un
+    pendant cohérent dans les coupes : Z (= élévation du niveau),
+    épaisseur (= ``FloorType.total_thickness``), et extent (= la portion
+    de coupe à l'intérieur du contour plan doit être couverte par une
+    paire top/bot dans la coupe).
+
+    Détecte 5 types d'anomalies :
+    - ``thickness_mismatch`` : épaisseur plan ≠ épaisseur coupe.
+    - ``extent_partial`` : la paire ne couvre que partiellement la zone
+      de coupe (signal : trémie non-détectée en plan OU contour trop
+      large).
+    - ``no_section_pair_at_z`` : aucune paire en coupe au niveau de la
+      dalle (signal fort de dalle plan « fantôme »).
+    - ``no_section_pair_at_x`` : paire(s) au bon Z mais sans overlap X.
+    - ``section_slabs_unmatched`` : paire en coupe sans pendant plan
+      (= dalle potentiellement oubliée en plan).
+
+    **Read-only** : aucun écrit Revit, aucun écrit KG. Le caller décide
+    quoi faire (typiquement présenter via ``ui_confirm_choices``).
+
+    Concepts: dxf, dwg, recoupement, cohérence, floors, sols, dalles,
+              slabs, plan, coupe, section, épaisseur, thickness,
+              élévation, extent, trémie, phase 2c, audit, vérification
+    Phrases: "recoupe les dalles plan et coupes",
+             "vérifie la cohérence des sols", "phase 2c étape 1",
+             "audit floors plan coupe", "check plan section floors"
+    Similar: dwg_reconcile_plan_section_walls, dwg_create_floors_many,
+             dwg_inspect_sections
+
+    Args:
+        scale_override: facteur m-par-unité-DXF (cf. ``dwg_inspect``).
+        section_lines: liste de section_lines explicite (cf. format de
+            ``DxfImportContext.section_lines``). Si absent, lue depuis
+            le KG via ``_find_live_context``.
+        z_tol_m: tolérance Z pour match niveau (défaut 5 cm).
+        thickness_tol_m: tolérance d'épaisseur (défaut 2 cm).
+        coverage_min_ratio: fraction min de l'intervalle de coupe qui
+            doit être recouverte par la paire pour ``status="ok"``
+            (défaut 0.80). En-dessous : ``extent_partial``.
+
+    Returns:
+        ``{"ok": bool, "plan_floors_count": int, "section_lines_count": int,
+           "section_slabs_count_by_coupe": {path: int},
+           "summary": {matches_ok, thickness_mismatches, extent_partial,
+                       no_section_pair_at_z, no_section_pair_at_x,
+                       plan_floors_total, plan_floors_not_crossed,
+                       section_slabs_unmatched, section_lines_count},
+           "matches_ok": [...],
+           "thickness_mismatches": [...],
+           "extent_partial": [...],
+           "no_section_pair_at_z": [...],
+           "no_section_pair_at_x": [...],
+           "section_slabs_unmatched": [...],
+           "floors_plan_not_crossed_indices": [...],
+           "needs_user_decision": bool,
+           "note": str}``
+    """
+    # --- 1. Récupérer les Floors vivants du KG --------------------------
+    plan_floors = _collect_plan_floors_from_kg(kg)
+
+    # --- 2. Récupérer les section_lines ---------------------------------
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext vivant dans le KG et `section_lines` "
+                "non fourni. Lance d'abord Phase 1 (dwg_inspect_sections + "
+                "dxf_context_register_section_line[_many]) ou passe explicite-"
+                "ment `section_lines`."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines enregistrées. "
+                "Lance Phase 1 étape 2 d'abord (dxf_context_register_section_"
+                "line[_many]).",
+            )
+
+    # --- 3. Parse chaque coupe référencée → section slabs --------------
+    section_slabs_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    distinct_coupe_paths = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for coupe_path in distinct_coupe_paths:
+        cp_path = Path(coupe_path)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF référencé par section_lines introuvable : {}".format(
+                    cp_path,
+                )
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        slabs = dwg_section_reader.read_section_floor_slabs(coupe_entities)
+        section_slabs_by_coupe[coupe_path] = [
+            _section_slab_to_dict(s) for s in slabs
+        ]
+
+    # --- 4. Reconcile (module pur) --------------------------------------
+    report = dwg_coherence.reconcile_plan_section_floors(
+        plan_floors=plan_floors,
+        section_lines=section_lines,
+        section_slabs_by_coupe=section_slabs_by_coupe,
+        z_tol_m=z_tol_m,
+        thickness_tol_m=thickness_tol_m,
+        coverage_min_ratio=coverage_min_ratio,
+    )
+
+    # --- 5. Sérialiser + filtrer par sévérité ---------------------------
+    matches_ok = [_floor_match_to_dict(m) for m in report.matches if m.status == "ok"]
+    thickness_mismatches = [
+        _floor_match_to_dict(m) for m in report.matches
+        if m.status == "thickness_mismatch"
+    ]
+    extent_partial = [
+        _floor_match_to_dict(m) for m in report.matches
+        if m.status == "extent_partial"
+    ]
+    no_section_pair_at_z = [
+        _floor_match_to_dict(m) for m in report.matches
+        if m.status == "no_section_pair_at_z"
+    ]
+    no_section_pair_at_x = [
+        _floor_match_to_dict(m) for m in report.matches
+        if m.status == "no_section_pair_at_x"
+    ]
+
+    needs_user_decision = bool(
+        thickness_mismatches or extent_partial
+        or no_section_pair_at_z or no_section_pair_at_x
+        or report.section_slabs_unmatched
+    )
+
+    if not needs_user_decision:
+        note = (
+            "**Recoupement OK** : toutes les dalles plan croisées par un trait "
+            "matchent une paire cohérente en coupe (Z tol={:.0f}mm, "
+            "ep tol={:.0f}mm, couverture ≥ {:.0%}). Pas de paire orpheline."
+            .format(z_tol_m * 1000, thickness_tol_m * 1000, coverage_min_ratio)
+        )
+    else:
+        problems: List[str] = []
+        if thickness_mismatches:
+            problems.append("{} mismatch(es) d'épaisseur".format(
+                len(thickness_mismatches)
+            ))
+        if extent_partial:
+            problems.append("{} extent(s) partiel(s) (trémie possible)".format(
+                len(extent_partial)
+            ))
+        if no_section_pair_at_z:
+            problems.append("{} dalle(s) sans paire au bon Z (fantôme)".format(
+                len(no_section_pair_at_z)
+            ))
+        if no_section_pair_at_x:
+            problems.append("{} dalle(s) sans paire au bon X".format(
+                len(no_section_pair_at_x)
+            ))
+        if report.section_slabs_unmatched:
+            problems.append("{} paire(s) coupe sans pendant plan (oubli ?)".format(
+                len(report.section_slabs_unmatched)
+            ))
+        note = (
+            "**Recoupement INCOMPLET** — {}. Présenter à l'user via "
+            "`ui_confirm_choices` pour décider plan vs coupe sur chaque cas, "
+            "ou identifier un défaut d'extraction à corriger."
+            .format(" + ".join(problems))
+        )
+
+    return {
+        "ok": True,
+        "plan_floors_count": len(plan_floors),
+        "section_lines_count": len(section_lines),
+        "section_slabs_count_by_coupe": {
+            p: len(s) for p, s in section_slabs_by_coupe.items()
+        },
+        "summary": report.summary,
+        "matches_ok": matches_ok,
+        "thickness_mismatches": thickness_mismatches,
+        "extent_partial": extent_partial,
+        "no_section_pair_at_z": no_section_pair_at_z,
+        "no_section_pair_at_x": no_section_pair_at_x,
+        "section_slabs_unmatched": report.section_slabs_unmatched,
+        "floors_plan_not_crossed_indices": list(report.floors_plan_not_crossed),
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.4. Détection orientation X axis par coupe (P2 mirror fix) ----
+#
+# Détecte automatiquement, pour chaque coupe, si son DXF X axis suit
+# la convention "identity" (= +world axis, défaut P7) ou "reversed"
+# (= -world axis, cas P2 longitudinal). Utilisé par
+# `views_create_section_many` pour flipper basis_x quand nécessaire.
+
+
+@tool(name="dwg_detect_section_orientations", tier=2)
+def detect_section_orientations(
+    kg: ProjectKG,
+    plan_path: str,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    scale_override: Optional[float] = None,
+    thickness_tol_m: float = 0.02,
+    x_cut_tol_m: float = 0.10,
+) -> Dict[str, Any]:
+    """Détecte la convention X axis de chaque DXF coupe (identity ou
+    reversed) par cross-validation murs plan ↔ section walls.
+
+    Use case : sur certains projets (cf. P2 longitudinales), le source
+    Revit a `FlipDirection()` la vue section, inversant le BasisX du
+    DXF exporté. Sans correction, le XREF DXF apparaît miroité en
+    Revit après import. Ce tool détecte ces cas automatiquement par
+    cross-validation géométrique.
+
+    Algo : pour chaque section_line, parse la coupe, classify les murs
+    plan, et teste les 2 conventions (DXF X = +world axis vs -world
+    axis). Celle qui matche le plus de murs (par épaisseur + position)
+    gagne.
+
+    **Read-only** : aucun écrit Revit/KG. Le caller stocke le résultat
+    dans le DxfImportContext.section_lines pour consommation par
+    `views_create_section_many`.
+
+    Concepts: dxf, dwg, coupe, section, orientation, basis x, axis,
+              mirror, flip, view range, convention, audit, phase 1
+    Phrases: "détecte si les coupes sont miroitées",
+             "find section x axis convention", "phase 1 orientation"
+    Similar: dwg_reconcile_plan_section_walls,
+             dxf_assign_coupes_to_traits
+
+    Args:
+        plan_path: chemin du DXF plan (pour classifier les murs).
+        section_lines: liste de section_lines (cf. format
+            DxfImportContext.section_lines). Si None, lit depuis le KG.
+        scale_override / thickness_tol_m / x_cut_tol_m: cf.
+            `reconcile_plan_section_walls`.
+
+    Returns:
+        ``{"ok": bool, "orientations": [{coupe_path, name, convention,
+            matches_identity, matches_reversed, walls_crossed,
+            confidence}, ...], "summary": {identity_count,
+            reversed_count, ambiguous_count}, "note": str}``
+    """
+    plan_p = Path(plan_path)
+    if not plan_p.exists():
+        raise FileNotFoundError("Plan file not found: {}".format(plan_p))
+
+    # 1. Parse plan + classify walls.
+    plan_entities, _ = dwg_reader.parse(plan_p, scale_override=scale_override)
+    plan_classified = dwg_classifier.classify(
+        plan_entities, {"A-WALL": "wall"},
+        min_thickness_m=0.05, max_thickness_m=0.60, include_centerline=True,
+    )
+    plan_walls = [_wall_candidate_to_dict(w) for w in plan_classified.walls]
+
+    # 2. Récupérer section_lines.
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext et `section_lines` non fourni."
+            )
+        ctx = kg.get_node(nid)
+        section_lines = list(ctx.get("section_lines", []))
+        if not section_lines:
+            raise ValueError("Pas de section_lines dans le KG.")
+
+    # 3. Pour chaque coupe, parse + read_section_walls + detect.
+    orientations: List[Dict[str, Any]] = []
+    identity_count = 0
+    reversed_count = 0
+    ambiguous_count = 0
+    for sl in section_lines:
+        coupe_path = sl.get("coupe_path", "")
+        if not coupe_path:
+            continue
+        cp = Path(coupe_path)
+        if not cp.exists():
+            raise FileNotFoundError("Coupe introuvable : {}".format(cp))
+        coupe_entities, _ = dwg_reader.parse(cp, scale_override=scale_override)
+        sec_walls_raw = dwg_section_reader.read_section_walls(coupe_entities)
+        sec_walls = [_section_wall_to_dict(sw) for sw in sec_walls_raw]
+
+        verdict = dwg_coherence.detect_section_x_axis_convention(
+            plan_walls=plan_walls,
+            section_line=sl,
+            section_walls_in_coupe=sec_walls,
+            thickness_tol_m=thickness_tol_m,
+            x_cut_tol_m=x_cut_tol_m,
+        )
+        orientations.append({
+            "coupe_path": coupe_path,
+            "name": sl.get("name"),
+            "convention": verdict.convention,
+            "matches_identity": verdict.matches_identity,
+            "matches_reversed": verdict.matches_reversed,
+            "walls_crossed": verdict.walls_crossed,
+            "confidence": verdict.confidence,
+        })
+        if verdict.walls_crossed == 0 or verdict.confidence < 0.1:
+            ambiguous_count += 1
+        elif verdict.convention == "reversed":
+            reversed_count += 1
+        else:
+            identity_count += 1
+
+    summary = {
+        "identity_count": identity_count,
+        "reversed_count": reversed_count,
+        "ambiguous_count": ambiguous_count,
+        "section_lines_count": len(section_lines),
+    }
+    if reversed_count > 0:
+        note = (
+            "{} coupe(s) en convention 'reversed' détectée(s) (DXF X = "
+            "-world axis). Le caller doit set `x_axis_convention=reversed` "
+            "lors de la création de la ViewSection pour corriger le miroir "
+            "du XREF.".format(reversed_count)
+        )
+    elif ambiguous_count > 0:
+        note = (
+            "{} coupe(s) ambigu(ës) (peu de murs croisés ou égalité). "
+            "Convention identity par défaut. Vérifier visuellement.".format(
+                ambiguous_count,
+            )
+        )
+    else:
+        note = (
+            "Toutes les coupes utilisent la convention identity (= "
+            "convention P7 standard). Pas de flip nécessaire."
+        )
+
+    return {
+        "ok": True,
+        "plan_path": plan_path,
+        "orientations": orientations,
+        "summary": summary,
+        "note": note,
+    }
+
+
+# ----- 8.5. Validation 3D de l'existence des murs (post-création) ------
+#
+# Layer over `reconcile_plan_section_walls` + `vote_wall_visible_in_
+# elevation` : agrège votes coupes ET élévations par **Wall vivant
+# du KG**. Verdict par mur (le 1er match du haut emporte) :
+#
+# - `confirmed` : ≥ 1 YES (coupe ok/ambig OU élévation YES). Le mur
+#   est matérialisé en 3D.
+# - `unconfirmed` : ≥ 1 NO (coupe sans match au x_cut attendu OU
+#   élévation no overlap) ET 0 YES → **suspect View Range artifact**
+#   ou mur fantôme à supprimer.
+# - `thickness_mismatch_only` : présent en coupe mais épaisseur off
+#   (issue d'épaisseur, pas d'existence).
+# - `no_3d_evidence` : aucune vue 3D (ni coupe, ni élévation) ne peut
+#   se prononcer (mur isolé sans crossing ni projection dans une
+#   élévation).
+#
+# **Murs de façade** : crucial. Un mur de façade ne croise typiquement
+# aucun trait de coupe (les coupes sont à l'intérieur), mais il est
+# visible **dans l'élévation** qui regarde sa face extérieure. Sans
+# ce check élévation, on classerait à tort `no_crossings`.
+#
+# **Read-only** : aucune suppression auto. L'user décide.
+
+
+@tool(name="dwg_validate_walls_3d_existence", tier=2)
+def validate_walls_3d_existence(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    thickness_tol_m: float = 0.02,
+    x_cut_tol_m: float = 0.10,
+) -> Dict[str, Any]:
+    """Valide l'existence 3D de chaque Wall vivant du KG en croisant
+    avec les coupes (Phase 2a.2 — post-création).
+
+    Use case : après Phase 2a (`dwg_create_continuous_walls_many`),
+    certains murs créés peuvent être des **artifacts View Range Revit**
+    (le plan d'étage Niveau N exporté montre par défaut les éléments
+    des niveaux inférieurs). Sans cross-validation, on ne peut pas
+    distinguer un mur légitime (étage habité, mur porteur) d'un
+    artifact (mur N-1 visible dans le plan N).
+
+    **Principe** : un mur réel coupé par une coupe doit apparaître
+    comme paire verticale A-WALL dans cette coupe, au bon x_cut, à
+    la bonne épaisseur (cf. `reconcile_plan_section_walls`). Si un
+    mur est croisé par ≥ 1 trait de coupe et 0 confirmation → fort
+    signal qu'il est fantôme.
+
+    **Read-only** : aucun écrit Revit, aucun écrit KG. L'user décide
+    quoi faire des `walls_unconfirmed_in_3d` (typiquement : les
+    supprimer en UI Revit ou via un tool de suppression dédié).
+
+    Concepts: dxf, dwg, recoupement, validation, 3d, existence, mur,
+              wall, view range, fantôme, phase 2a, post-creation,
+              cross-validation
+    Phrases: "valide les murs avec les coupes",
+             "cross-validation 3D des murs", "trouve les murs fantômes",
+             "phase 2a étape 2"
+    Similar: dwg_reconcile_plan_section_walls,
+             dwg_validate_floors_3d_existence
+
+    Args:
+        scale_override: cf. `dwg_inspect`.
+        section_lines: liste explicite (cf. format
+            `DxfImportContext.section_lines`). Si absent, lue depuis
+            le KG.
+        thickness_tol_m / x_cut_tol_m: cf.
+            `reconcile_plan_section_walls`.
+
+    Returns:
+        ``{"ok": bool, "walls_total": int, "section_lines_count": int,
+            "summary": {confirmed, unconfirmed, no_crossings,
+                        thickness_mismatch_only, walls_total},
+            "walls_confirmed": [{llm_id, crossings, confirmations}, ...],
+            "walls_unconfirmed_in_3d": [{llm_id, crossings, p1, p2,
+                thickness_m, level_name}, ...],   # SUSPECTS
+            "walls_no_3d_evidence": [{llm_id, p1, p2, ...}, ...],
+            "walls_thickness_mismatch_only": [{llm_id, ...}, ...],
+            "needs_user_decision": bool, "note": str}``
+    """
+    # 1. Collect KG walls.
+    kg_wall_ids: List[str] = sorted(kg.find_by_type("Wall"))
+    living_walls: List[Dict[str, Any]] = []
+    for wid in kg_wall_ids:
+        attrs = kg.get_node(wid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        p1 = attrs.get("p1")
+        p2 = attrs.get("p2")
+        type_ref = attrs.get("type_ref")
+        if not p1 or not p2 or not type_ref:
+            continue
+        try:
+            tnode = kg.get_node(type_ref)
+        except KeyError:
+            continue
+        thickness = float(tnode.get("total_thickness", 0.0))
+        level_ref = attrs.get("level_ref")
+        level_name = None
+        level_elev = 0.0
+        if level_ref:
+            try:
+                lvl_node = kg.get_node(level_ref)
+                level_name = lvl_node.get("name")
+                level_elev = float(lvl_node.get("elevation", 0.0))
+            except KeyError:
+                pass
+        height_m = float(attrs.get("height", 3.0))
+        living_walls.append({
+            "llm_id": wid,
+            "p1": [float(p1[0]), float(p1[1])],
+            "p2": [float(p2[0]), float(p2[1])],
+            "thickness_m": thickness,
+            "level_name": level_name,
+            "level_elev_m": level_elev,
+            "height_m": height_m,
+        })
+
+    if not living_walls:
+        return {
+            "ok": True, "walls_total": 0, "section_lines_count": 0,
+            "elevations_count": 0,
+            "summary": {
+                "confirmed": 0, "unconfirmed": 0, "no_3d_evidence": 0,
+                "thickness_mismatch_only": 0, "walls_total": 0,
+            },
+            "walls_confirmed": [], "walls_unconfirmed_in_3d": [],
+            "walls_no_3d_evidence": [], "walls_thickness_mismatch_only": [],
+            "needs_user_decision": False,
+            "note": "Aucun Wall vivant dans le KG — rien à valider.",
+        }
+
+    # 2. Section_lines : KG ou explicite.
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext vivant dans le KG et `section_lines` "
+                "non fourni. Lance Phase 1 d'abord."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines enregistrées."
+            )
+
+    # 3. Parse chaque coupe → section_walls.
+    section_walls_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    distinct_coupes = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for cp in distinct_coupes:
+        cp_path = Path(cp)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF introuvable : {}".format(cp_path)
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        sec_walls = dwg_section_reader.read_section_walls(coupe_entities)
+        section_walls_by_coupe[cp] = [
+            _section_wall_to_dict(sw) for sw in sec_walls
+        ]
+
+    # 4. Reconcile avec walls KG comme input plan_walls.
+    plan_walls_input = [
+        {"p1": w["p1"], "p2": w["p2"], "thickness_m": w["thickness_m"]}
+        for w in living_walls
+    ]
+    report = dwg_coherence.reconcile_plan_section_walls(
+        plan_walls=plan_walls_input,
+        section_lines=section_lines,
+        section_walls_by_coupe=section_walls_by_coupe,
+        thickness_tol_m=thickness_tol_m,
+        x_cut_tol_m=x_cut_tol_m,
+    )
+
+    # 5a. Agréger votes coupes par mur.
+    per_wall: Dict[int, Dict[str, int]] = {}
+    for m in report.matches:
+        bucket = per_wall.setdefault(m.plan_wall_index, {
+            "crossings": 0, "ok_or_ambig": 0, "thickness_mismatch": 0,
+            "no_section_wall_at_x": 0,
+        })
+        bucket["crossings"] += 1
+        if m.status in ("ok", "ambiguous_multiple_candidates"):
+            bucket["ok_or_ambig"] += 1
+        elif m.status == "thickness_mismatch":
+            bucket["thickness_mismatch"] += 1
+        elif m.status == "no_section_wall_at_x":
+            bucket["no_section_wall_at_x"] += 1
+
+    # 5b. Voter dans les élévations pour chaque mur.
+    elevations = _load_elevations_from_kg(kg, scale_override=scale_override)
+    per_wall_elev: Dict[int, Dict[str, int]] = {}
+    for wi, w in enumerate(living_walls):
+        yes = 0
+        no = 0
+        abst = 0
+        for direction, elev_view in elevations.items():
+            vote = dwg_elevation_reader.vote_wall_visible_in_elevation(
+                wall_p1=tuple(w["p1"]),
+                wall_p2=tuple(w["p2"]),
+                level_elevation_m=w["level_elev_m"],
+                height_m=w["height_m"],
+                elevation=elev_view,
+                wall_thickness_m=w["thickness_m"],
+            )
+            if vote.answer is True:
+                yes += 1
+            elif vote.answer is False:
+                no += 1
+            else:
+                abst += 1
+        per_wall_elev[wi] = {"yes": yes, "no": no, "abstain": abst}
+
+    walls_confirmed: List[Dict[str, Any]] = []
+    walls_unconfirmed: List[Dict[str, Any]] = []
+    walls_no_3d_evidence: List[Dict[str, Any]] = []
+    walls_thickness_only: List[Dict[str, Any]] = []
+    for wi, w in enumerate(living_walls):
+        sec = per_wall.get(wi, {
+            "crossings": 0, "ok_or_ambig": 0,
+            "thickness_mismatch": 0, "no_section_wall_at_x": 0,
+        })
+        elev = per_wall_elev[wi]
+        # Total YES = confirmations coupes (ok/ambig) + YES élévations.
+        # Total NO = no_section_wall_at_x + NO élévations.
+        total_yes = sec["ok_or_ambig"] + elev["yes"]
+        total_no = sec["no_section_wall_at_x"] + elev["no"]
+        thk_mismatches = sec["thickness_mismatch"]
+        entry = {
+            "llm_id": w["llm_id"],
+            "p1": w["p1"], "p2": w["p2"],
+            "thickness_m": round(w["thickness_m"], 4),
+            "level_name": w["level_name"],
+            "level_elev_m": w["level_elev_m"],
+            "height_m": w["height_m"],
+            "section_crossings": sec["crossings"],
+            "section_confirmations": sec["ok_or_ambig"],
+            "section_missing": sec["no_section_wall_at_x"],
+            "section_thickness_mismatch": thk_mismatches,
+            "elevation_yes": elev["yes"],
+            "elevation_no": elev["no"],
+            "elevation_abstain": elev["abstain"],
+            "total_yes": total_yes,
+            "total_no": total_no,
+        }
+        if total_yes >= 1:
+            walls_confirmed.append(entry)
+        elif total_no >= 1:
+            walls_unconfirmed.append(entry)
+        elif thk_mismatches > 0 and sec["no_section_wall_at_x"] == 0:
+            walls_thickness_only.append(entry)
+        else:
+            # 0 YES, 0 NO partout → aucune vue 3D ne peut juger.
+            walls_no_3d_evidence.append(entry)
+
+    summary = {
+        "confirmed": len(walls_confirmed),
+        "unconfirmed": len(walls_unconfirmed),
+        "no_3d_evidence": len(walls_no_3d_evidence),
+        "thickness_mismatch_only": len(walls_thickness_only),
+        "walls_total": len(living_walls),
+    }
+    needs_user_decision = bool(walls_unconfirmed or walls_thickness_only)
+    if not needs_user_decision:
+        note = (
+            "**Validation 3D OK** : tous les murs avec évidence 3D "
+            "(coupe ou élévation) sont confirmés. {} mur(s) sans aucune "
+            "évidence 3D (ni coupe ni élévation ne les voit).".format(
+                len(walls_no_3d_evidence),
+            )
+        )
+    else:
+        note = (
+            "**Validation 3D INCOMPLÈTE** : {} mur(s) suspects (≥ 1 vue "
+            "3D dit explicitement 'absent', 0 confirmation). {} avec "
+            "mismatch d'épaisseur uniquement. {} sans évidence 3D. "
+            "Inspecter `walls_unconfirmed_in_3d`.".format(
+                len(walls_unconfirmed), len(walls_thickness_only),
+                len(walls_no_3d_evidence),
+            )
+        )
+
+    return {
+        "ok": True,
+        "walls_total": len(living_walls),
+        "section_lines_count": len(section_lines),
+        "elevations_count": len(elevations),
+        "summary": summary,
+        "walls_confirmed": walls_confirmed,
+        "walls_unconfirmed_in_3d": walls_unconfirmed,
+        "walls_no_3d_evidence": walls_no_3d_evidence,
+        "walls_thickness_mismatch_only": walls_thickness_only,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.6. Validation 3D de l'existence des sols (post-création) ------
+#
+# Layer over `reconcile_plan_section_floors` : agrège le rapport par
+# **Floor vivant du KG**. Verdict par dalle :
+#
+# - `confirmed` : ≥ 1 intervalle de coupe avec paire correspondante.
+# - `unconfirmed` : ≥ 1 intervalle de coupe, mais 0 paire au bon Z
+#   (= suspect dalle fantôme dans le plan).
+# - `partial_extent` : crossings trouvés en partie seulement (signal
+#   trémie non-détectée ou contour plan trop large).
+# - `no_crossings` : aucun trait ne traverse cette dalle.
+
+
+@tool(name="dwg_validate_floors_3d_existence", tier=2)
+def validate_floors_3d_existence(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    z_tol_m: float = 0.05,
+    thickness_tol_m: float = 0.02,
+    coverage_min_ratio: float = 0.80,
+) -> Dict[str, Any]:
+    """Valide l'existence 3D de chaque Floor vivant du KG en croisant
+    avec les coupes (Phase 2c.2 — post-création).
+
+    Use case : après Phase 2c (`dwg_create_floors_many`), valider que
+    chaque dalle créée a au moins 1 paire top/bot correspondante dans
+    une coupe qui la traverse. Identique en principe à la validation
+    walls (Phase 2a.2) : on agrège `reconcile_plan_section_floors`
+    par Floor au lieu de par crossing.
+
+    **Read-only** : aucune suppression auto. Le rapport propose les
+    suspects, l'user décide.
+
+    Concepts: dxf, dwg, validation, 3d, existence, sol, dalle, floor,
+              view range, fantôme, phase 2c, post-creation,
+              cross-validation
+    Phrases: "valide les sols avec les coupes",
+             "cross-validation 3D des dalles", "trouve les dalles fantômes",
+             "phase 2c étape 2"
+    Similar: dwg_validate_walls_3d_existence,
+             dwg_reconcile_plan_section_floors
+
+    Args:
+        scale_override / section_lines / z_tol_m / thickness_tol_m /
+            coverage_min_ratio: cf. `dwg_reconcile_plan_section_floors`.
+
+    Returns:
+        ``{"ok": bool, "floors_total": int, "section_lines_count": int,
+            "summary": {confirmed, unconfirmed, partial_extent,
+                        no_crossings, floors_total},
+            "floors_confirmed": [...],
+            "floors_unconfirmed_in_3d": [...],   # SUSPECTS
+            "floors_partial_extent": [...],
+            "floors_no_crossings": [...],
+            "needs_user_decision": bool, "note": str}``
+    """
+    # 1. Collect KG floors.
+    living_floors_full = _collect_plan_floors_from_kg(kg)
+    if not living_floors_full:
+        return {
+            "ok": True, "floors_total": 0, "section_lines_count": 0,
+            "summary": {
+                "confirmed": 0, "unconfirmed": 0,
+                "partial_extent": 0, "no_crossings": 0, "floors_total": 0,
+            },
+            "floors_confirmed": [], "floors_unconfirmed_in_3d": [],
+            "floors_partial_extent": [], "floors_no_crossings": [],
+            "needs_user_decision": False,
+            "note": "Aucun Floor vivant dans le KG — rien à valider.",
+        }
+
+    # 2. Section_lines.
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext vivant dans le KG et `section_lines` "
+                "non fourni."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines enregistrées."
+            )
+
+    # 3. Parse chaque coupe → section_slabs.
+    section_slabs_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    distinct_coupes = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for cp in distinct_coupes:
+        cp_path = Path(cp)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF introuvable : {}".format(cp_path)
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        slabs = dwg_section_reader.read_section_floor_slabs(coupe_entities)
+        section_slabs_by_coupe[cp] = [
+            _section_slab_to_dict(s) for s in slabs
+        ]
+
+    # 4. Reconcile avec floors KG.
+    report = dwg_coherence.reconcile_plan_section_floors(
+        plan_floors=living_floors_full,
+        section_lines=section_lines,
+        section_slabs_by_coupe=section_slabs_by_coupe,
+        z_tol_m=z_tol_m,
+        thickness_tol_m=thickness_tol_m,
+        coverage_min_ratio=coverage_min_ratio,
+    )
+
+    # 5. Agréger par dalle.
+    per_floor: Dict[int, Dict[str, int]] = {}
+    for m in report.matches:
+        bucket = per_floor.setdefault(m.plan_floor_index, {
+            "intervals": 0, "ok": 0, "thickness_mismatch": 0,
+            "extent_partial": 0, "no_pair_at_z": 0, "no_pair_at_x": 0,
+        })
+        bucket["intervals"] += 1
+        if m.status == "ok":
+            bucket["ok"] += 1
+        elif m.status == "thickness_mismatch":
+            bucket["thickness_mismatch"] += 1
+        elif m.status == "extent_partial":
+            bucket["extent_partial"] += 1
+        elif m.status == "no_section_pair_at_z":
+            bucket["no_pair_at_z"] += 1
+        elif m.status == "no_section_pair_at_x":
+            bucket["no_pair_at_x"] += 1
+
+    not_crossed = set(report.floors_plan_not_crossed)
+    floors_confirmed: List[Dict[str, Any]] = []
+    floors_unconfirmed: List[Dict[str, Any]] = []
+    floors_partial: List[Dict[str, Any]] = []
+    floors_no_crossings: List[Dict[str, Any]] = []
+    for fi, f in enumerate(living_floors_full):
+        bucket = per_floor.get(fi, {
+            "intervals": 0, "ok": 0, "thickness_mismatch": 0,
+            "extent_partial": 0, "no_pair_at_z": 0, "no_pair_at_x": 0,
+        })
+        entry = {
+            "llm_id": f.get("llm_id"),
+            "level_name": f.get("level_name"),
+            "elevation_m": f.get("elevation_m"),
+            "thickness_m": f.get("thickness_m"),
+            "intervals": bucket["intervals"],
+            "ok": bucket["ok"],
+            "thickness_mismatches": bucket["thickness_mismatch"],
+            "extent_partial": bucket["extent_partial"],
+            "no_pair_at_z": bucket["no_pair_at_z"],
+            "no_pair_at_x": bucket["no_pair_at_x"],
+        }
+        if fi in not_crossed or bucket["intervals"] == 0:
+            floors_no_crossings.append(entry)
+        elif bucket["ok"] > 0 and bucket["extent_partial"] == 0:
+            floors_confirmed.append(entry)
+        elif bucket["extent_partial"] > 0:
+            floors_partial.append(entry)
+        else:
+            # intervals > 0 mais 0 ok → unconfirmed.
+            floors_unconfirmed.append(entry)
+
+    summary = {
+        "confirmed": len(floors_confirmed),
+        "unconfirmed": len(floors_unconfirmed),
+        "partial_extent": len(floors_partial),
+        "no_crossings": len(floors_no_crossings),
+        "floors_total": len(living_floors_full),
+    }
+    needs_user_decision = bool(floors_unconfirmed or floors_partial)
+    if not needs_user_decision:
+        note = (
+            "**Validation 3D OK** : toutes les dalles croisées par un trait "
+            "ont au moins 1 confirmation en coupe. "
+            "{} dalle(s) sans crossing.".format(len(floors_no_crossings))
+        )
+    else:
+        note = (
+            "**Validation 3D INCOMPLÈTE** : {} dalle(s) sans aucune "
+            "confirmation en coupe (suspects fantômes). {} avec extent "
+            "partiel (trémie non détectée ?). {} sans crossing. Inspecter "
+            "`floors_unconfirmed_in_3d` + `floors_partial_extent`.".format(
+                len(floors_unconfirmed), len(floors_partial),
+                len(floors_no_crossings),
+            )
+        )
+
+    return {
+        "ok": True,
+        "floors_total": len(living_floors_full),
+        "section_lines_count": len(section_lines),
+        "summary": summary,
+        "floors_confirmed": floors_confirmed,
+        "floors_unconfirmed_in_3d": floors_unconfirmed,
+        "floors_partial_extent": floors_partial,
+        "floors_no_crossings": floors_no_crossings,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.7. Validation 3D de l'existence des colonnes (post-création) --
+#
+# Différent du pattern walls/floors : les colonnes sont des **points
+# 2D** (pas des segments). Une colonne plan à `(x_col, y_col)` est
+# "traversée" par un trait de coupe si la distance point↔segment est
+# inférieure à un seuil (typiquement 50cm = ordre de grandeur d'une
+# colonne large). Pour chaque crossing, expected x_cut = world Y
+# (trait vertical) ou world X (horizontal). On cherche un `SectionColumn`
+# dans la coupe à cette abscisse (± tol).
+
+
+def _distance_point_to_segment(
+    pt: Tuple[float, float],
+    a: Tuple[float, float], b: Tuple[float, float],
+) -> float:
+    """Distance euclidienne minimale entre un point et un segment 2D."""
+    ax, ay = a
+    bx, by = b
+    px, py = pt
+    abx, aby = bx - ax, by - ay
+    ab_len_sq = abx * abx + aby * aby
+    if ab_len_sq < 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * abx + (py - ay) * aby) / ab_len_sq
+    t = max(0.0, min(1.0, t))
+    proj_x = ax + t * abx
+    proj_y = ay + t * aby
+    return math.hypot(px - proj_x, py - proj_y)
+
+
+@tool(name="dwg_validate_columns_3d_existence", tier=2)
+def validate_columns_3d_existence(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    point_on_section_tol_m: float = 0.50,
+    x_cut_tol_m: float = 0.30,
+) -> Dict[str, Any]:
+    """Valide l'existence 3D de chaque Column vivante du KG en croisant
+    avec les coupes (Phase 2d.2 — post-création).
+
+    **Détection symétrique mais adaptée aux points** : une colonne plan
+    est considérée traversée par un trait de coupe si sa distance au
+    trait < `point_on_section_tol_m` (défaut 50cm — couvre les colonnes
+    larges et les drift d'export). Pour chaque crossing, on cherche un
+    `SectionColumn` (INSERT ou paire LINEs S-COLS) au x_cut attendu
+    dans la coupe correspondante.
+
+    Verdict par colonne :
+    - `confirmed` : ≥ 1 crossing avec un SectionColumn correspondant.
+    - `unconfirmed` : ≥ 1 crossing mais 0 SectionColumn trouvé.
+    - `no_crossings` : aucun trait ne traverse cette colonne.
+
+    Concepts: dxf, dwg, validation, 3d, existence, poteau, column,
+              view range, fantôme, phase 2d, post-creation,
+              cross-validation
+    Phrases: "valide les poteaux avec les coupes",
+             "cross-validation 3D des colonnes",
+             "trouve les poteaux fantômes", "phase 2d étape 2"
+    Similar: dwg_validate_walls_3d_existence,
+             dwg_validate_floors_3d_existence
+
+    Args:
+        scale_override / section_lines: cf. les autres validate tools.
+        point_on_section_tol_m: distance max colonne↔trait pour que ça
+            compte comme un crossing (défaut 50 cm).
+        x_cut_tol_m: tolérance sur la position dans la coupe pour
+            matcher un SectionColumn (défaut 30 cm).
+
+    Returns:
+        ``{"ok": bool, "columns_total": int, "section_lines_count": int,
+            "summary": {confirmed, unconfirmed, no_crossings, columns_total},
+            "columns_confirmed": [...],
+            "columns_unconfirmed_in_3d": [...],   # SUSPECTS
+            "columns_no_crossings": [...],
+            "needs_user_decision": bool, "note": str}``
+    """
+    # 1. Collect KG columns (with position + level).
+    living_cols: List[Dict[str, Any]] = []
+    for cid in sorted(kg.find_by_type("Column")):
+        attrs = kg.get_node(cid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        pos = attrs.get("position")
+        if not pos or len(pos) < 2:
+            continue
+        lvl_ref = attrs.get("level_ref")
+        level_name = None
+        elev = None
+        if lvl_ref:
+            try:
+                lvl = kg.get_node(lvl_ref)
+                level_name = lvl.get("name")
+                elev = float(lvl.get("elevation", 0.0))
+            except KeyError:
+                pass
+        living_cols.append({
+            "llm_id": cid,
+            "position": [float(pos[0]), float(pos[1])],
+            "level_name": level_name,
+            "base_elev_m": elev,
+            "height_m": float(attrs.get("height", 0.0)),
+        })
+
+    if not living_cols:
+        return {
+            "ok": True, "columns_total": 0, "section_lines_count": 0,
+            "summary": {
+                "confirmed": 0, "unconfirmed": 0, "no_crossings": 0,
+                "columns_total": 0,
+            },
+            "columns_confirmed": [], "columns_unconfirmed_in_3d": [],
+            "columns_no_crossings": [],
+            "needs_user_decision": False,
+            "note": "Aucune Column vivante dans le KG — rien à valider.",
+        }
+
+    # 2. Section_lines.
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext vivant et `section_lines` non fourni."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines."
+            )
+
+    # 3. Parse chaque coupe → section_columns.
+    section_cols_by_coupe: Dict[str, List[Dict[str, Any]]] = {}
+    distinct_coupes = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for cp in distinct_coupes:
+        cp_path = Path(cp)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF introuvable : {}".format(cp_path)
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        sec_cols = dwg_section_reader.read_section_columns(coupe_entities)
+        section_cols_by_coupe[cp] = [
+            {
+                "x_cut_m": sc.x_cut_m,
+                "kind": sc.kind,
+                "width_m": sc.width_m,
+                "block_name": sc.block_name,
+            }
+            for sc in sec_cols
+        ]
+
+    # 4. Per-column validation.
+    columns_confirmed: List[Dict[str, Any]] = []
+    columns_unconfirmed: List[Dict[str, Any]] = []
+    columns_no_crossings: List[Dict[str, Any]] = []
+    for c in living_cols:
+        pos = (c["position"][0], c["position"][1])
+        crossings_total = 0
+        crossings_confirmed = 0
+        for sl in section_lines:
+            sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
+            sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
+            dist = _distance_point_to_segment(pos, sp1, sp2)
+            if dist > point_on_section_tol_m:
+                continue
+            crossings_total += 1
+            # Compute expected x_cut.
+            trait_dx = sp2[0] - sp1[0]
+            trait_dy = sp2[1] - sp1[1]
+            if abs(trait_dx) < abs(trait_dy):
+                expected_x_cut = pos[1]  # vertical trait → x_cut = world Y
+            else:
+                expected_x_cut = pos[0]  # horizontal trait → x_cut = world X
+            coupe_path = sl.get("coupe_path", "")
+            sec_cols = section_cols_by_coupe.get(coupe_path, [])
+            for sc in sec_cols:
+                if abs(float(sc["x_cut_m"]) - expected_x_cut) <= x_cut_tol_m:
+                    crossings_confirmed += 1
+                    break  # 1 confirmation suffit par crossing
+
+        entry = {
+            "llm_id": c["llm_id"],
+            "position": c["position"],
+            "level_name": c["level_name"],
+            "base_elev_m": c["base_elev_m"],
+            "height_m": c["height_m"],
+            "crossings": crossings_total,
+            "confirmations": crossings_confirmed,
+        }
+        if crossings_total == 0:
+            columns_no_crossings.append(entry)
+        elif crossings_confirmed > 0:
+            columns_confirmed.append(entry)
+        else:
+            columns_unconfirmed.append(entry)
+
+    summary = {
+        "confirmed": len(columns_confirmed),
+        "unconfirmed": len(columns_unconfirmed),
+        "no_crossings": len(columns_no_crossings),
+        "columns_total": len(living_cols),
+    }
+    needs_user_decision = bool(columns_unconfirmed)
+    if not needs_user_decision:
+        note = (
+            "**Validation 3D OK** : tous les poteaux croisés par un trait "
+            "ont au moins 1 confirmation en coupe. {} poteau(x) sans "
+            "crossing.".format(len(columns_no_crossings))
+        )
+    else:
+        note = (
+            "**Validation 3D INCOMPLÈTE** : {} poteau(x) sans confirmation "
+            "en coupe (suspects fantômes). {} sans crossing. Inspecter "
+            "`columns_unconfirmed_in_3d`.".format(
+                len(columns_unconfirmed), len(columns_no_crossings),
+            )
+        )
+
+    return {
+        "ok": True,
+        "columns_total": len(living_cols),
+        "section_lines_count": len(section_lines),
+        "summary": summary,
+        "columns_confirmed": columns_confirmed,
+        "columns_unconfirmed_in_3d": columns_unconfirmed,
+        "columns_no_crossings": columns_no_crossings,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.75. Validation 3D existence des openings (Phase 2b.2) ---------
+#
+# Pour chaque Window / Door vivant du KG :
+# - Vote sur chaque élévation via `vote_opening_visible_in_elevation`.
+#   Élévations = la voie principale pour les fenêtres (cf. user
+#   2026-05-14 : « les élévations sont déterminantes pour les fenêtres
+#   et les murs de façade »).
+# - Vote sur chaque coupe qui traverse le mur hôte : présence d'une
+#   `SectionOpening` à la position x_cut attendue + Y range matchant.
+# - Verdict consolidé.
+
+
+@tool(name="dwg_validate_openings_3d_existence", tier=2)
+def validate_openings_3d_existence(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+    x_cut_tol_m: float = 0.30,
+    y_tol_m: float = 0.30,
+    default_width_m: float = 1.0,
+) -> Dict[str, Any]:
+    """Valide l'existence 3D de chaque Window / Door vivant du KG en
+    croisant avec les coupes ET les élévations (Phase 2b.2 — post-
+    création).
+
+    **Élévations centrales** pour les fenêtres : une fenêtre de façade
+    n'est typiquement pas vue par les coupes (qui traversent l'intérieur
+    du bâtiment), mais elle laisse un linteau + une allège bien visibles
+    dans l'élévation qui regarde la bonne façade. Sans le check
+    élévation, on classerait à tort les fenêtres de façade comme
+    « pas d'évidence 3D ».
+
+    Verdict par opening :
+    - `confirmed` : ≥ 1 YES (coupe OU élévation).
+    - `unconfirmed` : ≥ 1 NO partout, 0 YES → suspect.
+    - `no_3d_evidence` : 0 YES + 0 NO (toutes les vues abstiennent).
+
+    Concepts: dxf, dwg, validation, 3d, existence, fenêtre, window,
+              porte, door, opening, élévation, coupe, view range,
+              phase 2b, post-creation, cross-validation
+    Phrases: "valide les fenêtres et portes avec coupes et élévations",
+             "cross-validation 3D des openings",
+             "trouve les fenêtres fantômes"
+    Similar: dwg_validate_walls_3d_existence,
+             dwg_validate_floors_3d_existence
+
+    Args:
+        scale_override / section_lines: cf. les autres validate tools.
+        x_cut_tol_m: tolérance en X dans la coupe pour match
+            `SectionOpening` (défaut 30 cm).
+        y_tol_m: tolérance en Y (sill / head) (défaut 30 cm).
+        default_width_m: largeur à supposer pour une opening sans
+            dimensions explicites dans son FamilyType (défaut 1m).
+
+    Returns:
+        ``{"ok", "openings_total", "section_lines_count", "elevations_count",
+            "summary": {confirmed, unconfirmed, no_3d_evidence,
+                        windows_total, doors_total, openings_total},
+            "openings_confirmed": [...],
+            "openings_unconfirmed_in_3d": [...],   # SUSPECTS
+            "openings_no_3d_evidence": [...],
+            "needs_user_decision", "note"}``
+    """
+    # 1. Collect KG openings (windows + doors).
+    living_openings: List[Dict[str, Any]] = []
+    for category in ("Window", "Door"):
+        for oid in sorted(kg.find_by_type(category)):
+            attrs = kg.get_node(oid)
+            if attrs.get("deleted_at_turn") is not None:
+                continue
+            pos = attrs.get("position")
+            host_ref = attrs.get("host_wall_ref")
+            type_ref = attrs.get("type_ref")
+            if not pos or not host_ref or not type_ref:
+                continue
+            try:
+                host = kg.get_node(host_ref)
+            except KeyError:
+                continue
+            host_p1 = host.get("p1")
+            host_p2 = host.get("p2")
+            if not host_p1 or not host_p2:
+                continue
+            level_ref = host.get("level_ref")
+            level_elev = 0.0
+            level_name = None
+            if level_ref:
+                try:
+                    lvl = kg.get_node(level_ref)
+                    level_elev = float(lvl.get("elevation", 0.0))
+                    level_name = lvl.get("name")
+                except KeyError:
+                    pass
+            # Largeur depuis FamilyType.dimensions si dispo.
+            width_m = default_width_m
+            try:
+                tnode = kg.get_node(type_ref)
+                dims = tnode.get("dimensions") or {}
+                if isinstance(dims, dict):
+                    w = dims.get("width_m") or dims.get("width")
+                    if isinstance(w, (int, float)) and w > 0:
+                        width_m = float(w)
+            except KeyError:
+                pass
+            sill = float(attrs.get("sill_height", 0.0))
+            head = float(attrs.get("head_height", sill + 2.1))
+            height = max(head - sill, 0.1)
+            living_openings.append({
+                "llm_id": oid,
+                "category": category,
+                "position": [float(pos[0]), float(pos[1])],
+                "host_wall_ref": host_ref,
+                "host_p1": [float(host_p1[0]), float(host_p1[1])],
+                "host_p2": [float(host_p2[0]), float(host_p2[1])],
+                "level_elev_m": level_elev,
+                "level_name": level_name,
+                "sill_m": sill,
+                "head_m": head,
+                "height_m": height,
+                "width_m": width_m,
+            })
+
+    if not living_openings:
+        return {
+            "ok": True, "openings_total": 0,
+            "section_lines_count": 0, "elevations_count": 0,
+            "summary": {
+                "confirmed": 0, "unconfirmed": 0, "no_3d_evidence": 0,
+                "windows_total": 0, "doors_total": 0, "openings_total": 0,
+            },
+            "openings_confirmed": [], "openings_unconfirmed_in_3d": [],
+            "openings_no_3d_evidence": [],
+            "needs_user_decision": False,
+            "note": "Aucune Window/Door vivante dans le KG.",
+        }
+
+    # 2. Section_lines.
+    if section_lines is None:
+        from .dxf_context import _find_live_context
+        nid = _find_live_context(kg)
+        if nid is None:
+            raise ValueError(
+                "Pas de DxfImportContext et `section_lines` non fourni."
+            )
+        ctx_node = kg.get_node(nid)
+        section_lines = list(ctx_node.get("section_lines", []))
+        if not section_lines:
+            raise ValueError(
+                "DxfImportContext vivant mais sans section_lines."
+            )
+
+    # 3. Lire SectionOpenings dans chaque coupe.
+    section_openings_by_coupe: Dict[str, List[Any]] = {}
+    distinct_coupes = sorted(
+        {sl.get("coupe_path", "") for sl in section_lines if sl.get("coupe_path")}
+    )
+    for cp in distinct_coupes:
+        cp_path = Path(cp)
+        if not cp_path.exists():
+            raise FileNotFoundError(
+                "Coupe DXF introuvable : {}".format(cp_path)
+            )
+        coupe_entities, _ = dwg_reader.parse(
+            cp_path, scale_override=scale_override,
+        )
+        section_openings_by_coupe[cp] = list(
+            dwg_section_reader.read_section_openings(coupe_entities)
+        )
+
+    # 4. Charger élévations.
+    elevations = _load_elevations_from_kg(kg, scale_override=scale_override)
+
+    # 5. Validation per opening.
+    openings_confirmed: List[Dict[str, Any]] = []
+    openings_unconfirmed: List[Dict[str, Any]] = []
+    openings_no_evidence: List[Dict[str, Any]] = []
+    for o in living_openings:
+        # 5a. Coupes : intersect host_wall avec chaque section_line,
+        # puis chercher SectionOpening à x_cut attendu, Y range matching.
+        host_p1 = (o["host_p1"][0], o["host_p1"][1])
+        host_p2 = (o["host_p2"][0], o["host_p2"][1])
+        sec_yes = 0
+        sec_no = 0
+        for sl in section_lines:
+            sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
+            sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
+            inter = dwg_coherence._segment_intersection_2d(host_p1, host_p2, sp1, sp2)
+            if inter is None:
+                continue
+            ix, iy, _t, _u = inter
+            trait_dx = sp2[0] - sp1[0]
+            trait_dy = sp2[1] - sp1[1]
+            x_cut_expected = iy if abs(trait_dx) < abs(trait_dy) else ix
+            sill_y = o["level_elev_m"] + o["sill_m"]
+            head_y = o["level_elev_m"] + o["head_m"]
+            coupe_path = sl.get("coupe_path", "")
+            section_openings = section_openings_by_coupe.get(coupe_path, [])
+            found = False
+            for so in section_openings:
+                if abs(so.x_dxf_m - x_cut_expected) > x_cut_tol_m:
+                    continue
+                # y_dxf_m du SectionOpening = sill probable, height_m =
+                # hauteur d'ouverture. On accepte si la zone projetée
+                # de l'opening overlapping le y range plan.
+                so_y_bot = so.y_dxf_m
+                so_y_top = so.y_dxf_m + (so.height_m or o["height_m"])
+                if so_y_top < sill_y - y_tol_m:
+                    continue
+                if so_y_bot > head_y + y_tol_m:
+                    continue
+                found = True
+                break
+            if found:
+                sec_yes += 1
+            else:
+                sec_no += 1
+        # 5b. Élévations.
+        elev_yes = 0
+        elev_no = 0
+        for _direction, elev_view in elevations.items():
+            vote = dwg_elevation_reader.vote_opening_visible_in_elevation(
+                opening_world=(o["position"][0], o["position"][1]),
+                level_elevation_m=o["level_elev_m"],
+                sill_m=o["sill_m"],
+                height_m=o["height_m"],
+                width_m=o["width_m"],
+                elevation=elev_view,
+            )
+            if vote.answer is True:
+                elev_yes += 1
+            elif vote.answer is False:
+                elev_no += 1
+        total_yes = sec_yes + elev_yes
+        total_no = sec_no + elev_no
+        entry = {
+            "llm_id": o["llm_id"],
+            "category": o["category"],
+            "position": o["position"],
+            "level_name": o["level_name"],
+            "level_elev_m": o["level_elev_m"],
+            "sill_m": o["sill_m"],
+            "head_m": o["head_m"],
+            "width_m": o["width_m"],
+            "section_yes": sec_yes, "section_no": sec_no,
+            "elevation_yes": elev_yes, "elevation_no": elev_no,
+            "total_yes": total_yes, "total_no": total_no,
+        }
+        if total_yes >= 1:
+            openings_confirmed.append(entry)
+        elif total_no >= 1:
+            openings_unconfirmed.append(entry)
+        else:
+            openings_no_evidence.append(entry)
+
+    windows_total = sum(1 for o in living_openings if o["category"] == "Window")
+    doors_total = sum(1 for o in living_openings if o["category"] == "Door")
+    summary = {
+        "confirmed": len(openings_confirmed),
+        "unconfirmed": len(openings_unconfirmed),
+        "no_3d_evidence": len(openings_no_evidence),
+        "windows_total": windows_total,
+        "doors_total": doors_total,
+        "openings_total": len(living_openings),
+    }
+    needs_user_decision = bool(openings_unconfirmed)
+    if not needs_user_decision:
+        note = (
+            "**Validation 3D OK** : toutes les ouvertures avec évidence 3D "
+            "sont confirmées. {} sans aucune évidence.".format(
+                len(openings_no_evidence),
+            )
+        )
+    else:
+        note = (
+            "**Validation 3D INCOMPLÈTE** : {} ouverture(s) suspect(s). "
+            "{} sans évidence. Inspecter `openings_unconfirmed_in_3d`.".format(
+                len(openings_unconfirmed), len(openings_no_evidence),
+            )
+        )
+
+    return {
+        "ok": True,
+        "openings_total": len(living_openings),
+        "section_lines_count": len(section_lines),
+        "elevations_count": len(elevations),
+        "summary": summary,
+        "openings_confirmed": openings_confirmed,
+        "openings_unconfirmed_in_3d": openings_unconfirmed,
+        "openings_no_3d_evidence": openings_no_evidence,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.8. Meta : validation 3D consolidée (walls + floors + columns) -
+
+
+@tool(name="dwg_validate_import_3d", tier=2)
+def validate_import_3d(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Meta-validation 3D post-import : pour chaque élément BIM créé
+    (Wall + Floor + Column), agrège les rapports des 3 tools
+    `dwg_validate_*_3d_existence` en un rapport unique.
+
+    Use case canonique : après `dwg_import_project_execute`, l'agent
+    appelle ce meta-tool pour identifier les éléments BIM potentiellement
+    « fantômes » (créés depuis le plan mais sans correspondant 3D dans
+    les coupes — typiquement View Range artifacts). L'user reçoit une
+    liste consolidée par catégorie et décide quoi supprimer.
+
+    **Read-only** : aucune suppression auto. Le tool produit un rapport,
+    l'user (ou un futur tool de suppression dédié) agit.
+
+    Concepts: dxf, dwg, validation, 3d, existence, mur, sol, poteau,
+              wall, floor, column, view range, fantôme, meta, audit,
+              post-import, cross-validation
+    Phrases: "valide l'import 3D", "audit 3D post-import",
+             "trouve les éléments fantômes",
+             "validation 3D consolidée"
+    Similar: dwg_validate_walls_3d_existence,
+             dwg_validate_floors_3d_existence,
+             dwg_validate_columns_3d_existence
+
+    Args:
+        scale_override / section_lines: passés aux 3 tools sous-jacents.
+
+    Returns:
+        ``{"ok": bool, "walls": {...validate_walls payload...},
+            "floors": {...}, "columns": {...},
+            "summary": {walls_unconfirmed, floors_unconfirmed,
+                        columns_unconfirmed, total_suspects, total_elements},
+            "needs_user_decision": bool, "note": str}``
+    """
+    walls = validate_walls_3d_existence(
+        kg=kg, scale_override=scale_override, section_lines=section_lines,
+    )
+    floors = validate_floors_3d_existence(
+        kg=kg, scale_override=scale_override, section_lines=section_lines,
+    )
+    columns = validate_columns_3d_existence(
+        kg=kg, scale_override=scale_override, section_lines=section_lines,
+    )
+    openings = validate_openings_3d_existence(
+        kg=kg, scale_override=scale_override, section_lines=section_lines,
+    )
+
+    summary = {
+        "walls_total": walls["walls_total"],
+        "walls_confirmed": walls["summary"]["confirmed"],
+        "walls_unconfirmed": walls["summary"]["unconfirmed"],
+        "walls_no_3d_evidence": walls["summary"]["no_3d_evidence"],
+        "floors_total": floors["floors_total"],
+        "floors_confirmed": floors["summary"]["confirmed"],
+        "floors_unconfirmed": floors["summary"]["unconfirmed"],
+        "floors_partial_extent": floors["summary"]["partial_extent"],
+        "floors_no_crossings": floors["summary"]["no_crossings"],
+        "columns_total": columns["columns_total"],
+        "columns_confirmed": columns["summary"]["confirmed"],
+        "columns_unconfirmed": columns["summary"]["unconfirmed"],
+        "columns_no_crossings": columns["summary"]["no_crossings"],
+        "openings_total": openings["openings_total"],
+        "openings_confirmed": openings["summary"]["confirmed"],
+        "openings_unconfirmed": openings["summary"]["unconfirmed"],
+        "openings_no_3d_evidence": openings["summary"]["no_3d_evidence"],
+    }
+    total_suspects = (
+        summary["walls_unconfirmed"]
+        + summary["floors_unconfirmed"]
+        + summary["floors_partial_extent"]
+        + summary["columns_unconfirmed"]
+        + summary["openings_unconfirmed"]
+    )
+    total_elements = (
+        summary["walls_total"] + summary["floors_total"]
+        + summary["columns_total"] + summary["openings_total"]
+    )
+    summary["total_suspects"] = total_suspects
+    summary["total_elements"] = total_elements
+
+    needs_user_decision = bool(total_suspects)
+    if not needs_user_decision:
+        note = (
+            "**Validation 3D OK** : aucun élément suspect "
+            "({} W + {} F + {} C + {} O confirmés).".format(
+                summary["walls_confirmed"], summary["floors_confirmed"],
+                summary["columns_confirmed"], summary["openings_confirmed"],
+            )
+        )
+    else:
+        note = (
+            "**{} élément(s) suspect(s)** sur {} : "
+            "{} mur(s) + {} sol(s) ({} extent partiel) + {} poteau(x) "
+            "+ {} opening(s). Inspecter les sous-payloads."
+            .format(
+                total_suspects, total_elements,
+                summary["walls_unconfirmed"],
+                summary["floors_unconfirmed"], summary["floors_partial_extent"],
+                summary["columns_unconfirmed"], summary["openings_unconfirmed"],
+            )
+        )
+
+    return {
+        "ok": True,
+        "walls": walls,
+        "floors": floors,
+        "columns": columns,
+        "openings": openings,
+        "summary": summary,
+        "needs_user_decision": needs_user_decision,
+        "note": note,
+    }
+
+
+# ----- 8.9. Flag visuel des suspects 3D (couleur en vue Revit) --------
+#
+# Combine `dwg_validate_import_3d` + `views_override_element_colors_many`.
+# Pour chaque élément suspect (unconfirmed_in_3d) → rouge. Pour chaque
+# élément sans évidence 3D (no_3d_evidence) → jaune. L'user voit
+# directement en 3D ce qu'il faut inspecter / supprimer.
+
+
+@tool(name="dwg_flag_3d_suspects_in_view", tier=2)
+def flag_3d_suspects_in_view(
+    kg: ProjectKG,
+    doc: Any,
+    view_ref: Optional[str] = None,
+    flag_no_evidence: bool = True,
+    scale_override: Optional[float] = None,
+    section_lines: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Peint en rouge / jaune les éléments suspects identifiés par
+    `dwg_validate_import_3d` dans une vue Revit donnée.
+
+    **Rouge** (`unconfirmed_in_3d`) : ≥ 1 vue 3D dit explicitement
+    « cet élément n'est pas là » → suspect fantôme à supprimer.
+
+    **Jaune** (`no_3d_evidence`, optionnel) : aucune vue 3D ne peut
+    valider (ni coupe ni élévation ne contient cet élément) → à
+    vérifier visuellement.
+
+    Couvre walls + floors + columns + openings. Pas d'auto-suppression :
+    juste la mise en évidence visuelle. L'user décide manuellement.
+
+    Concepts: flag, suspect, rouge, jaune, validation, 3d, fantôme,
+              couleur, override, view, vue, peinture, visuel, audit,
+              post-import
+    Phrases: "flag les suspects en rouge", "peins les fantômes",
+             "color the unconfirmed elements", "highlight 3d suspects"
+    Similar: dwg_validate_import_3d, views_override_element_colors_many,
+             views_clear_element_overrides
+
+    Args:
+        view_ref: llm_id de la vue cible. Si None, vue active.
+        flag_no_evidence: si True (défaut), peint aussi les
+            no_3d_evidence en jaune. Mettre False pour ne flagger
+            QUE les unconfirmed (= rouge seul, vue plus lisible).
+        scale_override / section_lines: cf. `dwg_validate_import_3d`.
+
+    Returns:
+        ``{"ok", "view_revit_id", "red_count", "yellow_count",
+            "total_flagged", "validation": <full validate_import_3d payload>,
+            "note"}``
+    """
+    # 1. Run validation.
+    validation = validate_import_3d(
+        kg=kg, scale_override=scale_override, section_lines=section_lines,
+    )
+
+    # 2. Collect llm_ids to color.
+    red_ids: List[Dict[str, Any]] = []
+    yellow_ids: List[Dict[str, Any]] = []
+
+    for w in (validation.get("walls", {}).get("walls_unconfirmed_in_3d") or []):
+        red_ids.append({"llm_id": w["llm_id"], "color": "red"})
+    for f in (validation.get("floors", {}).get("floors_unconfirmed_in_3d") or []):
+        red_ids.append({"llm_id": f["llm_id"], "color": "red"})
+    for f in (validation.get("floors", {}).get("floors_partial_extent") or []):
+        red_ids.append({"llm_id": f["llm_id"], "color": "red"})  # extent_partial = aussi suspect
+    for c in (validation.get("columns", {}).get("columns_unconfirmed_in_3d") or []):
+        red_ids.append({"llm_id": c["llm_id"], "color": "red"})
+    for o in (validation.get("openings", {}).get("openings_unconfirmed_in_3d") or []):
+        red_ids.append({"llm_id": o["llm_id"], "color": "red"})
+
+    if flag_no_evidence:
+        for w in (validation.get("walls", {}).get("walls_no_3d_evidence") or []):
+            yellow_ids.append({"llm_id": w["llm_id"], "color": "yellow"})
+        for f in (validation.get("floors", {}).get("floors_no_crossings") or []):
+            yellow_ids.append({"llm_id": f["llm_id"], "color": "yellow"})
+        for c in (validation.get("columns", {}).get("columns_no_crossings") or []):
+            yellow_ids.append({"llm_id": c["llm_id"], "color": "yellow"})
+        for o in (validation.get("openings", {}).get("openings_no_3d_evidence") or []):
+            yellow_ids.append({"llm_id": o["llm_id"], "color": "yellow"})
+
+    items = red_ids + yellow_ids
+    if not items:
+        return {
+            "ok": True, "view_revit_id": None,
+            "red_count": 0, "yellow_count": 0, "total_flagged": 0,
+            "validation": validation,
+            "note": "Aucun élément suspect — rien à flagger.",
+        }
+
+    # 3. Apply overrides via views_override_element_colors_many.
+    from .views import override_element_colors_many as _override
+    result = _override(kg=kg, doc=doc, items=items, view_ref=view_ref)
+
+    note = (
+        "{} élément(s) en rouge (suspects fantômes) + {} en jaune (sans "
+        "évidence 3D) appliqué(s) dans la vue {}. {} skipped.".format(
+            len(red_ids), len(yellow_ids),
+            result.get("view_revit_id"),
+            result.get("skipped_count"),
+        )
+    )
+
+    return {
+        "ok": True,
+        "view_revit_id": result.get("view_revit_id"),
+        "red_count": len(red_ids),
+        "yellow_count": len(yellow_ids),
+        "total_flagged": result.get("applied_count"),
+        "skipped_count": result.get("skipped_count"),
+        "validation": validation,
         "note": note,
     }
 
@@ -1661,12 +3398,7 @@ def check_planset_integrity(
             coupe_extents: List[Tuple[str, float]] = []
             for cp in section_paths:
                 ents = parsed[cp]["entities"]
-                xs = [
-                    pt[0] for e in ents
-                    if e.layer == "A-WALL" and e.kind == "LINE"
-                    for pt in e.coords
-                ]
-                ext = (max(xs) - min(xs)) if xs else 0.0
+                ext = _building_extent_from_entities(ents) or 0.0
                 coupe_extents.append((cp, ext))
             best_perm = None
             best_drift = float("inf")
@@ -1705,12 +3437,7 @@ def check_planset_integrity(
             (p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2
         ) ** 0.5
         ents = parsed[coupe_path]["entities"]
-        xs = [
-            pt[0] for e in ents
-            if e.layer == "A-WALL" and e.kind == "LINE"
-            for pt in e.coords
-        ]
-        extent = (max(xs) - min(xs)) if xs else 0.0
+        extent = _building_extent_from_entities(ents) or 0.0
         drift_m = abs(marker_length - extent)
         denom = max(marker_length, extent, 1e-6)
         drift_pct = 100.0 * drift_m / denom
@@ -4145,6 +5872,14 @@ def create_continuous_walls_many(
     total_walls_filtered = 0
     filtered_walls_detail: List[Dict[str, Any]] = []
 
+    # NB : pas de dédup inter-niveaux. La logique « 100% identique
+    # = View Range artifact » s'est avérée trop fragile (faux positifs
+    # sur étages habitables avec murs porteurs légitimement empilés ou
+    # apartments dont le périmètre matche la base sans cloisons). User
+    # nettoie manuellement les éventuels artifacts View Range en Revit
+    # UI. Module `lib/wall_inter_level_dedup.py` conservé comme
+    # toolkit pour audit/check futur (pas appelé automatiquement).
+
     # --- 4. Dédup thicknesses + get_or_create types ---------------------
     seen_buckets: Set[int] = set()
     unique_thicknesses_m: List[float] = []
@@ -4902,6 +6637,303 @@ def create_floors_many(
     }
 
 
+# ----- Phase 2d : import des poteaux depuis les plans DXF -------------
+#
+# Pipeline aligned avec Phase 2a (walls) et Phase 2c (floors) :
+# 1. Pour chaque plan, extraire les INSERTs S-COLS via
+#    `dwg_plan_columns.extract_columns_from_entities` (1 candidate par
+#    instance).
+# 2. Aggréger inter-niveaux par position : `aggregate_columns_across_plans`
+#    retourne 1 colonne aggrégée par grille-point unique, avec
+#    base/top elevation déduits de l'apparition à chaque niveau.
+# 3. Get-or-create un ColumnType placeholder `DXF_COL_<famille>_<type>`
+#    par paire `(family, type)` unique via
+#    `columns_get_or_create_dxf_type_many`. Aucune assomption matériau.
+# 4. Bulk create via `columns_create_many` (1 Tx Revit, 1 Tx KG).
+#
+# Le module gère naturellement le View Range Revit (qui fait apparaître
+# 60 INSERTs au niveau intermédiaire d'un projet 3 niveaux) en aggrégeant
+# par position avant création — chaque position physique → 1 colonne.
+
+
+@tool(name="dwg_create_columns_many", tier=2)
+def create_columns_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+    scale_override: Optional[float] = None,
+    base_column_type_ref: Optional[str] = None,
+    default_storey_height_m: float = 3.0,
+    position_merge_tol_m: float = 0.05,
+) -> Dict[str, Any]:
+    """Phase 2d — Crée les poteaux depuis les S-COLS INSERTs des plans.
+
+    Pipeline :
+
+    1. Parse chaque plan, extrait les INSERTs S-COLS → `ColumnCandidate`
+       (position, family_name, type_name, rotation, block_name).
+    2. **Aggrège inter-niveaux par position** (à `position_merge_tol_m`
+       près) : pour chaque grille-point unique, retient le niveau le
+       plus bas comme base et déduit la hauteur du niveau suivant.
+       Évite la création de doublons quand le View Range Revit affiche
+       plusieurs niveaux dans le même plan.
+    3. Get-or-create un `ColumnType` placeholder `DXF_COL_<famille>_<type>`
+       par paire `(family, type)` unique (cf.
+       `columns_get_or_create_dxf_type_many` — duplique un poteau
+       générique du projet, aucune assomption matériau).
+    4. Bulk-call `columns_create_many` (1 Tx Revit, 1 Tx KG).
+
+    **Aucune assomption sur le matériau** : couvre HEA acier, béton,
+    bois, etc. (cf. `dwg_plan_columns.parse_column_block_name`). Les
+    types DXF_COL_* sont des placeholders traçables ; l'user remappe
+    vers les vraies familles après import.
+
+    Concepts: poteau, column, dxf, import, phase 2d, plans, s-cols,
+              HEA, béton, bois, family, type, placeholder, bulk
+    Phrases: "crée les poteaux", "import des colonnes",
+             "phase 2d", "import poteaux dxf"
+    Similar: dwg_create_continuous_walls_many, dwg_create_floors_many,
+             columns_create_many
+
+    Args:
+        items: liste de dicts `{file_path, level_ref}`. Chaque item =
+            un plan DXF associé à son niveau Revit (llm_id du Level).
+            `file_path` doit pointer vers un DXF de plan (pas de
+            coupe / élévation). L'ordre par level_elevation est
+            indifférent — la fonction trie elle-même.
+        scale_override: cf. `dwg_inspect`.
+        base_column_type_ref: llm_id d'un ColumnType template à
+            dupliquer pour les placeholders DXF_COL_*. Si None
+            (défaut), cherche un FamilySymbol de poteau générique
+            chargé dans le projet (cf.
+            `columns_get_or_create_dxf_type_many`).
+        default_storey_height_m: hauteur d'étage par défaut quand
+            une colonne n'apparaît qu'à un seul niveau (pas d'info
+            top). Défaut 3 m.
+        position_merge_tol_m: tolérance pour fusionner des positions
+            de colonnes quasi-identiques (drift d'export DXF).
+            Défaut 5 cm.
+
+    Returns:
+        ``{"ok": bool, "files_count": int, "candidates_total": int,
+            "aggregated_count": int, "columns_created_count": int,
+            "types_created": int, "types_reused": int,
+            "types": [{family_name, type_name, kind, llm_id, ...}, ...],
+            "columns_per_level": {elevation: count},
+            "inner_columns": dict | None, "note": str}``
+    """
+    from .. import dwg_plan_columns
+    from . import columns as columns_tool
+
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+
+    # --- 1. Pré-validation + collect candidates per plan ----------------
+    plan_records: List[Dict[str, Any]] = []
+    level_elev_by_ref: Dict[str, float] = {}
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            raise ValueError("items[{}] must be a dict".format(i))
+        fp = it.get("file_path")
+        level_ref = it.get("level_ref")
+        if not isinstance(fp, str) or not fp.strip():
+            raise ValueError("items[{}]: file_path required".format(i))
+        if not isinstance(level_ref, str) or not kg.has_node(level_ref):
+            raise ValueError(
+                "items[{}]: unknown level_ref {!r}".format(i, level_ref)
+            )
+        path = Path(fp)
+        if not path.exists():
+            raise FileNotFoundError(
+                "items[{}]: file not found: {}".format(i, path)
+            )
+        _refuse_if_section(path)
+        lvl_node = kg.get_node(level_ref)
+        level_elev_by_ref[level_ref] = float(lvl_node.get("elevation", 0.0))
+
+        entities, _ = dwg_reader.parse(path, scale_override=scale_override)
+        candidates = dwg_plan_columns.extract_columns_from_entities(entities)
+        plan_records.append({
+            "item": it,
+            "candidates": candidates,
+        })
+
+    candidates_total = sum(len(pr["candidates"]) for pr in plan_records)
+    if candidates_total == 0:
+        return {
+            "ok": True,
+            "files_count": len(items),
+            "candidates_total": 0,
+            "aggregated_count": 0,
+            "columns_created_count": 0,
+            "types_created": 0,
+            "types_reused": 0,
+            "types": [],
+            "columns_per_level": {},
+            "inner_columns": None,
+            "note": (
+                "Aucun INSERT S-COLS détecté dans les plans. "
+                "Soit le projet n'a pas de poteaux, soit la convention "
+                "de layer diffère (S-COLS attendu — vérifier dwg_inspect)."
+            ),
+        }
+
+    # --- 2. Per-level dedup (1 colonne par étage par grille-point) -----
+    # Convention Revit structurelle : chaque storey = un élément
+    # distinct (jonctions physiques séparées). Pour P2 : 30 par niveau
+    # × 3 niveaux = 90 colonnes.
+    columns_by_level_elev: List[Tuple[float, List[Any]]] = [
+        (level_elev_by_ref[pr["item"]["level_ref"]], pr["candidates"])
+        for pr in plan_records
+    ]
+    aggregated = dwg_plan_columns.dedup_columns_within_plans(
+        columns_by_level_elev,
+        position_merge_tol_m=position_merge_tol_m,
+        default_storey_height_m=default_storey_height_m,
+    )
+
+    if not aggregated:
+        return {
+            "ok": True,
+            "files_count": len(items),
+            "candidates_total": candidates_total,
+            "aggregated_count": 0,
+            "columns_created_count": 0,
+            "types_created": 0,
+            "types_reused": 0,
+            "types": [],
+            "columns_per_level": {},
+            "inner_columns": None,
+            "note": (
+                "Aggregation a retourné 0 colonnes — vérifier "
+                "position_merge_tol_m et le contenu DXF."
+            ),
+        }
+
+    # --- 3. Get-or-create ColumnType placeholders ---------------------
+    # Pour chaque (family, type) unique, on prend les dimensions bbox
+    # de la 1re occurrence rencontrée — toutes les instances d'un même
+    # (family, type) devraient avoir le même bbox (mêmes définitions
+    # BLOCK).
+    type_specs: List[Dict[str, Any]] = []
+    seen_type_keys: Set[Tuple[str, str]] = set()
+    for col in aggregated:
+        key = (col.family_name, col.type_name)
+        if key in seen_type_keys:
+            continue
+        seen_type_keys.add(key)
+        type_specs.append({
+            "family_name": col.family_name,
+            "type_name": col.type_name,
+            "kind": "structural",
+            "width_m": col.width_m,
+            "depth_m": col.depth_m,
+        })
+    types_result = columns_tool.get_or_create_dxf_type_many(
+        kg=kg, doc=doc, types=type_specs,
+        base_type_ref=base_column_type_ref,
+    )
+    # Map (original_family, original_type) → llm_id du placeholder.
+    type_ref_by_original: Dict[Tuple[str, str], str] = {}
+    for col_t in types_result["types"]:
+        # `family_name` ici = la family d'origine conservée par
+        # get_or_create_dxf_type_many ; on a besoin du couple original.
+        # Le placeholder name encode (family, type) — on re-parse.
+        # En pratique, get_or_create conserve `family_name` = original,
+        # et `type_name` = `DXF_COL_<family>_<type>`. On retrouve
+        # l'original_type via le suffixe.
+        placeholder = col_t["type_name"]  # DXF_COL_<fam>_<type>
+        family_in_node = col_t["family_name"]
+        # Extract original type by stripping prefix and family.
+        prefix = "DXF_COL_"
+        rest = placeholder[len(prefix):] if placeholder.startswith(prefix) else placeholder
+        # Le family_name peut contenir des `_` (sanitization) → on
+        # retrouve l'original_type en cherchant la version sanitizée
+        # de family puis le `_` séparateur.
+        type_ref_by_original[(family_in_node, col_t["type_name"])] = col_t["llm_id"]
+    # Construire le mapping placeholder_name → llm_id, plus simple.
+    type_ref_by_placeholder: Dict[str, str] = {
+        col_t["type_name"]: col_t["llm_id"]
+        for col_t in types_result["types"]
+    }
+
+    # --- 4. Build column items + columns_create_many -----------------
+    # Trouver, pour chaque AggregatedColumn, le level_ref de sa base.
+    elev_to_level_ref: Dict[float, str] = {
+        round(e, 4): lr for lr, e in level_elev_by_ref.items()
+    }
+
+    column_items: List[Dict[str, Any]] = []
+    columns_per_level: Dict[float, int] = {}
+    skipped_no_base_level = 0
+    for col in aggregated:
+        base_elev_key = round(col.base_level_elev_m, 4)
+        base_level_ref = elev_to_level_ref.get(base_elev_key)
+        if base_level_ref is None:
+            # Pas de niveau Revit correspondant à la base elevation —
+            # peut arriver si user a passé des plans qui ne couvrent
+            # pas tous les niveaux. Skip avec compteur.
+            skipped_no_base_level += 1
+            continue
+        # Le placeholder name est `DXF_COL_<sanitized_family>_<sanitized_type>`.
+        from ..tools.columns import _dxf_column_type_name
+        placeholder_name = _dxf_column_type_name(
+            col.family_name, col.type_name,
+        )
+        type_ref = type_ref_by_placeholder.get(placeholder_name)
+        if type_ref is None:
+            # Type pas trouvé — devrait pas arriver puisqu'on vient de
+            # le créer ci-dessus.
+            skipped_no_base_level += 1
+            continue
+        height_m = col.top_level_elev_m - col.base_level_elev_m
+        column_items.append({
+            "level_ref": base_level_ref,
+            "column_type_ref": type_ref,
+            "position": [col.position[0], col.position[1]],
+            "height": height_m,
+        })
+        columns_per_level[col.base_level_elev_m] = (
+            columns_per_level.get(col.base_level_elev_m, 0) + 1
+        )
+
+    inner_columns = None
+    if column_items:
+        inner_columns = columns_tool.create_many(
+            kg=kg, doc=doc, items=column_items,
+        )
+
+    note = (
+        "Phase 2d : {} poteau(x) créé(s) sur {} grille-points uniques "
+        "({} candidates parsés depuis {} plan(s)). "
+        "{} ColumnType DXF_COL_* créé(s) / {} réutilisé(s)."
+        .format(
+            len(column_items), len(aggregated), candidates_total,
+            len(items),
+            types_result["created_count"], types_result["reused_count"],
+        )
+    )
+    if skipped_no_base_level:
+        note += " {} colonne(s) skippée(s) (level_ref base manquant).".format(
+            skipped_no_base_level,
+        )
+
+    return {
+        "ok": True,
+        "files_count": len(items),
+        "candidates_total": candidates_total,
+        "aggregated_count": len(aggregated),
+        "columns_created_count": len(column_items),
+        "columns_skipped_no_base_level": skipped_no_base_level,
+        "types_created": types_result["created_count"],
+        "types_reused": types_result["reused_count"],
+        "types": types_result["types"],
+        "columns_per_level": {str(k): v for k, v in columns_per_level.items()},
+        "inner_columns": inner_columns,
+        "note": note,
+    }
+
+
 # ----- Reset des imports DXF (Phase 2 maintenance) ----------------------
 #
 # Outil de nettoyage : soft-delete dans le KG tous les Wall/Window/Door
@@ -4912,11 +6944,11 @@ def create_floors_many(
 # KG rollback via `kg.transaction()`.
 
 
-_DXF_TYPE_PREFIXES = ("DXF_WALL_", "DXF_WIN_", "DXF_DOOR_", "DXF_FLOOR_")
+_DXF_TYPE_PREFIXES = ("DXF_WALL_", "DXF_WIN_", "DXF_DOOR_", "DXF_FLOOR_", "DXF_COL_")
 
 
 def _is_dxf_type_node(attrs: Dict[str, Any]) -> bool:
-    """Match WallType/FloorType/FamilyType DXF_* (Phase 2a/b/c)."""
+    """Match WallType/FloorType/FamilyType/ColumnType DXF_* (Phase 2a/b/c/d)."""
     t = attrs.get("_type")
     if t == "WallType":
         name = attrs.get("name") or ""
@@ -4927,6 +6959,9 @@ def _is_dxf_type_node(attrs: Dict[str, Any]) -> bool:
     if t == "FamilyType":
         tn = attrs.get("type_name") or ""
         return tn.startswith("DXF_WIN_") or tn.startswith("DXF_DOOR_")
+    if t == "ColumnType":
+        tn = attrs.get("type_name") or ""
+        return tn.startswith("DXF_COL_")
     return False
 
 
@@ -5245,7 +7280,42 @@ def _meta_run_phase1_audit(
                 "view_dir": view_dir,
                 "drift_m": entry.get("drift_m"),
                 "drift_pct": entry.get("drift_pct"),
+                "x_axis_convention": "identity",  # défaut, override ci-dessous.
             })
+
+    # 4bis. Détection X axis convention par coupe (P2 mirror fix).
+    # On cross-valide murs plan ↔ section_walls coupe pour identifier
+    # les coupes en convention "reversed" (DXF X = -world axis).
+    if assignment and plan_for_markers is not None:
+        try:
+            section_lines_for_detect = [
+                {
+                    "coupe_path": a["coupe_path"],
+                    "plan_p1": a["plan_p1"],
+                    "plan_p2": a["plan_p2"],
+                    "view_dir": a["view_dir"],
+                    "name": a.get("coupe_name"),
+                }
+                for a in assignment
+            ]
+            detect_result = detect_section_orientations(
+                kg=kg,
+                plan_path=str(plan_for_markers),
+                section_lines=section_lines_for_detect,
+                scale_override=scale_override,
+            )
+            orient_by_path = {
+                o["coupe_path"]: o["convention"]
+                for o in detect_result.get("orientations") or []
+            }
+            for a in assignment:
+                a["x_axis_convention"] = orient_by_path.get(
+                    a["coupe_path"], "identity",
+                )
+        except Exception:  # noqa: BLE001 — détection non-fatale.
+            # Si la détection échoue (parse error, etc.), garder identity
+            # par défaut. L'user peut overrider à la main si miroité.
+            pass
 
     # 5. Level reconciliation (uses first coupe — they declare same levels).
     coupe_levels_reconcile: Dict[str, Any] = {}
@@ -5459,6 +7529,7 @@ def _meta_create_section_views(
             "p1_m": entry["plan_p1"],
             "p2_m": entry["plan_p2"],
             "view_dir": entry["view_dir"],
+            "x_axis_convention": entry.get("x_axis_convention", "identity"),
         })
     result = _create_sections(
         kg=kg, doc=doc, items=items, top_elev_m=top_elev_m,
@@ -5470,6 +7541,11 @@ def _meta_create_section_views(
             "coupe_path": entry["coupe_path"],
             "section_name": section.get("name"),
             "section_revit_id": section.get("revit_id"),
+            # Diagnostic mirror (P2 fix) : propagate basis_x verdict.
+            "x_axis_convention": entry.get("x_axis_convention"),
+            "intended_basis_x": section.get("intended_basis_x"),
+            "actual_right_direction": section.get("actual_right_direction"),
+            "basis_x_match": section.get("basis_x_match"),
         })
     return out
 
@@ -5584,12 +7660,23 @@ def _meta_link_cad_for_all_dxfs(
         })
 
     # Coupes → SectionViews (just created).
+    # Si basis_x_match=False (Revit a ignoré notre BasisX flippé),
+    # demander à link_cad de mirror l'instance post-placement pour
+    # compenser. Cf. fix bug mirror P2 longitudinales 2026-05-14.
     for coupe in coupes_with_sections:
         view_revit_id = coupe.get("section_revit_id")
         if view_revit_id is None:
             skipped += 1
             continue
-        links.append({"file_path": coupe["coupe_path"], "view_revit_id": int(view_revit_id)})
+        need_mirror = (
+            coupe.get("x_axis_convention") is not None
+            and coupe.get("basis_x_match") is False
+        )
+        links.append({
+            "file_path": coupe["coupe_path"],
+            "view_revit_id": int(view_revit_id),
+            "mirror_post_link": need_mirror,
+        })
         linked_view_specs.append({
             "file_path": coupe["coupe_path"],
             "view_revit_id": int(view_revit_id),
@@ -5746,6 +7833,73 @@ def _meta_phase2c_floors(
     }
 
 
+def _meta_phase2d_columns(
+    kg: ProjectKG,
+    doc: Any,
+    audit: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Phase 2d — `dwg_create_columns_many` sur tous les plans assignés
+    aux niveaux. Réutilise le même mapping plan → level que Phase 2a."""
+    plans = audit.get("files", {}).get("plans") or []
+    if not plans:
+        return {
+            "columns_created_count": 0,
+            "note": "no plans to import columns from",
+        }
+
+    # Build plan_items via le même mapping nom-de-fichier → Level que 2a.
+    plan_view_names: Dict[str, str] = {}
+    for plan_path in plans:
+        stem = Path(plan_path).stem
+        suffix = stem.split(" - ")[-1] if " - " in stem else stem
+        plan_view_names[plan_path] = suffix
+
+    level_by_name: Dict[str, str] = {}
+    levels_sorted: List[Tuple[float, str]] = []
+    for lid in kg.find_by_type("Level"):
+        attrs = kg.get_node(lid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        level_by_name[attrs.get("name")] = lid
+        levels_sorted.append((float(attrs.get("elevation", 0.0)), lid))
+    levels_sorted.sort()
+    if not levels_sorted:
+        return {
+            "columns_created_count": 0,
+            "note": "no levels in KG — cannot import columns",
+        }
+
+    plan_items: List[Dict[str, Any]] = []
+    for plan_path in plans:
+        level_ref = level_by_name.get(plan_view_names[plan_path])
+        if level_ref is None:
+            level_ref = levels_sorted[0][1]
+        plan_items.append({
+            "file_path": plan_path,
+            "level_ref": level_ref,
+        })
+
+    try:
+        result = create_columns_many(kg=kg, doc=doc, items=plan_items)
+    except ValueError as exc:
+        # Cas typique : aucune famille de poteau chargée dans le projet
+        # → non-fatal (le projet peut ne pas avoir de poteaux).
+        return {
+            "columns_created_count": 0,
+            "skipped_reason": str(exc),
+            "note": "Phase 2d skippée (cf. skipped_reason).",
+        }
+    return {
+        "columns_created_count": result.get("columns_created_count", 0),
+        "candidates_total": result.get("candidates_total", 0),
+        "aggregated_count": result.get("aggregated_count", 0),
+        "columns_per_level": result.get("columns_per_level"),
+        "types_created": result.get("types_created"),
+        "types_reused": result.get("types_reused"),
+        "note": result.get("note"),
+    }
+
+
 def _meta_open_3d_view(kg: ProjectKG, doc: Any) -> bool:
     if doc is None:
         return False
@@ -5883,38 +8037,62 @@ def import_project_execute(
         elevations=audit.get("files", {}).get("elevations") or [],
     )
 
-    # 6-8. Phase 2.
+    # 6-9. Phase 2.
     phase2a = _meta_phase2a_walls(kg, doc, audit, height_per_level_m)
     phase2b = _meta_phase2b_openings(kg, doc)
     phase2c = _meta_phase2c_floors(kg, doc, skip_top_floor)
+    phase2d = _meta_phase2d_columns(kg, doc, audit)
 
-    # 9. Open 3D view (optional).
+    # 10. Open 3D view (optional).
     view_3d_opened = _meta_open_3d_view(kg, doc) if open_3d_view else False
 
     note = (
-        "Import OK — {} murs / {} fenêtres / {} portes / {} sols créés sur "
-        "{} niveau(x). {}".format(
+        "Import OK — {} murs / {} fenêtres / {} portes / {} sols / "
+        "{} poteaux créés sur {} niveau(x). {}".format(
             phase2a.get("walls_imported_total", 0),
             phase2b.get("openings_windows_created", 0),
             phase2b.get("openings_doors_created", 0),
             phase2c.get("floors_created_count", 0),
+            phase2d.get("columns_created_count", 0),
             levels_summary.get("levels_created", 0)
             + levels_summary.get("levels_create_skipped_existing", 0),
             "Vue 3D ouverte." if view_3d_opened else "",
         )
     )
 
+    # Diagnostic : orientations détectées (P2 mirror fix) + verdict
+    # basis_x match (= est-ce que Revit a accepté notre BasisX flippé,
+    # ou re-dérivé sa propre version ?).
+    section_orientations_diag = []
+    coupes_diag_by_path = {
+        c.get("coupe_path"): c for c in coupes_with_sections
+    }
+    for entry in audit.get("section_assignment") or []:
+        cp = entry.get("coupe_path")
+        cs = coupes_diag_by_path.get(cp) or {}
+        section_orientations_diag.append({
+            "coupe_path": cp,
+            "name": Path(cp).stem.split(" - ")[-1] if cp else None,
+            "view_dir": entry.get("view_dir"),
+            "x_axis_convention": entry.get("x_axis_convention"),
+            "intended_basis_x": cs.get("intended_basis_x"),
+            "actual_right_direction": cs.get("actual_right_direction"),
+            "basis_x_match": cs.get("basis_x_match"),
+        })
+
     return {
         "ok": True,
         "phase1_setup": {
             **levels_summary,
             "sections_created": len(coupes_with_sections),
+            "section_orientations": section_orientations_diag,
             **ctx_summary,
             **link_summary,
         },
         "phase2a_walls": phase2a,
         "phase2b_openings": phase2b,
         "phase2c_floors": phase2c,
+        "phase2d_columns": phase2d,
         "view_3d_opened": view_3d_opened,
         "note": note,
     }

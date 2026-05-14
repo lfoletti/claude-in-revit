@@ -283,6 +283,539 @@ def reconcile_plan_section_walls(
     )
 
 
+# ----- Détection convention DXF X axis (P2 mirror fix) ----------------
+#
+# La convention « DXF X = world axis identité » établie sur P7 ne tient
+# pas systématiquement (cf. P2 où certaines coupes longitudinales sont
+# miroitées). Source probable : le user a `FlipDirection()` la vue
+# section dans Revit (ou changé le sens de dessin du trait), modifiant
+# l'orientation du BasisX de la vue source. L'export DXF reflète cette
+# orientation, mais le marqueur de coupe en plan ne le révèle pas
+# directement.
+#
+# **Stratégie auto-détection** : tester les 2 conventions sur les murs
+# du plan croisés par le trait. Celle qui matche le plus de murs gagne.
+# Si égalité ou aucun match → "identity" par défaut (= convention P7).
+
+
+@dataclass
+class SectionXAxisConvention:
+    """Verdict de détection de convention X axis pour une coupe.
+
+    - `convention` : `"identity"` (DXF X = +world axis, défaut P7) ou
+      `"reversed"` (DXF X = -world axis, cas P2 longitudinal).
+    - `matches_identity` / `matches_reversed` : nb de murs plan
+      retrouvés en coupe selon chaque convention.
+    - `confidence` : `(winner - loser) / max(walls_crossed, 1)`. ≥ 0.3
+      = signal clair ; entre 0 et 0.3 = à confirmer ; 0 = égalité ou
+      aucun mur croisé.
+    """
+    convention: str
+    matches_identity: int
+    matches_reversed: int
+    walls_crossed: int
+    confidence: float
+
+
+def detect_section_x_axis_convention(
+    plan_walls: List[Dict[str, Any]],
+    section_line: Dict[str, Any],
+    section_walls_in_coupe: List[Dict[str, Any]],
+    *,
+    thickness_tol_m: float = 0.02,
+    x_cut_tol_m: float = 0.10,
+) -> SectionXAxisConvention:
+    """Détecte si la coupe utilise convention `identity` ou `reversed`.
+
+    Pour chaque mur plan croisant `section_line` :
+    - `x_cut_identity = ix` (trait horizontal) ou `iy` (trait vertical).
+    - `x_cut_reversed = -x_cut_identity`.
+    - Cherche un section_wall dans `section_walls_in_coupe` à
+      `x_cut_identity` (± tol, épaisseur compatible) → +1 identity.
+    - Cherche à `x_cut_reversed` → +1 reversed.
+
+    Convention retenue = celle avec le plus de matches.
+
+    Args:
+        plan_walls: liste `[{p1, p2, thickness_m}, ...]`.
+        section_line: dict `{plan_p1, plan_p2, ...}`.
+        section_walls_in_coupe: liste `[{x_cut_m, thickness_m, ...}, ...]`.
+        thickness_tol_m / x_cut_tol_m: tolérances de matching.
+
+    Returns:
+        `SectionXAxisConvention`.
+    """
+    sp1 = (float(section_line["plan_p1"][0]), float(section_line["plan_p1"][1]))
+    sp2 = (float(section_line["plan_p2"][0]), float(section_line["plan_p2"][1]))
+    trait_dx = sp2[0] - sp1[0]
+    trait_dy = sp2[1] - sp1[1]
+    is_vertical_trait = abs(trait_dx) < abs(trait_dy)
+
+    matches_identity = 0
+    matches_reversed = 0
+    walls_crossed = 0
+    for pw in plan_walls:
+        p1 = (float(pw["p1"][0]), float(pw["p1"][1]))
+        p2 = (float(pw["p2"][0]), float(pw["p2"][1]))
+        thickness = float(pw.get("thickness_m", pw.get("thickness", 0.0)))
+        inter = _segment_intersection_2d(p1, p2, sp1, sp2)
+        if inter is None:
+            continue
+        ix, iy, _t, _u = inter
+        x_cut_identity = iy if is_vertical_trait else ix
+        x_cut_reversed = -x_cut_identity
+        walls_crossed += 1
+        for sw in section_walls_in_coupe:
+            if abs(float(sw["thickness_m"]) - thickness) > thickness_tol_m:
+                continue
+            x_dxf = float(sw["x_cut_m"])
+            if abs(x_dxf - x_cut_identity) <= x_cut_tol_m:
+                matches_identity += 1
+                break  # 1 match par mur suffit
+        for sw in section_walls_in_coupe:
+            if abs(float(sw["thickness_m"]) - thickness) > thickness_tol_m:
+                continue
+            x_dxf = float(sw["x_cut_m"])
+            if abs(x_dxf - x_cut_reversed) <= x_cut_tol_m:
+                matches_reversed += 1
+                break
+
+    if walls_crossed == 0:
+        return SectionXAxisConvention(
+            convention="identity", matches_identity=0, matches_reversed=0,
+            walls_crossed=0, confidence=0.0,
+        )
+
+    if matches_reversed > matches_identity:
+        winner = "reversed"
+        margin = matches_reversed - matches_identity
+    else:
+        winner = "identity"
+        margin = matches_identity - matches_reversed
+
+    confidence = margin / float(walls_crossed)
+    return SectionXAxisConvention(
+        convention=winner,
+        matches_identity=matches_identity,
+        matches_reversed=matches_reversed,
+        walls_crossed=walls_crossed,
+        confidence=round(confidence, 3),
+    )
+
+
+# ----- Reconciliation plan ↔ coupes pour les dalles (Phase 2c) ---------
+#
+# Symétrique de `reconcile_plan_section_walls` pour les sols. Une dalle
+# plan a un contour 2D + niveau Z + épaisseur (via FloorType). Une coupe
+# révèle des paires top/bot horizontales A-FLOR (`SectionFloorSlab`).
+#
+# Pour chaque (Floor, section_line) qui se croisent, on calcule les
+# intervalles `[x_cut_min, x_cut_max]` où la coupe est *à l'intérieur*
+# de la dalle (en tenant compte des trous), exprimés dans le repère DXF
+# coupe via la même convention que pour les murs : `x_cut = iy` si trait
+# vertical, sinon `ix`. On cherche ensuite une paire dans cette coupe
+# dont `top_y_m ≈ floor.elevation_m` ET dont `[x_min, x_max]` recouvre
+# l'intervalle. On compare alors les épaisseurs.
+
+
+def _polygon_line_intersections(
+    polygon: List[Tuple[float, float]],
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> List[Tuple[float, float, float]]:
+    """Intersections d'un segment `a→b` avec le contour d'un polygone fermé.
+
+    Args:
+        polygon: liste de sommets `[(x, y), ...]`. Fermeture implicite
+            (le dernier sommet reboucle sur le premier).
+        a, b: extrémités du segment.
+
+    Returns:
+        Liste de `(x, y, u)` où `u ∈ [0, 1]` est l'abscisse normalisée
+        du point d'intersection le long du segment `a→b`. Pas dédoublonnée
+        — un segment qui passe pile par un sommet apparaît deux fois.
+    """
+    out: List[Tuple[float, float, float]] = []
+    n = len(polygon)
+    if n < 2:
+        return out
+    for i in range(n):
+        p = polygon[i]
+        q = polygon[(i + 1) % n]
+        inter = _segment_intersection_2d(a, b, p, q)
+        if inter is None:
+            continue
+        ix, iy, t, _u = inter
+        out.append((ix, iy, t))
+    return out
+
+
+def _point_in_polygon(
+    pt: Tuple[float, float],
+    polygon: List[Tuple[float, float]],
+) -> bool:
+    """Test d'inclusion strict d'un point dans un polygone fermé
+    (ray casting horizontal vers +X). Frontière → True (par tolérance
+    de l'algorithme classique ; on n'a pas besoin de stricte ouverture
+    pour notre cas d'usage)."""
+    x, y = pt
+    n = len(polygon)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-15) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _floor_cut_intervals_in_section(
+    boundary: List[Tuple[float, float]],
+    holes: List[List[Tuple[float, float]]],
+    section_p1: Tuple[float, float],
+    section_p2: Tuple[float, float],
+    *,
+    cut_dedupe_tol_m: float = 1e-4,
+) -> List[Tuple[float, float]]:
+    """Pour une dalle (boundary + holes) traversée par un trait de coupe
+    `section_p1→section_p2`, retourne les intervalles `[x_cut_min,
+    x_cut_max]` dans le repère DXF coupe où le trait est à l'intérieur
+    de la dalle (donc où on attend une paire top/bot dans la coupe).
+
+    Algo :
+    1. Calculer toutes les intersections du trait avec outer + chaque hole.
+    2. Trier par `t` (abscisse normalisée sur le trait), en dédoublonnant
+       les `t` quasi-égaux (pile sur un sommet → 2 hits à fusionner en 1).
+    3. Évaluer un test d'inclusion en milieu de chaque intervalle entre
+       hits successifs : si le milieu est *dans la dalle nette*
+       (outer ∧ ¬hole_i), c'est un intervalle "à l'intérieur".
+    4. Projeter `(x, y)` du couple `(t_a, t_b)` selon l'orientation du
+       trait (vertical → y, horizontal → x) pour obtenir `[x_cut_min,
+       x_cut_max]` en coordonnées coupe.
+
+    Returns:
+        Liste d'intervalles `(x_cut_min, x_cut_max)` triés et non-vides.
+    """
+    # 1. Hits sur outer + holes.
+    hits: List[Tuple[float, float, float]] = []
+    hits.extend(_polygon_line_intersections(boundary, section_p1, section_p2))
+    for hole in holes:
+        hits.extend(_polygon_line_intersections(hole, section_p1, section_p2))
+
+    # Compléter par les extrémités du trait pour traiter le cas où une
+    # extrémité tombe à l'intérieur de la dalle (sinon on rate l'intervalle).
+    hits.append((section_p1[0], section_p1[1], 0.0))
+    hits.append((section_p2[0], section_p2[1], 1.0))
+
+    hits.sort(key=lambda h: h[2])
+    # Dédoublonner les t quasi-égaux.
+    deduped: List[Tuple[float, float, float]] = []
+    for h in hits:
+        if deduped and abs(h[2] - deduped[-1][2]) < 1e-6:
+            continue
+        deduped.append(h)
+
+    if len(deduped) < 2:
+        return []
+
+    trait_dx = section_p2[0] - section_p1[0]
+    trait_dy = section_p2[1] - section_p1[1]
+    is_vertical = abs(trait_dx) < abs(trait_dy)
+
+    def _to_cut_x(x: float, y: float) -> float:
+        return y if is_vertical else x
+
+    intervals: List[Tuple[float, float]] = []
+    for i in range(len(deduped) - 1):
+        x_a, y_a, _t_a = deduped[i]
+        x_b, y_b, _t_b = deduped[i + 1]
+        mid = ((x_a + x_b) / 2.0, (y_a + y_b) / 2.0)
+        # Inside = inside outer AND not inside any hole.
+        if not _point_in_polygon(mid, boundary):
+            continue
+        if any(_point_in_polygon(mid, h) for h in holes):
+            continue
+        cx_a = _to_cut_x(x_a, y_a)
+        cx_b = _to_cut_x(x_b, y_b)
+        x_min, x_max = (cx_a, cx_b) if cx_a <= cx_b else (cx_b, cx_a)
+        if x_max - x_min < cut_dedupe_tol_m:
+            continue
+        intervals.append((round(x_min, 4), round(x_max, 4)))
+
+    # Fusion d'intervalles adjacents (trait colinéaire à un bord, etc.).
+    if not intervals:
+        return []
+    intervals.sort()
+    merged: List[Tuple[float, float]] = [intervals[0]]
+    for x_min, x_max in intervals[1:]:
+        last_min, last_max = merged[-1]
+        if x_min <= last_max + cut_dedupe_tol_m:
+            merged[-1] = (last_min, max(last_max, x_max))
+        else:
+            merged.append((x_min, x_max))
+    return merged
+
+
+@dataclass
+class FloorSectionMatch:
+    """Une dalle plan croisée par un trait de coupe, avec son pendant
+    éventuel dans le DXF coupe.
+
+    `status` :
+    - `"ok"` : Z + épaisseur + extent matchent.
+    - `"thickness_mismatch"` : paire trouvée au bon Z + extent OK, mais
+      drift d'épaisseur > tolérance.
+    - `"extent_partial"` : paire trouvée au bon Z + épaisseur OK, mais
+      ne recouvre pas tout l'intervalle de coupe (signal : trémie non-
+      détectée en plan OU dalle plan trop large).
+    - `"no_section_pair_at_z"` : aucune paire dans la coupe à l'élévation
+      du niveau de cette dalle (signal fort : dalle plan « fantôme »
+      ou paire mal détectée côté coupe).
+    - `"no_section_pair_at_x"` : paire(s) trouvée(s) au bon Z mais
+      aucune n'a d'overlap X avec l'intervalle de coupe.
+    """
+    plan_floor_index: int
+    plan_level_elevation_m: float
+    plan_thickness_m: float
+    section_line_index: int
+    section_line_name: Optional[str]
+    coupe_path: str
+    cut_interval_m: Tuple[float, float]
+    section_slab_index: Optional[int]
+    section_top_y_m: Optional[float]
+    section_thickness_m: Optional[float]
+    thickness_drift_m: Optional[float]
+    coverage_ratio: Optional[float]
+    status: str
+
+
+@dataclass
+class FloorsReconciliation:
+    """Rapport de recoupement plan ↔ coupes pour les dalles."""
+    matches: List[FloorSectionMatch]
+    floors_plan_not_crossed: List[int]
+    section_slabs_unmatched: List[Dict[str, Any]]
+    summary: Dict[str, int]
+
+
+def reconcile_plan_section_floors(
+    plan_floors: List[Dict[str, Any]],
+    section_lines: List[Dict[str, Any]],
+    section_slabs_by_coupe: Dict[str, List[Dict[str, Any]]],
+    *,
+    z_tol_m: float = 0.05,
+    thickness_tol_m: float = 0.02,
+    coverage_min_ratio: float = 0.80,
+) -> FloorsReconciliation:
+    """Croise les dalles du plan avec celles observées dans chaque coupe.
+
+    Pour chaque dalle plan, on cherche les intersections avec chaque
+    trait de coupe (segment 2D vs polygone). Pour chaque intervalle
+    `[x_cut_min, x_cut_max]` où le trait est à l'intérieur de la dalle,
+    on cherche une `SectionFloorSlab` dans cette coupe telle que
+    `top_y_m ≈ floor.elevation_m` et `[x_min_m, x_max_m]` recouvre
+    suffisamment l'intervalle. On compare alors les épaisseurs.
+
+    Args:
+        plan_floors: liste de dicts `{boundary: [[x,y]], holes: [[[x,y]]],
+            elevation_m: float, thickness_m: float, …}`. Le `level_ref`
+            n'est pas requis ici (résolu côté caller).
+        section_lines: liste de dicts `{plan_p1, plan_p2, view_dir,
+            coupe_path, name?}`. Identique au format murs.
+        section_slabs_by_coupe: `{coupe_path: [{top_y_m, bot_y_m,
+            thickness_m, x_min_m, x_max_m}, …]}`. Sérialisation de
+            `read_section_floor_slabs`.
+        z_tol_m: tolérance Z pour match niveau (défaut 5 cm — empirique,
+            les exports Revit posent le top de dalle pile à l'élévation
+            du niveau, drift < 1 mm normalement).
+        thickness_tol_m: tolérance d'épaisseur (défaut 2 cm).
+        coverage_min_ratio: fraction min de l'intervalle de coupe qui
+            doit être recouverte par la paire (défaut 0.80). Si < ratio :
+            statut `extent_partial`.
+
+    Returns:
+        `FloorsReconciliation` avec :
+        - `matches` : un `FloorSectionMatch` par intervalle de coupe.
+        - `floors_plan_not_crossed` : indices des dalles plan qui ne
+          croisent aucun trait.
+        - `section_slabs_unmatched` : paires coupe sans pendant au plan
+          (suspect — dalle oubliée ou détection plan incomplète).
+        - `summary` : compteurs agrégés par statut.
+    """
+    matches: List[FloorSectionMatch] = []
+    floors_plan_not_crossed: List[int] = []
+    matched_slabs: Dict[str, set] = {p: set() for p in section_slabs_by_coupe}
+
+    for fi, fl in enumerate(plan_floors):
+        boundary_raw = fl.get("boundary") or []
+        boundary: List[Tuple[float, float]] = [
+            (float(p[0]), float(p[1])) for p in boundary_raw
+        ]
+        holes_raw = fl.get("holes") or []
+        holes: List[List[Tuple[float, float]]] = [
+            [(float(p[0]), float(p[1])) for p in h] for h in holes_raw
+        ]
+        elevation = float(fl.get("elevation_m", 0.0))
+        thickness = float(fl.get("thickness_m", 0.0))
+
+        if len(boundary) < 3:
+            floors_plan_not_crossed.append(fi)
+            continue
+
+        crossed_any = False
+        for si, sl in enumerate(section_lines):
+            sp1 = (float(sl["plan_p1"][0]), float(sl["plan_p1"][1]))
+            sp2 = (float(sl["plan_p2"][0]), float(sl["plan_p2"][1]))
+            intervals = _floor_cut_intervals_in_section(
+                boundary, holes, sp1, sp2,
+            )
+            if not intervals:
+                continue
+            crossed_any = True
+            coupe_path = sl.get("coupe_path", "")
+            slabs = section_slabs_by_coupe.get(coupe_path, [])
+
+            # Sous-ensemble des paires au bon niveau Z.
+            slabs_at_z: List[Tuple[int, Dict[str, Any]]] = [
+                (idx, s) for idx, s in enumerate(slabs)
+                if abs(float(s["top_y_m"]) - elevation) <= z_tol_m
+            ]
+
+            for (x_min, x_max) in intervals:
+                interval_len = x_max - x_min
+                if not slabs_at_z:
+                    matches.append(FloorSectionMatch(
+                        plan_floor_index=fi,
+                        plan_level_elevation_m=round(elevation, 4),
+                        plan_thickness_m=round(thickness, 4),
+                        section_line_index=si,
+                        section_line_name=sl.get("name"),
+                        coupe_path=coupe_path,
+                        cut_interval_m=(x_min, x_max),
+                        section_slab_index=None,
+                        section_top_y_m=None,
+                        section_thickness_m=None,
+                        thickness_drift_m=None,
+                        coverage_ratio=None,
+                        status="no_section_pair_at_z",
+                    ))
+                    continue
+
+                # Best candidate : meilleur overlap X.
+                best_idx: Optional[int] = None
+                best_slab: Optional[Dict[str, Any]] = None
+                best_overlap: float = 0.0
+                for idx, s in slabs_at_z:
+                    ox = max(x_min, float(s["x_min_m"]))
+                    oX = min(x_max, float(s["x_max_m"]))
+                    overlap = oX - ox
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_idx = idx
+                        best_slab = s
+
+                if best_slab is None or best_overlap <= 0:
+                    matches.append(FloorSectionMatch(
+                        plan_floor_index=fi,
+                        plan_level_elevation_m=round(elevation, 4),
+                        plan_thickness_m=round(thickness, 4),
+                        section_line_index=si,
+                        section_line_name=sl.get("name"),
+                        coupe_path=coupe_path,
+                        cut_interval_m=(x_min, x_max),
+                        section_slab_index=None,
+                        section_top_y_m=None,
+                        section_thickness_m=None,
+                        thickness_drift_m=None,
+                        coverage_ratio=0.0,
+                        status="no_section_pair_at_x",
+                    ))
+                    continue
+
+                cov_ratio = (
+                    best_overlap / interval_len if interval_len > 0 else 1.0
+                )
+                cand_thk = float(best_slab["thickness_m"])
+                drift = abs(thickness - cand_thk)
+                matched_slabs[coupe_path].add(best_idx)  # type: ignore[arg-type]
+
+                if drift > thickness_tol_m:
+                    status = "thickness_mismatch"
+                elif cov_ratio < coverage_min_ratio:
+                    status = "extent_partial"
+                else:
+                    status = "ok"
+
+                matches.append(FloorSectionMatch(
+                    plan_floor_index=fi,
+                    plan_level_elevation_m=round(elevation, 4),
+                    plan_thickness_m=round(thickness, 4),
+                    section_line_index=si,
+                    section_line_name=sl.get("name"),
+                    coupe_path=coupe_path,
+                    cut_interval_m=(x_min, x_max),
+                    section_slab_index=best_idx,
+                    section_top_y_m=round(float(best_slab["top_y_m"]), 4),
+                    section_thickness_m=round(cand_thk, 4),
+                    thickness_drift_m=round(drift, 4),
+                    coverage_ratio=round(cov_ratio, 3),
+                    status=status,
+                ))
+
+        if not crossed_any:
+            floors_plan_not_crossed.append(fi)
+
+    # Paires coupe non-matchées : potentiellement dalles oubliées en plan.
+    section_slabs_unmatched: List[Dict[str, Any]] = []
+    for coupe_path, slabs in section_slabs_by_coupe.items():
+        matched = matched_slabs.get(coupe_path, set())
+        for idx, s in enumerate(slabs):
+            if idx in matched:
+                continue
+            section_slabs_unmatched.append({
+                "coupe_path": coupe_path,
+                "section_slab_index": idx,
+                "top_y_m": round(float(s["top_y_m"]), 4),
+                "bot_y_m": round(float(s["bot_y_m"]), 4),
+                "thickness_m": round(float(s["thickness_m"]), 4),
+                "x_min_m": round(float(s["x_min_m"]), 4),
+                "x_max_m": round(float(s["x_max_m"]), 4),
+            })
+
+    summary = {
+        "matches_ok": sum(1 for m in matches if m.status == "ok"),
+        "thickness_mismatches": sum(
+            1 for m in matches if m.status == "thickness_mismatch"
+        ),
+        "extent_partial": sum(
+            1 for m in matches if m.status == "extent_partial"
+        ),
+        "no_section_pair_at_z": sum(
+            1 for m in matches if m.status == "no_section_pair_at_z"
+        ),
+        "no_section_pair_at_x": sum(
+            1 for m in matches if m.status == "no_section_pair_at_x"
+        ),
+        "plan_floors_total": len(plan_floors),
+        "plan_floors_not_crossed": len(floors_plan_not_crossed),
+        "section_slabs_unmatched": len(section_slabs_unmatched),
+        "section_lines_count": len(section_lines),
+    }
+
+    return FloorsReconciliation(
+        matches=matches,
+        floors_plan_not_crossed=floors_plan_not_crossed,
+        section_slabs_unmatched=section_slabs_unmatched,
+        summary=summary,
+    )
+
+
 # ----- Audit d'intégrité du plan set (gate avant écriture modèle) -------
 #
 # Le user veut un audit holistique du dossier DXF AVANT toute proposition

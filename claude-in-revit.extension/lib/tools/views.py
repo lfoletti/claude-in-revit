@@ -222,9 +222,16 @@ def create_section_many(
             raise ValueError(
                 "items[{}]: view_dir must be left/right/up/down".format(i)
             )
+        x_axis_conv = item.get("x_axis_convention")  # None par défaut
+        if x_axis_conv is not None and x_axis_conv not in ("identity", "reversed"):
+            raise ValueError(
+                "items[{}]: x_axis_convention must be identity|reversed|None "
+                "(got {!r})".format(i, x_axis_conv)
+            )
         specs.append({
             "name": name.strip(),
             "p1_m": p1, "p2_m": p2, "view_dir": view_dir,
+            "x_axis_convention": x_axis_conv,
         })
 
     # KG-only : compute bounds + return placeholders.
@@ -235,15 +242,19 @@ def create_section_many(
                 spec["p1_m"], spec["p2_m"], spec["view_dir"],
                 bottom_elev_m=bottom_elev_m, top_elev_m=top_elev_m,
                 far_clip_m=far_clip_m, height_buffer_m=height_buffer_m,
+                x_axis_convention=spec["x_axis_convention"],
             )
             out.append({
                 "name": spec["name"],
                 "revit_id": None,
                 "section_length_m": round(bounds.section_length_m, 4),
                 "view_dir": spec["view_dir"],
+                "reused": False,
             })
         return {
-            "ok": True, "count": len(out), "sections": out,
+            "ok": True, "count": len(out),
+            "created_count": len(out), "reused_count": 0,
+            "sections": out,
             "note": "doc is None — geometry computed but no Revit views created.",
         }
 
@@ -264,6 +275,19 @@ def create_section_many(
             "No Section ViewFamilyType in this project."
         )
 
+    # Idempotence : si une ViewSection avec le nom cible existe déjà
+    # (typiquement d'un run précédent d'import), la réutiliser au lieu
+    # de lever `ArgumentException: Name must be unique`. Géométrie de
+    # la vue existante préservée (on ne réécrit pas la bbox) — si l'user
+    # a modifié le trait depuis le run précédent, il doit supprimer
+    # manuellement la vue pour forcer la régénération.
+    existing_by_name: Dict[str, Any] = {}
+    for v in FilteredElementCollector(doc).OfClass(ViewSection):
+        try:
+            existing_by_name[v.Name] = v
+        except Exception:  # noqa: BLE001
+            continue
+
     out: List[Dict[str, Any]] = []
     with rp.transaction(doc, "views.create_section_many"):
         for spec in specs:
@@ -271,38 +295,70 @@ def create_section_many(
                 spec["p1_m"], spec["p2_m"], spec["view_dir"],
                 bottom_elev_m=bottom_elev_m, top_elev_m=top_elev_m,
                 far_clip_m=far_clip_m, height_buffer_m=height_buffer_m,
+                x_axis_convention=spec["x_axis_convention"],
             )
-            t = Transform.Identity
-            t.Origin = XYZ(
-                rp.meters_to_internal(bounds.origin_m[0]),
-                rp.meters_to_internal(bounds.origin_m[1]),
-                rp.meters_to_internal(bounds.origin_m[2]),
-            )
-            t.BasisX = XYZ(*bounds.basis_x)
-            t.BasisY = XYZ(*bounds.basis_y)
-            t.BasisZ = XYZ(*bounds.basis_z)
-            bbox = BoundingBoxXYZ()
-            bbox.Transform = t
-            bbox.Min = XYZ(
-                rp.meters_to_internal(bounds.bbox_min_m[0]),
-                rp.meters_to_internal(bounds.bbox_min_m[1]),
-                rp.meters_to_internal(bounds.bbox_min_m[2]),
-            )
-            bbox.Max = XYZ(
-                rp.meters_to_internal(bounds.bbox_max_m[0]),
-                rp.meters_to_internal(bounds.bbox_max_m[1]),
-                rp.meters_to_internal(bounds.bbox_max_m[2]),
-            )
-            view = ViewSection.CreateSection(doc, vft.Id, bbox)
-            view.Name = spec["name"]
+            reused = spec["name"] in existing_by_name
+            if reused:
+                view = existing_by_name[spec["name"]]
+            else:
+                t = Transform.Identity
+                t.Origin = XYZ(
+                    rp.meters_to_internal(bounds.origin_m[0]),
+                    rp.meters_to_internal(bounds.origin_m[1]),
+                    rp.meters_to_internal(bounds.origin_m[2]),
+                )
+                t.BasisX = XYZ(*bounds.basis_x)
+                t.BasisY = XYZ(*bounds.basis_y)
+                t.BasisZ = XYZ(*bounds.basis_z)
+                bbox = BoundingBoxXYZ()
+                bbox.Transform = t
+                bbox.Min = XYZ(
+                    rp.meters_to_internal(bounds.bbox_min_m[0]),
+                    rp.meters_to_internal(bounds.bbox_min_m[1]),
+                    rp.meters_to_internal(bounds.bbox_min_m[2]),
+                )
+                bbox.Max = XYZ(
+                    rp.meters_to_internal(bounds.bbox_max_m[0]),
+                    rp.meters_to_internal(bounds.bbox_max_m[1]),
+                    rp.meters_to_internal(bounds.bbox_max_m[2]),
+                )
+                view = ViewSection.CreateSection(doc, vft.Id, bbox)
+                view.Name = spec["name"]
+            # Diagnostic mirror : compare basis_x INTENDED vs ce que
+            # Revit a vraiment posé (view.RightDirection). Si Revit
+            # re-dérive le basis_x (ignore notre bbox.Transform.BasisX),
+            # le flip n'a aucun effet et on doit chercher une autre voie.
+            intended_basis_x = bounds.basis_x
+            actual_right = None
+            try:
+                rd = view.RightDirection
+                actual_right = [round(rd.X, 4), round(rd.Y, 4), round(rd.Z, 4)]
+            except Exception:  # noqa: BLE001
+                pass
             out.append({
                 "name": spec["name"],
                 "revit_id": int(view.Id.Value),
                 "section_length_m": round(bounds.section_length_m, 4),
                 "view_dir": spec["view_dir"],
+                "reused": reused,
+                "intended_basis_x": [round(c, 4) for c in intended_basis_x],
+                "actual_right_direction": actual_right,
+                "basis_x_match": (
+                    actual_right is not None
+                    and abs(actual_right[0] - intended_basis_x[0]) < 0.01
+                    and abs(actual_right[1] - intended_basis_x[1]) < 0.01
+                    and abs(actual_right[2] - intended_basis_x[2]) < 0.01
+                ),
             })
 
-    return {"ok": True, "count": len(out), "sections": out}
+    reused_count = sum(1 for o in out if o["reused"])
+    return {
+        "ok": True,
+        "count": len(out),
+        "created_count": len(out) - reused_count,
+        "reused_count": reused_count,
+        "sections": out,
+    }
 
 
 @tool(name="views_open_3d", tier=1)
@@ -406,6 +462,7 @@ def _link_cad_to_view(
     placement: str,
     color_mode: str,
     restore_pinned: bool,
+    mirror_post_link: bool = False,
 ) -> Dict[str, Any]:
     """Helper interne : exécute le link + translation + re-pin pour UN
     DXF dans UNE vue. À appeler **dans une transaction Revit ouverte**.
@@ -500,11 +557,60 @@ def _link_cad_to_view(
         except Exception:  # noqa: BLE001
             final_pinned = False
 
+    # Post-link MIRROR si demandé (fix bug mirror P2 longitudinales) :
+    # Revit ignore notre bbox.Transform.BasisX dans CreateSection et
+    # re-dérive son propre BasisX (= viewer's right convention). Du
+    # coup pour une coupe dont DXF X axis ≠ viewer's right, le DXF est
+    # placé miroité dans le monde. Solution : mirror le link element
+    # après placement, sur le plan perpendiculaire à world X (pour
+    # traits horizontaux) ou world Y (pour traits verticaux).
+    mirrored = False
+    if (mirror_post_link and link_revit_id is not None
+            and isinstance(view, ViewSection)):
+        try:
+            from Autodesk.Revit.DB import Plane
+            # Détermine l'axe de mirror via view.RightDirection :
+            # |X| > 0.5 → trait horizontal → mirror plane YZ (normal X).
+            # sinon → trait vertical → mirror plane XZ (normal Y).
+            right = view.RightDirection
+            if abs(right.X) > 0.5:
+                normal = XYZ(1.0, 0.0, 0.0)
+            else:
+                normal = XYZ(0.0, 1.0, 0.0)
+            plane = Plane.CreateByNormalAndOrigin(normal, XYZ(0.0, 0.0, 0.0))
+            target_eid_for_mirror = (
+                out_id if isinstance(out_id, ElementId)
+                else ElementId(int(link_revit_id))
+            )
+            instance_for_mirror = doc.GetElement(target_eid_for_mirror)
+            # Unpin si nécessaire (sinon MirrorElements refuse).
+            was_pinned = bool(getattr(instance_for_mirror, "Pinned", False)) \
+                if instance_for_mirror else False
+            if was_pinned and instance_for_mirror is not None:
+                instance_for_mirror.Pinned = False
+            from System.Collections.Generic import List as _NetList
+            id_list = _NetList[ElementId]()
+            id_list.Add(target_eid_for_mirror)
+            # MirrorElements(doc, ids, plane, mirrorCopies=False) →
+            # mirror in place (no copies created).
+            ElementTransformUtils.MirrorElements(doc, id_list, plane, False)
+            mirrored = True
+            if was_pinned and instance_for_mirror is not None:
+                # Re-pin après mirror.
+                try:
+                    instance_for_mirror.Pinned = True
+                    final_pinned = True
+                except Exception:  # noqa: BLE001
+                    final_pinned = False
+        except Exception:  # noqa: BLE001
+            mirrored = False
+
     return {
         "file": str(path),
         "view_revit_id": view_revit_id,
         "link_revit_id": link_revit_id,
         "placement": placement,
+        "mirrored": mirrored,
         "color_mode": color_mode,
         "aligned_to_view_origin": aligned_to_view_origin,
         "pinned": final_pinned,
@@ -661,7 +767,11 @@ def link_cad_many(
             raise FileNotFoundError(
                 "links[{}]: file not found: {}".format(i, path)
             )
-        normalized.append({"path": path, "view_revit_id": int(vid)})
+        normalized.append({
+            "path": path,
+            "view_revit_id": int(vid),
+            "mirror_post_link": bool(item.get("mirror_post_link", False)),
+        })
 
     if doc is None:
         return {
@@ -686,6 +796,281 @@ def link_cad_many(
             r = _link_cad_to_view(
                 doc, spec["path"], spec["view_revit_id"],
                 placement, color_mode, restore_pinned,
+                mirror_post_link=spec["mirror_post_link"],
             )
             results.append(r)
     return {"ok": True, "count": len(results), "links": results}
+
+
+# ----- views_override_element_colors_many ------------------------------
+#
+# Surcharge la couleur d'éléments dans une vue donnée (= "peint en
+# rouge / jaune"). Use case principal : flagger visuellement les
+# éléments suspects identifiés par `dwg_validate_import_3d`.
+
+
+# Palette nommée → RGB.
+_NAMED_COLORS = {
+    "red": (255, 0, 0),
+    "yellow": (255, 200, 0),
+    "orange": (255, 128, 0),
+    "green": (0, 200, 0),
+    "blue": (0, 100, 255),
+    "magenta": (255, 0, 255),
+    "cyan": (0, 200, 255),
+}
+
+
+def _resolve_color(spec: Any) -> Tuple[int, int, int]:
+    """Normalise une spec couleur en `(r, g, b)` int [0, 255].
+    Accepte : nom (e.g. 'red'), `[r, g, b]`, `(r, g, b)`."""
+    if isinstance(spec, str):
+        key = spec.lower().strip()
+        if key not in _NAMED_COLORS:
+            raise ValueError(
+                "Unknown color name {!r}. Known: {}".format(
+                    spec, list(_NAMED_COLORS.keys()),
+                )
+            )
+        return _NAMED_COLORS[key]
+    if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        return tuple(int(max(0, min(255, c))) for c in spec)  # type: ignore[return-value]
+    raise ValueError(
+        "color must be a name str or [r, g, b], got {!r}".format(spec)
+    )
+
+
+def _find_solid_fill_pattern_id(doc: Any):
+    """Cherche le pattern 'Solid fill' (drafting target) — nécessaire
+    pour que les surfaces apparaissent VRAIMENT remplies de la couleur.
+    """
+    from Autodesk.Revit.DB import (
+        FilteredElementCollector, FillPatternElement, FillPatternTarget,
+    )
+    for fp in FilteredElementCollector(doc).OfClass(FillPatternElement):
+        try:
+            pattern = fp.GetFillPattern()
+            if pattern is None:
+                continue
+            if pattern.IsSolidFill and pattern.Target == FillPatternTarget.Drafting:
+                return fp.Id
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+@tool(name="views_override_element_colors_many", tier=1)
+def override_element_colors_many(
+    kg: ProjectKG,
+    doc: Any,
+    items: List[Dict[str, Any]],
+    view_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Surcharge la couleur d'affichage de N éléments dans une vue
+    Revit (en **une seule** transaction).
+
+    Use case principal : flagger visuellement les éléments suspects
+    après `dwg_validate_import_3d` — rouge pour les certains-fantômes,
+    jaune pour les sans-évidence-3D. L'override est par-vue : il ne
+    modifie pas la couleur intrinsèque de l'élément, juste son
+    affichage dans la vue cible.
+
+    **Réversible** via `views_clear_element_overrides` (à venir) ou
+    manuellement en Revit UI (Properties → Visibility/Graphics).
+
+    Concepts: surcharge, override, couleur, color, peinture, paint,
+              rouge, jaune, vert, jaune, flag, marquage, visuel,
+              graphics, vue
+    Phrases: "peins ces murs en rouge", "flag les suspects en jaune",
+             "override color", "color these elements"
+    Similar: dwg_flag_3d_suspects_in_view, dwg_validate_import_3d
+
+    Args:
+        items: liste de dicts `{llm_id, color}`. `color` peut être un
+            nom (`"red"`, `"yellow"`, `"orange"`, `"green"`, `"blue"`,
+            etc.) ou `[r, g, b]` (entiers 0-255). Les éléments sans
+            binding Revit (= pas créés en Revit) sont skippés.
+        view_ref: llm_id de la vue cible. Si None, utilise la vue
+            active de Revit (`uidoc.ActiveView`).
+
+    Returns:
+        ``{"ok", "view_revit_id", "applied_count", "skipped_count",
+            "skipped": [{llm_id, reason}, ...]}``
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+    if doc is None:
+        return {
+            "ok": True, "view_revit_id": None,
+            "applied_count": 0, "skipped_count": len(items),
+            "skipped": [{"llm_id": it.get("llm_id"), "reason": "doc is None"}
+                        for it in items],
+            "note": "doc is None — no Revit overrides applied.",
+        }
+
+    # Pré-validation.
+    specs: List[Dict[str, Any]] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError("items[{}] must be a dict".format(i))
+        llm_id = item.get("llm_id")
+        color = item.get("color")
+        if not isinstance(llm_id, str) or not llm_id.strip():
+            raise ValueError("items[{}]: llm_id required (str)".format(i))
+        rgb = _resolve_color(color)
+        specs.append({"llm_id": llm_id, "rgb": rgb})
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import (
+        Color, ElementId, OverrideGraphicSettings,
+    )
+
+    # Résoud la vue cible.
+    if view_ref is not None:
+        if not kg.has_node(view_ref):
+            raise ValueError("Unknown view_ref: {}".format(view_ref))
+        view_rid_raw = kg.get_revit_id(view_ref)
+        if view_rid_raw is None:
+            raise ValueError(
+                "view_ref {} has no Revit binding".format(view_ref)
+            )
+        view = doc.GetElement(ElementId(view_rid_raw))
+    else:
+        # Active view.
+        # Note : `doc.ActiveView` retourne la dernière vue active du
+        # document. Suffisant pour le pushbutton (l'user clique en
+        # ayant la 3D ouverte typiquement).
+        view = doc.ActiveView
+        if view is None:
+            raise ValueError(
+                "No active view in document — pass view_ref explicitly."
+            )
+
+    view_revit_id = int(view.Id.Value)
+
+    solid_fill_id = _find_solid_fill_pattern_id(doc)
+
+    applied: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    with rp.transaction(doc, "views.override_element_colors_many"):
+        for spec in specs:
+            llm_id = spec["llm_id"]
+            r, g, b = spec["rgb"]
+            try:
+                eid_raw = kg.get_revit_id(llm_id)
+            except Exception:  # noqa: BLE001
+                eid_raw = None
+            if eid_raw is None:
+                skipped.append({"llm_id": llm_id, "reason": "no Revit binding"})
+                continue
+            try:
+                elem = doc.GetElement(ElementId(eid_raw))
+                if elem is None:
+                    skipped.append({"llm_id": llm_id, "reason": "element not found"})
+                    continue
+                color = Color(r, g, b)
+                ogs = OverrideGraphicSettings()
+                ogs.SetProjectionLineColor(color)
+                ogs.SetSurfaceForegroundPatternColor(color)
+                if solid_fill_id is not None:
+                    ogs.SetSurfaceForegroundPatternId(solid_fill_id)
+                # Cut surface (visible dans les coupes).
+                ogs.SetCutForegroundPatternColor(color)
+                if solid_fill_id is not None:
+                    ogs.SetCutForegroundPatternId(solid_fill_id)
+                view.SetElementOverrides(ElementId(eid_raw), ogs)
+                applied.append({
+                    "llm_id": llm_id, "revit_id": eid_raw,
+                    "rgb": [r, g, b],
+                })
+            except Exception as exc:  # noqa: BLE001
+                skipped.append({
+                    "llm_id": llm_id,
+                    "reason": "{}: {}".format(type(exc).__name__, exc),
+                })
+
+    return {
+        "ok": True,
+        "view_revit_id": view_revit_id,
+        "applied_count": len(applied),
+        "skipped_count": len(skipped),
+        "applied": applied,
+        "skipped": skipped,
+    }
+
+
+@tool(name="views_clear_element_overrides", tier=1)
+def clear_element_overrides(
+    kg: ProjectKG,
+    doc: Any,
+    llm_ids: Optional[List[str]] = None,
+    view_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reset les overrides graphiques d'éléments dans une vue donnée.
+
+    Use case : après `views_override_element_colors_many`, nettoyer
+    les couleurs pour repartir d'une vue neutre.
+
+    Args:
+        llm_ids: liste d'éléments à reset. Si None, reset TOUS les
+            overrides actuellement présents dans la vue (= reset
+            global de la vue).
+        view_ref: llm_id de la vue. Si None, vue active.
+
+    Returns:
+        ``{"ok", "view_revit_id", "cleared_count"}``
+    """
+    if doc is None:
+        return {"ok": True, "view_revit_id": None, "cleared_count": 0,
+                "note": "doc is None — no-op."}
+
+    from .. import revit_primitives as rp
+    from Autodesk.Revit.DB import ElementId, OverrideGraphicSettings
+
+    if view_ref is not None:
+        if not kg.has_node(view_ref):
+            raise ValueError("Unknown view_ref: {}".format(view_ref))
+        view_rid_raw = kg.get_revit_id(view_ref)
+        if view_rid_raw is None:
+            raise ValueError(
+                "view_ref {} has no Revit binding".format(view_ref)
+            )
+        view = doc.GetElement(ElementId(view_rid_raw))
+    else:
+        view = doc.ActiveView
+        if view is None:
+            raise ValueError("No active view; pass view_ref explicitly.")
+
+    view_revit_id = int(view.Id.Value)
+    empty = OverrideGraphicSettings()  # tous les fields par défaut = aucun override
+
+    cleared = 0
+    with rp.transaction(doc, "views.clear_element_overrides"):
+        if llm_ids is None:
+            # Reset tous les éléments du KG vivant dans la vue.
+            from Autodesk.Revit.DB import FilteredElementCollector
+            for elem in FilteredElementCollector(doc, view.Id):
+                try:
+                    view.SetElementOverrides(elem.Id, empty)
+                    cleared += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        else:
+            for llm_id in llm_ids:
+                try:
+                    eid_raw = kg.get_revit_id(llm_id)
+                except Exception:  # noqa: BLE001
+                    eid_raw = None
+                if eid_raw is None:
+                    continue
+                try:
+                    view.SetElementOverrides(ElementId(eid_raw), empty)
+                    cleared += 1
+                except Exception:  # noqa: BLE001
+                    continue
+
+    return {
+        "ok": True,
+        "view_revit_id": view_revit_id,
+        "cleared_count": cleared,
+    }

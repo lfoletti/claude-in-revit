@@ -94,6 +94,20 @@ def _format_result(result) -> str:
     lines.append("  section_lines_registered : {}".format(p1.get("section_lines_registered")))
     lines.append("  linked_views_count       : {}".format(p1.get("linked_views_count")))
     lines.append("  skipped_unmatched        : {}".format(p1.get("skipped_unmatched")))
+    # Diagnostic : convention X axis appliquée + verdict Revit (P2 mirror fix).
+    sect_orient = p1.get("section_orientations") or []
+    if sect_orient:
+        lines.append("  section_orientations (basis_x check) :")
+        for so in sect_orient:
+            match = so.get("basis_x_match")
+            marker = "✓" if match else ("✗" if match is False else "?")
+            lines.append("    {} {}  view_dir={}  conv={}  intended={}  actual={}".format(
+                marker,
+                so.get("name") or so.get("coupe_path", "?")[-20:],
+                so.get("view_dir"), so.get("x_axis_convention"),
+                so.get("intended_basis_x"),
+                so.get("actual_right_direction"),
+            ))
     p2a = result.get("phase2a_walls", {})
     lines.append("")
     lines.append("Phase 2a walls :")
@@ -122,6 +136,20 @@ def _format_result(result) -> str:
         lines.append("  trous détectés       : {}".format(
             ", ".join("{}={}".format(k, v) for k, v in sorted(holes.items()))
         ))
+    p2d = result.get("phase2d_columns", {})
+    lines.append("")
+    lines.append("Phase 2d columns :")
+    lines.append("  columns_created_count : {}".format(p2d.get("columns_created_count")))
+    lines.append("  candidates_total      : {}".format(p2d.get("candidates_total")))
+    lines.append("  aggregated_count      : {}".format(p2d.get("aggregated_count")))
+    lines.append("  types_created/reused  : {} / {}".format(
+        p2d.get("types_created"), p2d.get("types_reused"),
+    ))
+    cpl = p2d.get("columns_per_level") or {}
+    if cpl:
+        lines.append("  per_level             : {}".format(cpl))
+    if p2d.get("skipped_reason"):
+        lines.append("  ⚠ skipped_reason      : {}".format(p2d.get("skipped_reason")))
     lines.append("")
     lines.append("view_3d_opened : {}".format(result.get("view_3d_opened")))
     lines.append("")
