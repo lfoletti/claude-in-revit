@@ -4871,3 +4871,832 @@ def kg_reset_dxf_imports(
         "deleted_at_turn": kg.turn,
         **inventory,
     }
+
+
+# =====================================================================
+# Meta-tools : `dwg_import_project_audit` / `dwg_import_project_execute`
+# =====================================================================
+#
+# Pipeline complet « import projet DXF → BIM Revit » en 2 stages, pour
+# que le LLM ne paie pas la latence + tokens d'un orchestrating ~14 tools
+# step-by-step. Le human-in-the-loop reste préservé entre audit et execute
+# (dialogs ui_confirm_* pour warnings + reconciliation niveaux).
+#
+# Structure interne : un helper privé `_meta_phase*_*(...)` par étape,
+# chacun avec un contrat I/O typé. Ajouter une micro-step = ajouter un
+# helper + 1 ligne dans `import_project_execute`. Pas de framework, juste
+# du Python sequentiel lisible.
+
+
+def _meta_classify_files(directory_path: Path) -> Dict[str, List[Path]]:
+    """Triage les .dxf du dossier par kind via dwg_section_reader.classify_dxf.
+
+    Retourne {"plans": [Path], "coupes": [Path], "elevations": [Path]}.
+    Ignore les fichiers `unknown`. Tolérant : si un parse échoue, le fichier
+    est skippé silencieusement (visible dans inspect_sections par ailleurs).
+    """
+    out: Dict[str, List[Path]] = {"plans": [], "coupes": [], "elevations": []}
+    for p in sorted(directory_path.glob("*.dxf")):
+        try:
+            _ents, meta = dwg_reader.parse(p)
+            kind, _ev = dwg_section_reader.classify_dxf(meta["layers"], file_name=p.name)
+        except Exception:  # noqa: BLE001
+            continue
+        if kind == "plan":
+            out["plans"].append(p)
+        elif kind == "section":
+            out["coupes"].append(p)
+        elif kind == "elevation":
+            out["elevations"].append(p)
+    return out
+
+
+def _meta_build_level_actions_proposed(reconcile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convertit le payload `levels_reconcile_with_dxf` en liste d'actions
+    structurées que l'execute peut consommer.
+
+    Sortie : liste de `{action, name, elevation_m, [existing_llm_id]}` avec
+    action ∈ {create, update, skip}. L'execute applique uniquement les
+    `create` (V0) ; `update` est un placeholder pour V1 (élévation
+    différente, nécessite levels_set_elevation). `skip` est informatif.
+    """
+    actions: List[Dict[str, Any]] = []
+    for lvl in reconcile.get("missing_in_project") or []:
+        actions.append({
+            "action": "create",
+            "name": lvl["name"],
+            "elevation_m": float(lvl["elevation_m"]),
+        })
+    for nm in reconcile.get("name_only_matches") or []:
+        actions.append({
+            "action": "update",
+            "name": nm["name"],
+            "elevation_m": float(nm["coupe_elevation_m"]),
+            "existing_llm_id": nm.get("llm_id"),
+            "note": "different elevation in project (Δ={:.3f}m)".format(nm.get("delta_m", 0.0)),
+        })
+    for mt in reconcile.get("matches") or []:
+        actions.append({
+            "action": "skip",
+            "name": mt["name"],
+            "elevation_m": float(mt["elevation_m"]),
+            "existing_llm_id": mt.get("llm_id"),
+            "note": "already aligned",
+        })
+    return actions
+
+
+def _meta_run_phase1_audit(
+    kg: ProjectKG,
+    directory: str,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Pipeline Phase 1 read-only : check + inspect + markers + assign + reconcile.
+
+    Helper interne réutilisé par `import_project_audit` (pour la première
+    exécution exposée au LLM) ET par `import_project_execute` (qui re-run
+    Phase 1 cheap après confirmation utilisateur, pour ne pas avoir à
+    persister l'état entre les deux calls).
+
+    Pure read-only — ne mute ni le KG, ni Revit, ni le filesystem.
+    """
+    dir_path = Path(directory)
+    if not dir_path.is_dir():
+        raise FileNotFoundError("Directory not found: {}".format(dir_path))
+
+    # 1. Integrity check (gate).
+    integrity = check_planset_integrity(
+        kg=kg, directory=str(dir_path), scale_override=scale_override,
+    )
+    gate_status = integrity.get("gate_status")
+    if gate_status == "abort":
+        return {
+            "gate_status": "abort",
+            "severity": integrity.get("severity"),
+            "integrity_audit": integrity,
+            "next_step": "Resolve errors before retrying (cf. integrity_audit.errors).",
+        }
+
+    # 2. Classify files (plans / coupes / elevations) via inspect_sections.
+    inspection = inspect_sections(
+        kg=kg, directory=str(dir_path), scale_override=scale_override,
+    )
+    classified = _meta_classify_files(dir_path)
+    plans = classified["plans"]
+    coupes = classified["coupes"]
+    elevations = classified["elevations"]
+
+    if not plans:
+        raise ValueError(
+            "No plan DXF detected in {}. Need at least one plan for section "
+            "marker detection.".format(dir_path.name)
+        )
+    if not coupes:
+        raise ValueError(
+            "No section DXF detected in {}. Phase 2c (floors) needs coupes "
+            "for thickness extraction.".format(dir_path.name)
+        )
+
+    # 3. Section markers — try plans until one has section traits.
+    markers_payload: Dict[str, Any] = {"markers": [], "section_count": 0}
+    plan_for_markers: Optional[Path] = None
+    for p in plans:
+        try:
+            payload = find_section_markers(kg=kg, file_path=str(p))
+        except Exception:  # noqa: BLE001
+            continue
+        section_markers = [m for m in (payload.get("markers") or []) if m.get("kind") == "section"]
+        if section_markers:
+            markers_payload = payload
+            plan_for_markers = p
+            break
+    section_markers = [m for m in (markers_payload.get("markers") or []) if m.get("kind") == "section"]
+
+    # 4. Pair coupes with markers (best-fit by drift).
+    assignment: List[Dict[str, Any]] = []
+    if section_markers and len(coupes) == len(section_markers):
+        assign_result = assign_coupes_to_traits(
+            kg=kg, coupe_paths=[str(c) for c in coupes],
+            section_markers=section_markers,
+        )
+        for entry in assign_result.get("assignment") or []:
+            mk = section_markers[entry["marker_index"]]
+            view_dir = (
+                mk.get("inferred_view_dir")
+                or (mk.get("view_dir_candidates") or ["up"])[0]
+            )
+            assignment.append({
+                "coupe_path": entry["coupe_path"],
+                "coupe_name": entry.get("coupe_name"),
+                "marker_index": entry["marker_index"],
+                "plan_p1": mk["p1_m"],
+                "plan_p2": mk["p2_m"],
+                "view_dir": view_dir,
+                "drift_m": entry.get("drift_m"),
+                "drift_pct": entry.get("drift_pct"),
+            })
+
+    # 5. Level reconciliation (uses first coupe — they declare same levels).
+    coupe_levels_reconcile: Dict[str, Any] = {}
+    if coupes:
+        from .levels import reconcile_with_dxf as _reconcile_levels
+        try:
+            coupe_levels_reconcile = _reconcile_levels(kg=kg, coupe_path=str(coupes[0]))
+        except Exception as exc:  # noqa: BLE001 — let user see what failed
+            coupe_levels_reconcile = {
+                "ok": False, "error": "{}".format(exc),
+                "alignment_complete": False,
+            }
+    level_actions_proposed = _meta_build_level_actions_proposed(coupe_levels_reconcile)
+
+    # 6. Build the consolidated next_step hint.
+    needs_warnings_confirm = gate_status == "needs_user"
+    needs_levels_confirm = not coupe_levels_reconcile.get("alignment_complete", False)
+    confirm_steps: List[str] = []
+    if needs_warnings_confirm:
+        confirm_steps.append("ui_confirm_yes_no(integrity warnings)")
+    if needs_levels_confirm:
+        confirm_steps.append("ui_confirm_choices(level_actions_proposed)")
+    if confirm_steps:
+        next_step = (
+            "Surface to user via {}, then call dwg_import_project_execute() "
+            "with level_actions= the confirmed subset and proceed_on_warnings=True."
+        ).format(" + ".join(confirm_steps))
+    else:
+        next_step = (
+            "No user confirmation needed — call dwg_import_project_execute() "
+            "directly with level_actions=None (auto-apply)."
+        )
+
+    return {
+        "gate_status": gate_status,
+        "severity": integrity.get("severity"),
+        "integrity_audit": integrity,
+        "files": {
+            "plans": [str(p) for p in plans],
+            "coupes": [str(c) for c in coupes],
+            "elevations": [str(e) for e in elevations],
+            "plan_with_markers": str(plan_for_markers) if plan_for_markers else None,
+        },
+        "inspection_summary": {
+            "files_count": len(inspection.get("files", [])),
+            "section_to_plan_matches": inspection.get("section_to_plan_matches"),
+        },
+        "section_assignment": assignment,
+        "level_reconciliation": {
+            "alignment_complete": coupe_levels_reconcile.get("alignment_complete", False),
+            "summary_for_dialog": coupe_levels_reconcile.get("summary_for_dialog"),
+            "missing_count": len(coupe_levels_reconcile.get("missing_in_project") or []),
+            "matches_count": len(coupe_levels_reconcile.get("matches") or []),
+            "elev_only_matches_count": len(coupe_levels_reconcile.get("elev_only_matches") or []),
+        },
+        "level_actions_proposed": level_actions_proposed,
+        "needs_warnings_confirm": needs_warnings_confirm,
+        "needs_levels_confirm": needs_levels_confirm,
+        "next_step": next_step,
+    }
+
+
+@tool(name="dwg_import_project_audit", tier=3)
+def import_project_audit(
+    kg: ProjectKG,
+    directory: str,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Meta-tool Phase 1 — audit read-only complet d'un dossier DXF projet.
+
+    Enchaîne `check_planset_integrity` + `inspect_sections` +
+    `find_section_markers` + `dxf_assign_coupes_to_traits` +
+    `levels_reconcile_with_dxf` en **un seul** appel tool. Retourne un
+    plan consolidé que le LLM surface à l'utilisateur via `ui_confirm_*`
+    avant de lancer `dwg_import_project_execute`.
+
+    **Pure read-only** — ne mute ni le KG, ni Revit, ni le filesystem.
+    Idempotent : peut être re-appelé sans effet de bord.
+
+    Pattern attendu côté LLM :
+    1. `dwg_import_project_audit(directory)` → plan
+    2. Si `gate_status == "abort"` → STOP, présenter `integrity_audit.errors`
+    3. Si `needs_warnings_confirm` → `ui_confirm_yes_no(...)` (warnings)
+    4. Si `needs_levels_confirm` → `ui_confirm_choices(level_actions_proposed)`
+    5. `dwg_import_project_execute(directory, level_actions=..., proceed_on_warnings=True)`
+
+    Concepts: dxf, dwg, import, projet, audit, plan, niveau, coupe,
+              élévation, méta, pipeline, phase 1
+    Phrases: "audite ce projet DXF", "prépare l'import projet",
+             "plan d'import", "qu'est-ce qu'il y a dans ce dossier"
+    Similar: dwg_import_project_execute, check_planset_integrity,
+             dwg_inspect_sections, levels_reconcile_with_dxf
+
+    Args:
+        directory: chemin du dossier contenant les DXFs du projet
+            (plan + coupes + élévations). Doit exister.
+        scale_override: forçage scale (m/unit) si `$INSUNITS` absent
+            dans les DXFs. Appliqué à tous les fichiers.
+
+    Returns:
+        {"ok": bool,
+         "gate_status": "pass" | "needs_user" | "abort",
+         "severity": "clean" | "warnings" | "errors",
+         "integrity_audit": {...},
+         "files": {"plans", "coupes", "elevations", "plan_with_markers"},
+         "section_assignment": [{coupe_path, plan_p1, plan_p2, view_dir, ...}],
+         "level_reconciliation": {alignment_complete, summary_for_dialog,
+                                   missing_count, matches_count, ...},
+         "level_actions_proposed": [{action, name, elevation_m, ...}],
+         "needs_warnings_confirm": bool,
+         "needs_levels_confirm": bool,
+         "next_step": str}
+        `gate_status == "abort"` → seul `integrity_audit` est rempli, le
+        reste est omis (early-return).
+    """
+    audit = _meta_run_phase1_audit(kg, directory, scale_override=scale_override)
+    return {"ok": True, **audit}
+
+
+# ----- import_project_execute helpers -----------------------------------
+
+
+def _meta_apply_level_actions(
+    kg: ProjectKG,
+    doc: Any,
+    level_actions: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Apply confirmed level_actions. V0 supports only `action="create"` ;
+    `update` / `skip` are no-ops (informative). Idempotent — if a level with
+    the same name already exists in the KG, the create is skipped silently
+    via the levels_create_many internal name_collision check.
+    """
+    creates = [a for a in level_actions if a.get("action") == "create"]
+    if not creates:
+        return {"levels_created": 0, "levels_create_skipped_existing": 0}
+
+    # Avoid duplicates if the user re-runs execute on the same project.
+    existing_names = set()
+    for lid in kg.find_by_type("Level"):
+        attrs = kg.get_node(lid)
+        if attrs.get("deleted_at_turn") is None:
+            existing_names.add(attrs.get("name"))
+    fresh_items: List[Dict[str, Any]] = []
+    skipped_existing = 0
+    for a in creates:
+        if a["name"] in existing_names:
+            skipped_existing += 1
+            continue
+        fresh_items.append({"name": a["name"], "elevation_m": float(a["elevation_m"])})
+
+    if not fresh_items:
+        return {"levels_created": 0, "levels_create_skipped_existing": skipped_existing}
+
+    from .levels import create_many as _levels_create_many
+    result = _levels_create_many(kg=kg, doc=doc, items=fresh_items)
+    return {
+        "levels_created": result.get("count", 0),
+        "levels_create_skipped_existing": skipped_existing,
+    }
+
+
+def _meta_register_dxf_context(
+    kg: ProjectKG,
+    directory: str,
+    inspection: Dict[str, Any],
+    section_assignment: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Persiste inspection + section lines dans le DxfImportContext KG.
+    Pure-Python (pas de Revit ici). Idempotent : register_inspection met à
+    jour le node existant si déjà créé."""
+    from .dxf_context import register_inspection as _reg_insp
+    from .dxf_context import register_section_line_many as _reg_lines
+
+    _reg_insp(kg=kg, directory=directory, inspection=inspection)
+
+    section_lines_count = 0
+    if section_assignment:
+        specs = []
+        for entry in section_assignment:
+            specs.append({
+                "coupe_path": entry["coupe_path"],
+                "plan_p1": entry["plan_p1"],
+                "plan_p2": entry["plan_p2"],
+                "view_dir": entry["view_dir"],
+                "name": Path(entry["coupe_path"]).stem,
+                "confirmed_by_user": True,
+                "scale_verified": True,
+                "drift_pct": entry.get("drift_pct", 0.0),
+            })
+        _reg_lines(kg=kg, section_lines=specs)
+        section_lines_count = len(specs)
+    return {"section_lines_registered": section_lines_count}
+
+
+def _meta_create_section_views(
+    kg: ProjectKG,
+    doc: Any,
+    section_assignment: List[Dict[str, Any]],
+    top_elev_m: float = 6.0,
+) -> List[Dict[str, Any]]:
+    """Crée les vues Section Revit pour chaque coupe assignée.
+    Retourne la liste des sections créées avec leur revit_id, indexée par
+    coupe_path pour le link_cad subséquent. doc=None → no-op (test path)."""
+    if doc is None or not section_assignment:
+        return []
+    from .views import create_section_many as _create_sections
+    items = []
+    for entry in section_assignment:
+        items.append({
+            "name": "Coupe " + Path(entry["coupe_path"]).stem.split(" - ")[-1],
+            "p1_m": entry["plan_p1"],
+            "p2_m": entry["plan_p2"],
+            "view_dir": entry["view_dir"],
+        })
+    result = _create_sections(
+        kg=kg, doc=doc, items=items, top_elev_m=top_elev_m,
+    )
+    # Re-zip with coupe_path for downstream link_cad mapping.
+    out: List[Dict[str, Any]] = []
+    for entry, section in zip(section_assignment, result.get("sections", [])):
+        out.append({
+            "coupe_path": entry["coupe_path"],
+            "section_name": section.get("name"),
+            "section_revit_id": section.get("revit_id"),
+        })
+    return out
+
+
+def _meta_simulate_linked_views_offline(
+    kg: ProjectKG,
+    plans: List[str],
+    coupes_with_sections: List[Dict[str, Any]],
+    elevations: List[str],
+) -> int:
+    """Mode test : pas de Revit, on injecte des linked_views synthétiques
+    dans le DxfImportContext pour que les collectors aval
+    (`_collect_plan_openings_world`, fusion élévation, etc.) trouvent les
+    plans/coupes/élévations attendus.
+
+    Les revit_ids synthétiques (1_000_000+) n'ont aucun sens hors-test ;
+    seuls `file_path` / `view_kind` / `view_name` sont consommés en aval
+    (cf. `_plan_path_to_level_elev`, `_load_elevations_from_kg`).
+    """
+    from .dxf_context import register_linked_view_many as _reg_linked
+    entries: List[Dict[str, Any]] = []
+    rid = 1_000_000
+    for plan_path in plans:
+        stem = Path(plan_path).stem
+        view_name = stem.split(" - ")[-1] if " - " in stem else stem
+        entries.append({
+            "file_path": plan_path, "link_revit_id": rid,
+            "view_revit_id": rid + 1, "view_kind": "plan",
+            "view_name": view_name,
+        })
+        rid += 2
+    for c in coupes_with_sections:
+        stem = Path(c["coupe_path"]).stem
+        view_name = stem.split(" - ")[-1] if " - " in stem else stem
+        entries.append({
+            "file_path": c["coupe_path"], "link_revit_id": rid,
+            "view_revit_id": rid + 1, "view_kind": "section",
+            "view_name": view_name,
+        })
+        rid += 2
+    for e in elevations:
+        stem = Path(e).stem
+        view_name = stem.split(" - ")[-1] if " - " in stem else stem
+        entries.append({
+            "file_path": e, "link_revit_id": rid,
+            "view_revit_id": rid + 1, "view_kind": "elevation",
+            "view_name": view_name,
+        })
+        rid += 2
+    if entries:
+        _reg_linked(kg=kg, entries=entries)
+    return len(entries)
+
+
+def _meta_link_cad_for_all_dxfs(
+    kg: ProjectKG,
+    doc: Any,
+    plans: List[str],
+    coupes_with_sections: List[Dict[str, Any]],
+    elevations: List[str],
+) -> Dict[str, Any]:
+    """Linke tous les DXFs dans leurs vues respectives + enregistre le
+    mapping dans le KG.
+
+    Linking targets :
+    - chaque plan DXF → la FloorPlan view du Level matchant (par nom)
+    - chaque coupe DXF → la SectionView fraîchement créée
+    - chaque élévation DXF → la vue Élévation Revit matchant la direction
+      (par nom de fichier : « Élévation Est » → vue « Est », etc.)
+
+    doc=None → mode test : on enregistre des linked_views synthétiques
+    pour que les collectors aval voient les fichiers (sinon la fusion
+    élévation ne tourne pas → résultats divergent du runtime Revit).
+    """
+    if doc is None:
+        n = _meta_simulate_linked_views_offline(
+            kg, plans, coupes_with_sections, elevations,
+        )
+        return {"linked_views_count": n, "skipped_unmatched": 0, "offline_simulated": True}
+
+    from .catalog import list_levels as _list_levels
+    from .catalog import list_elevation_views as _list_elev_views
+    from .views import link_cad_many as _link_cad_many
+    from .dxf_context import register_linked_view_many as _reg_linked
+
+    links: List[Dict[str, Any]] = []
+    linked_view_specs: List[Dict[str, Any]] = []
+    skipped = 0
+
+    # Plans → FloorPlan views.
+    levels_payload = _list_levels(kg=kg, doc=doc)
+    floor_plan_by_level_name: Dict[str, int] = {}
+    for lvl in levels_payload.get("levels", []):
+        fpv = lvl.get("floor_plan_view_revit_id")
+        if fpv is not None:
+            floor_plan_by_level_name[lvl.get("name")] = int(fpv)
+    for plan_path in plans:
+        # Convention : « Projet8-Plan d'étage - Niveau 0.dxf » → « Niveau 0 ».
+        stem = Path(plan_path).stem
+        suffix = stem.split(" - ")[-1] if " - " in stem else stem
+        view_revit_id = floor_plan_by_level_name.get(suffix)
+        if view_revit_id is None:
+            skipped += 1
+            continue
+        links.append({"file_path": plan_path, "view_revit_id": view_revit_id})
+        linked_view_specs.append({
+            "file_path": plan_path,
+            "view_revit_id": view_revit_id,
+            # link_revit_id is filled after link_cad_many returns.
+            "view_kind": "plan",
+            "view_name": suffix,
+        })
+
+    # Coupes → SectionViews (just created).
+    for coupe in coupes_with_sections:
+        view_revit_id = coupe.get("section_revit_id")
+        if view_revit_id is None:
+            skipped += 1
+            continue
+        links.append({"file_path": coupe["coupe_path"], "view_revit_id": int(view_revit_id)})
+        linked_view_specs.append({
+            "file_path": coupe["coupe_path"],
+            "view_revit_id": int(view_revit_id),
+            "view_kind": "section",
+            "view_name": coupe.get("section_name"),
+        })
+
+    # Elevations → Revit elevation views (by direction match).
+    elev_views_payload = _list_elev_views(kg=kg, doc=doc)
+    view_by_direction: Dict[str, int] = {}
+    for v in elev_views_payload.get("elevation_views", []):
+        d = v.get("direction")
+        if d:
+            view_by_direction[d] = int(v.get("revit_id"))
+    for elev_path in elevations:
+        stem = Path(elev_path).stem
+        suffix = stem.split(" - ")[-1] if " - " in stem else stem
+        # Direction = last token of suffix : « Élévation Est » → « Est ».
+        direction_word = suffix.split()[-1].strip()
+        # Normalize French → match dictionary keys.
+        direction = None
+        for cardinal in ("Est", "Ouest", "Nord", "Sud"):
+            if cardinal.lower() == direction_word.lower():
+                direction = cardinal
+                break
+        if direction is None or direction not in view_by_direction:
+            skipped += 1
+            continue
+        view_revit_id = view_by_direction[direction]
+        links.append({"file_path": elev_path, "view_revit_id": view_revit_id})
+        linked_view_specs.append({
+            "file_path": elev_path,
+            "view_revit_id": view_revit_id,
+            "view_kind": "elevation",
+            "view_name": "Élévation " + direction,
+        })
+
+    if not links:
+        return {"linked_views_count": 0, "skipped_unmatched": skipped}
+
+    link_result = _link_cad_many(kg=kg, doc=doc, links=links)
+
+    # Enrich linked_view_specs with link_revit_id from result, then register
+    # the mapping in the DxfImportContext KG.
+    link_by_file = {l["file"]: l for l in link_result.get("links", [])}
+    for spec in linked_view_specs:
+        live = link_by_file.get(spec["file_path"])
+        if live is not None:
+            spec["link_revit_id"] = int(live.get("link_revit_id") or 0)
+    # Strip any spec missing link_revit_id (failed link) — register only success.
+    valid_specs = [s for s in linked_view_specs if s.get("link_revit_id")]
+    if valid_specs:
+        _reg_linked(kg=kg, entries=valid_specs)
+
+    return {
+        "linked_views_count": len(valid_specs),
+        "skipped_unmatched": skipped,
+    }
+
+
+def _meta_phase2a_walls(
+    kg: ProjectKG,
+    doc: Any,
+    audit: Dict[str, Any],
+    height_per_level_m: float,
+) -> Dict[str, Any]:
+    """Phase 2a — extract_thicknesses (info) + create_continuous_walls_many."""
+    plans = audit.get("files", {}).get("plans") or []
+    if not plans:
+        return {"walls_imported_total": 0, "note": "no plans to import"}
+
+    # Find level_ref per plan via name match (same convention as link_cad).
+    plan_items: List[Dict[str, Any]] = []
+    plan_view_names = {}
+    for plan_path in plans:
+        stem = Path(plan_path).stem
+        suffix = stem.split(" - ")[-1] if " - " in stem else stem
+        plan_view_names[plan_path] = suffix
+
+    level_by_name: Dict[str, str] = {}
+    levels_sorted: List[Tuple[float, str]] = []
+    for lid in kg.find_by_type("Level"):
+        attrs = kg.get_node(lid)
+        if attrs.get("deleted_at_turn") is not None:
+            continue
+        level_by_name[attrs.get("name")] = lid
+        levels_sorted.append((float(attrs.get("elevation", 0.0)), lid))
+    levels_sorted.sort()
+
+    if not levels_sorted:
+        return {"walls_imported_total": 0, "note": "no levels in KG — cannot import walls"}
+
+    for plan_path in plans:
+        level_ref = level_by_name.get(plan_view_names[plan_path])
+        if level_ref is None:
+            # Fallback : bottom-most level.
+            level_ref = levels_sorted[0][1]
+        plan_items.append({
+            "file_path": plan_path,
+            "level_ref": level_ref,
+            "height_m": height_per_level_m,
+        })
+
+    # Info pass : thickness distribution (logged in summary but not gating).
+    thickness_info = extract_wall_thicknesses_many(
+        kg=kg, file_paths=plans,
+    )
+
+    walls_result = create_continuous_walls_many(
+        kg=kg, doc=doc, items=plan_items,
+    )
+    return {
+        "walls_imported_total": walls_result.get("walls_imported_total", 0),
+        "walls_per_file": walls_result.get("walls_per_file"),
+        "fusion_events": walls_result.get("fusion_events"),
+        "walls_suspect_low_3d_consensus": walls_result.get("walls_suspect_low_3d_consensus"),
+        "types_created": walls_result.get("types_created"),
+        "types_reused": walls_result.get("types_reused"),
+        "elevations_loaded": walls_result.get("elevations_loaded"),
+        "thickness_distribution_global": thickness_info.get("global_distribution"),
+    }
+
+
+def _meta_phase2b_openings(kg: ProjectKG, doc: Any) -> Dict[str, Any]:
+    result = add_openings_to_walls_many(kg=kg, doc=doc)
+    return {
+        "plan_openings_detected": result.get("plan_openings_detected"),
+        "openings_doors_created": result.get("openings_doors_created"),
+        "openings_windows_created": result.get("openings_windows_created"),
+        "openings_orphan": result.get("openings_orphan"),
+        "openings_oversize_for_wall": result.get("openings_oversize_for_wall"),
+        "opening_types_created": result.get("opening_types_created"),
+    }
+
+
+def _meta_phase2c_floors(
+    kg: ProjectKG,
+    doc: Any,
+    skip_top_floor: bool,
+) -> Dict[str, Any]:
+    result = create_floors_many(kg=kg, doc=doc, skip_top_level=skip_top_floor)
+    return {
+        "floors_created_count": result.get("floors_created_count"),
+        "floors_per_level": result.get("floors_per_level"),
+        "types_created": result.get("types_created"),
+        "types_reused": result.get("types_reused"),
+    }
+
+
+def _meta_open_3d_view(kg: ProjectKG, doc: Any) -> bool:
+    if doc is None:
+        return False
+    try:
+        from .views import open_3d as _open_3d
+        _open_3d(kg=kg, doc=doc)
+        return True
+    except Exception:  # noqa: BLE001 — non-fatal UX-only step.
+        return False
+
+
+@tool(name="dwg_import_project_execute", tier=3)
+def import_project_execute(
+    kg: ProjectKG,
+    doc: Any,
+    directory: str,
+    level_actions: Optional[List[Dict[str, Any]]] = None,
+    proceed_on_warnings: bool = False,
+    height_per_level_m: float = 3.0,
+    skip_top_floor: bool = True,
+    open_3d_view: bool = True,
+    scale_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Meta-tool Phase 1.5 + Phase 2 — exécute l'import BIM complet.
+
+    Suit `dwg_import_project_audit`. Re-run Phase 1 read-only (deterministe,
+    bon marché) en interne pour éviter de passer l'état Phase 1 par le LLM,
+    puis applique `level_actions` confirmés, registre le DxfImportContext,
+    crée les vues Section, linke tous les DXFs (plans/coupes/élévations),
+    crée murs/openings/sols, et optionnellement ouvre la vue 3D.
+
+    Pipeline interne (un helper privé `_meta_phase*_*` par étape — ajouter
+    une micro-step = ajouter un helper + 1 ligne ci-dessous) :
+
+    1. Re-run Phase 1 audit (gate check : abort sur errors, refuse sur
+       warnings si `proceed_on_warnings=False`).
+    2. `_meta_apply_level_actions` : levels_create_many des actions confirmées.
+    3. `_meta_register_dxf_context` : register_inspection +
+       register_section_line_many.
+    4. `_meta_create_section_views` : views_create_section_many.
+    5. `_meta_link_cad_for_all_dxfs` : link tous les DXFs +
+       register_linked_view_many.
+    6. `_meta_phase2a_walls` : extract_wall_thicknesses_many +
+       dwg_create_continuous_walls_many.
+    7. `_meta_phase2b_openings` : dwg_add_openings_to_walls_many.
+    8. `_meta_phase2c_floors` : dwg_create_floors_many (skip top level).
+    9. `_meta_open_3d_view` (optionnel).
+
+    Token saving : ~13 sequential LLM calls → ~1 meta call. Estimé ~70%
+    de réduction sur ce use case (cf. JOURNAL session w + benchmark).
+
+    Concepts: dxf, dwg, import, projet, execute, BIM, méta, pipeline,
+              phase 1, phase 2, walls, openings, floors, batch
+    Phrases: "importe le projet", "lance l'import complet",
+             "exécute le pipeline d'import", "crée les murs/openings/sols depuis DXF"
+    Similar: dwg_import_project_audit, dwg_create_continuous_walls_many,
+             dwg_add_openings_to_walls_many, dwg_create_floors_many
+
+    Args:
+        directory: dossier des DXFs (idem que pour _audit).
+        level_actions: liste retournée par _audit puis filtrée par
+            confirmation user. Si None, auto-derive de la reconciliation
+            interne (crée tous les niveaux missing). Si [], no-op (user
+            a explicitement refusé toute action niveau).
+        proceed_on_warnings: si False (défaut), refuse l'exécution quand
+            le gate est `needs_user` (warnings non confirmés). Si True,
+            outrepasse (user a déjà confirmé via ui_confirm_yes_no).
+        height_per_level_m: hauteur par défaut des murs (défaut 3.0m).
+        skip_top_floor: skip la création de sol au niveau le plus haut
+            (= toiture, défaut True).
+        open_3d_view: ouvre {3D} à la fin pour validation visuelle.
+        scale_override: idem que pour _audit.
+
+    Returns:
+        Summary consolidé :
+        {"ok", "phase1_setup": {levels_created, sections_created,
+          linked_views, section_lines_registered},
+         "phase2a": {...}, "phase2b": {...}, "phase2c": {...},
+         "view_3d_opened": bool,
+         "note": str}
+    """
+    # 1. Re-run Phase 1 audit (deterministic, cheap).
+    audit = _meta_run_phase1_audit(kg, directory, scale_override=scale_override)
+    if audit.get("gate_status") == "abort":
+        return {
+            "ok": False,
+            "reason": "integrity_audit aborted — errors in DXF planset",
+            "integrity_audit": audit.get("integrity_audit"),
+        }
+    if audit.get("gate_status") == "needs_user" and not proceed_on_warnings:
+        return {
+            "ok": False,
+            "reason": (
+                "integrity_audit has warnings — user must confirm via "
+                "ui_confirm_yes_no, then re-call with proceed_on_warnings=True."
+            ),
+            "integrity_audit": audit.get("integrity_audit"),
+        }
+
+    # 2. Apply level actions (default : auto-derive from audit's missing).
+    if level_actions is None:
+        level_actions = audit.get("level_actions_proposed") or []
+    levels_summary = _meta_apply_level_actions(kg, doc, level_actions)
+
+    # 3. Register DxfImportContext (inspection + section_lines).
+    inspection_for_register = inspect_sections(
+        kg=kg, directory=directory, scale_override=scale_override,
+    )
+    ctx_summary = _meta_register_dxf_context(
+        kg, directory,
+        inspection=inspection_for_register,
+        section_assignment=audit.get("section_assignment") or [],
+    )
+
+    # 4. Create section views in Revit.
+    coupes_with_sections = _meta_create_section_views(
+        kg, doc, audit.get("section_assignment") or [],
+        top_elev_m=height_per_level_m * 2,
+    )
+
+    # 5. Link all DXFs in their respective views + register the mapping.
+    # Offline (doc=None) : `coupes_with_sections` est vide ; le simulateur
+    # offline doit voir les coupes brutes pour les enregistrer comme
+    # linked_views synthétiques. On les construit depuis section_assignment.
+    if doc is None and not coupes_with_sections:
+        coupes_with_sections = [
+            {"coupe_path": entry["coupe_path"], "section_name": None,
+             "section_revit_id": None}
+            for entry in audit.get("section_assignment") or []
+        ]
+    link_summary = _meta_link_cad_for_all_dxfs(
+        kg, doc,
+        plans=audit.get("files", {}).get("plans") or [],
+        coupes_with_sections=coupes_with_sections,
+        elevations=audit.get("files", {}).get("elevations") or [],
+    )
+
+    # 6-8. Phase 2.
+    phase2a = _meta_phase2a_walls(kg, doc, audit, height_per_level_m)
+    phase2b = _meta_phase2b_openings(kg, doc)
+    phase2c = _meta_phase2c_floors(kg, doc, skip_top_floor)
+
+    # 9. Open 3D view (optional).
+    view_3d_opened = _meta_open_3d_view(kg, doc) if open_3d_view else False
+
+    note = (
+        "Import OK — {} murs / {} fenêtres / {} portes / {} sols créés sur "
+        "{} niveau(x). {}".format(
+            phase2a.get("walls_imported_total", 0),
+            phase2b.get("openings_windows_created", 0),
+            phase2b.get("openings_doors_created", 0),
+            phase2c.get("floors_created_count", 0),
+            levels_summary.get("levels_created", 0)
+            + levels_summary.get("levels_create_skipped_existing", 0),
+            "Vue 3D ouverte." if view_3d_opened else "",
+        )
+    )
+
+    return {
+        "ok": True,
+        "phase1_setup": {
+            **levels_summary,
+            "sections_created": len(coupes_with_sections),
+            **ctx_summary,
+            **link_summary,
+        },
+        "phase2a_walls": phase2a,
+        "phase2b_openings": phase2b,
+        "phase2c_floors": phase2c,
+        "view_3d_opened": view_3d_opened,
+        "note": note,
+    }
