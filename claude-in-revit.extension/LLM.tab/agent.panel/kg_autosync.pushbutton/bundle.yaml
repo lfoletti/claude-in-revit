@@ -1,7 +1,0 @@
-title: KG Auto-sync
-tooltip: |
-  Toggle l'auto-synchronisation du Knowledge Graph (KG) projet avec Revit.
-  ON  : les édits user sont captés par un hook après chaque transaction Revit.
-  OFF : retour au flux manuel (bouton Refresh KG + drift detection).
-  L'état est persistant entre sessions.
-author: Lauro Foletti

@@ -563,11 +563,11 @@ def _main():
 
     kg = kg_sync.open_or_create(doc)
 
-    # Auto-sync : consume any pending DocumentChanged events queued by
-    # the pyRevit hook `hooks/doc-changed.py`. No-op if mode is MANUEL
-    # (sentinel present) or if the buffer is empty. Runs *before* the
-    # catalog-empty check so the LLM sees a fresh KG.
-    diff_summary = kg_sync.consume_pending_diffs(kg, doc)
+    # Auto-sync hook (consume_pending_diffs) abandonned in V0 — pyRevit 5 +
+    # Revit 2025 + CPython3 had an assembly version conflict in pyRevitLoader
+    # that made DocumentChanged hook subscription crash on heavy operations
+    # (cf. JOURNAL session v retreat). The API stays in kg_sync (V1-ready),
+    # just no longer invoked here.
 
     # Heuristic: a fresh KG with no Levels means the user hasn't pressed
     # Refresh KG yet. Without it, the LLM sees an empty catalogue and
@@ -667,24 +667,6 @@ def _main():
         parts.append(result.text)
     if result.tool_calls:
         parts.append("\nTools utilisés : " + ", ".join(t["name"] for t in result.tool_calls))
-    # Surface the auto-sync activity only when it actually moved something
-    # — silence on no-op (empty buffer or all-unbound) to keep the UI quiet.
-    if diff_summary.get("modified_applied") or diff_summary.get("deleted_applied"):
-        parts.append(
-            "\n[KG auto-sync : {} node(s) rafraîchi(s), {} soft-delete(s) "
-            "depuis {} event(s) hook]".format(
-                diff_summary["modified_applied"],
-                diff_summary["deleted_applied"],
-                diff_summary["records"],
-            )
-        )
-    if diff_summary.get("skipped_added"):
-        parts.append(
-            "\n[KG auto-sync : {} élément(s) Revit créé(s) hors agent "
-            "ignoré(s) — clique Refresh KG pour les ingérer.]".format(
-                diff_summary["skipped_added"],
-            )
-        )
     if reset_requested:
         parts.append("\n[Historique conversation : réinitialisé sur demande.]")
     elif dropped_history_entries:

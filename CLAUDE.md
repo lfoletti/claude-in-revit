@@ -123,6 +123,45 @@ UC6 (vision) → V1. UC8 (compliance) → V1, requiert un KG projet stable.
 
 - **Bulk tool variant policy** : si un tool est susceptible d'être appelé en boucle dans une orchestration agent (création/modification multiple), créer **dès le départ** sa variante `_many(items: List[Dict])` — pas en réaction à un retour user après mesure de coût tokens. Chaque appel agent ↔ tool coûte ~80-150 tokens de overhead + 1 round-trip API séquentiel ; un bulk économise typiquement 70-90% des tokens et réduit drastiquement la latence. Pattern d'impl : extraire la logique per-item dans un helper privé `_do_one_X(...)` ; le tool unitaire wrap le helper avec sa transaction Revit ; le bulk wrap N appels au helper dans **une seule** transaction (atomicité). Validation pre-loop avant tout commit. Cf. mémoire `feedback-bulk-tool-variant-policy`.
 
+### Auto-sync Revit→KG : approche V0 abandonnée (DocumentChanged hook CPython)
+
+Tentative session v de capter les édits user-side via le pyRevit hook
+`hooks/doc-changed.py` (subscribed à `Application.DocumentChanged` event).
+**Abandonnée** : pyRevit 5.0.0.25034 + Revit 2025.0.2.419 + CPython 3.12
+produit un `Assembly version conflict in pyRevitLoader.dll` au boot de
+l'extension (visible dans le journal Revit). Symptôme observé : la simple
+**présence d'un handler CPython subscribed** à `DocumentChanged` faisait
+crasher Revit sur opérations massives (Refresh KG sur ~400 éléments
+template, création WallType DXF impliquant Legend regen). Pas d'exception
+Python catchée (`last_hook_error.txt` jamais écrit) → crash en-dessous
+de notre `try/except BaseException`, dans le bridge pyRevit ↔ .NET.
+
+Le code mort suivant est conservé pour ré-essai V1 :
+- `kg_sync.consume_pending_diffs(kg, doc)` + ses tests
+- `config.pending_diffs_path_for()`, `hooks_disabled_file()`,
+  `are_hooks_disabled()`, `set_hooks_disabled()`
+- Constante `revit_primitives.AGENT_TX_PREFIX = "[LLM] "` (non appliquée
+  aujourd'hui, mais nom de constante préservé pour grep futur)
+
+**Chemin V1 quand on retentera** : ne PAS utiliser un hook CPython via
+pyRevit. Implémenter un `IUpdater` (Dynamic Model Updater, doc Revit API)
+compilé en **C# .NET**, déployé comme add-in `.addin` séparé. L'updater
+peut s'enregistrer sur un `ElementFilter` ciblé (Walls, Doors, Windows,
+Floors, Rooms, Levels) avec `ChangeType.GeometryChange | ElementAddition
+| ElementDeletion`, et **peut piggyback la transaction utilisateur**
+(donc mutation autorisée pendant la Tx, contrairement à `DocumentChanged`
+qui est read-only). Le C# updater écrirait dans le même JSONL
+`pending_diffs.jsonl` que `consume_pending_diffs` lit. Cf. Building Coder
+"DocumentChanged versus Dynamic Model Updater" et les sources de l'enquête
+JOURNAL session v.
+
+Conditions pour retenter :
+1. pyRevit upstream résout l'`Assembly version conflict` OU on bascule
+   à une version pyRevit/Revit cohérente
+2. Besoin métier confirmé (économie réelle de clics Refresh KG mesurée
+   pendant un workflow réel, pas juste théorique)
+3. ½ journée pour le scaffold C# `.addin` + signature de classe + déploiement
+
 ### pyRevit pushbuttons — gotchas CPython
 
 - **`pyrevit.forms` est IronPython-only** : il lève `PyRevitCPythonNotSupported` sous CPython. Pour afficher un dialog depuis nos scripts (qui sont taggés `#! python3` → CPython 3.12), utiliser **`Autodesk.Revit.UI.TaskDialog`** directement (API Revit, disponible nativement via PythonNet dans pyRevit). Voir JOURNAL.md 2026-05-11 (bootstrap phase) pour le découvert.
