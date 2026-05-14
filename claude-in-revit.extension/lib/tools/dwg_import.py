@@ -7304,18 +7304,31 @@ def _meta_run_phase1_audit(
                 section_lines=section_lines_for_detect,
                 scale_override=scale_override,
             )
-            orient_by_path = {
-                o["coupe_path"]: o["convention"]
+            # Dict coupe_path → verdict complet (avec walls_crossed +
+            # confidence pour distinguer signal solide vs ambigu).
+            verdict_by_path = {
+                o["coupe_path"]: o
                 for o in detect_result.get("orientations") or []
             }
             for a in assignment:
-                a["x_axis_convention"] = orient_by_path.get(
-                    a["coupe_path"], "identity",
-                )
+                verdict = verdict_by_path.get(a["coupe_path"])
+                if (verdict is not None
+                        and verdict.get("walls_crossed", 0) > 0
+                        and verdict.get("confidence", 0.0) >= 0.1):
+                    # Signal solide : applique la convention détectée.
+                    a["x_axis_convention"] = verdict["convention"]
+                else:
+                    # Ambigu (0 mur croisé ou confidence trop basse) :
+                    # set None pour ne PAS appliquer de flip arbitraire.
+                    # Laisser Revit faire son default (= viewer's right).
+                    # Cas typique : un trait de coupe qui traverse une
+                    # zone sans mur (P2 Coupe 3 = poteaux+dalles only).
+                    a["x_axis_convention"] = None
         except Exception:  # noqa: BLE001 — détection non-fatale.
-            # Si la détection échoue (parse error, etc.), garder identity
-            # par défaut. L'user peut overrider à la main si miroité.
-            pass
+            # Si la détection échoue (parse error, etc.), garder None
+            # par défaut (= no flip). L'user peut overrider à la main.
+            for a in assignment:
+                a["x_axis_convention"] = None
 
     # 5. Level reconciliation (uses first coupe — they declare same levels).
     coupe_levels_reconcile: Dict[str, Any] = {}
@@ -7576,7 +7589,7 @@ def _meta_create_section_views(
             "p1_m": entry["plan_p1"],
             "p2_m": entry["plan_p2"],
             "view_dir": entry["view_dir"],
-            "x_axis_convention": entry.get("x_axis_convention", "identity"),
+            "x_axis_convention": entry.get("x_axis_convention"),  # None = pas de flip
         }
         if y_extent is not None:
             item["bottom_elev_m"] = y_extent[0]
