@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "graphify-code": {
+      "type": "stdio",
+      "command": ".venv/Scripts/python.exe",
+      "args": [
+        "-m",
+        "graphify.serve",
+        "graphify-out/graph.json"
+      ],
+      "env": {}
+    }
+  }
+}
