@@ -140,6 +140,80 @@ def test_hybrid_falls_back_to_hull_when_disconnected():
     assert boundary == fallback
 
 
+def test_floor_loops_outer_only():
+    """4 LINEs formant un rectangle 10×6 = 1 outer, 0 holes (cas P2 N0)."""
+    from lib.dwg_face_tracing import trace_floor_loops_2d
+    segments = [
+        ((0, 0), (10, 0)),
+        ((10, 0), (10, 6)),
+        ((10, 6), (0, 6)),
+        ((0, 6), (0, 0)),
+    ]
+    result = trace_floor_loops_2d(segments)
+    assert result is not None
+    assert len(result["outer"]) == 4
+    assert result["holes"] == []
+
+
+def test_floor_loops_outer_plus_one_hole():
+    """4 LINEs outer + 4 LINEs inner = 1 outer + 1 hole (cas P2 N2 clean)."""
+    from lib.dwg_face_tracing import trace_floor_loops_2d
+    segments = [
+        # Outer 20×16.
+        ((0, 0), (20, 0)),
+        ((20, 0), (20, 16)),
+        ((20, 16), (0, 16)),
+        ((0, 16), (0, 0)),
+        # Inner trémie 3×7.
+        ((5, 4), (8, 4)),
+        ((8, 4), (8, 11)),
+        ((8, 11), (5, 11)),
+        ((5, 11), (5, 4)),
+    ]
+    result = trace_floor_loops_2d(segments)
+    assert result is not None
+    assert len(result["outer"]) == 4
+    assert len(result["holes"]) == 1
+    assert len(result["holes"][0]) == 4
+
+
+def test_floor_loops_handles_landing_gaps_in_tremie():
+    """Trémie en U avec 2 gaps de 20cm (landing-access escalier — cas P2 N1).
+    `snap_tol_m=0.2` doit fermer les gaps et détecter la trémie comme
+    1 hole de 6 vertices."""
+    from lib.dwg_face_tracing import trace_floor_loops_2d
+    segments = [
+        # Outer 20×16.
+        ((0, 0), (20, 0)),
+        ((20, 0), (20, 16)),
+        ((20, 16), (0, 16)),
+        ((0, 16), (0, 0)),
+        # Trémie 3×7 avec 2 gaps de 20cm sur le côté gauche x=5.
+        ((5, 4), (5, 7.4)),   # bas
+        ((5, 7.6), (5, 11)),  # haut (gap de 20cm à y=7.4-7.6)
+        ((5, 11), (8, 11)),
+        ((8, 11), (8, 7.6)),
+        ((8, 7.4), (8, 4)),   # gap symétrique côté droit
+        ((8, 4), (5, 4)),
+    ]
+    result = trace_floor_loops_2d(segments, snap_tol_m=0.25)
+    assert result is not None
+    assert len(result["outer"]) == 4
+    assert len(result["holes"]) == 1
+    # Hole = 6 verts (la trémie traverse les gaps).
+    assert len(result["holes"][0]) == 6
+
+
+def test_floor_loops_returns_none_for_open_segments():
+    """Segments isolés sans loops fermés → None."""
+    from lib.dwg_face_tracing import trace_floor_loops_2d
+    segments = [
+        ((0, 0), (5, 0)),
+        ((10, 10), (15, 10)),
+    ]
+    assert trace_floor_loops_2d(segments) is None
+
+
 def test_hybrid_tries_progressively_larger_tolerance():
     """Murs avec petit gap (1cm) qui ferait échouer le snap_tol=0.005 mais
     passer à snap_tol=0.025. Le hybride essaie tol croissant."""

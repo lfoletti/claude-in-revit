@@ -338,6 +338,63 @@ def trace_outer_boundary_2d(
     return pts
 
 
+def trace_floor_loops_2d(
+    segments: List[Segment],
+    snap_tol_m: float = 0.20,
+    min_face_area_m2: float = 0.5,
+) -> Optional[Dict[str, Any]]:
+    """Trace toutes les boucles fermées du graphe planar et les classifie
+    en `outer` (contour principal) + `holes` (trous internes).
+
+    Use case : lecture de la géom dalle depuis les LINEs sur layer A-FLOR
+    (P2-style export Revit AIA). Le contour outer + les trémies sont
+    tous sur le même layer mais comme segments séparés. On reconstruit
+    les loops via le graphe planar.
+
+    Stratégie :
+    1. Build planar graph (mêmes étapes que `trace_outer_boundary_2d`).
+    2. Trace toutes les faces.
+    3. Sépare par signe d'aire signée :
+       - Aire négative → outer face (non-bornée, wrap CW depuis l'intérieur).
+       - Aire positive → inner face (région bornée).
+    4. Filtre les faces dégénérées (|aire| < `min_face_area_m2`).
+    5. Le **outer** retourné est la face inverse-orientée de la plus
+       grande aire positive (= contour de la slab).
+       Les **holes** sont les autres inner faces.
+
+    Returns:
+        `{"outer": [(x,y), ...], "holes": [[(x,y), ...], ...]}`
+        en CCW (premier point ≠ dernier). Ou `None` si pas de loop valide.
+    """
+    if not segments:
+        return None
+    vertices, edges = _build_planar_graph(segments, snap_tol_m=snap_tol_m)
+    if len(edges) < 3:
+        return None
+    faces = _trace_all_faces(vertices, edges)
+    if not faces:
+        return None
+    # Classify by signed area.
+    faces_with_area = [(f, _signed_area(vertices, f)) for f in faces]
+    faces_with_area = [(f, a) for f, a in faces_with_area if abs(a) >= min_face_area_m2]
+    if not faces_with_area:
+        return None
+    # Inner faces (positive area), sorted by area descending.
+    inner = [(f, a) for f, a in faces_with_area if a > 0]
+    if not inner:
+        # Aucune face bornée → seul le outer existe (graphe ouvert). Pas
+        # de loop fermée pour dalle.
+        return None
+    inner.sort(key=lambda fa: -fa[1])
+    # Largest inner = slab outline. Others = holes.
+    outer_face, _outer_area = inner[0]
+    hole_faces = [f for f, _ in inner[1:]]
+
+    outer_pts = [vertices[i] for i in outer_face]
+    holes_pts = [[vertices[i] for i in hf] for hf in hole_faces]
+    return {"outer": outer_pts, "holes": holes_pts}
+
+
 def trace_outer_boundary_with_fallback(
     wall_segments: List[Segment],
     fallback: List[Point],

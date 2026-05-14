@@ -4396,6 +4396,78 @@ def _shoelace_area_2d(points: List[Tuple[float, float]]) -> float:
     return abs(s) / 2.0
 
 
+def _collect_a_flor_loops_per_level(
+    kg: ProjectKG,
+    scale_override: Optional[float] = None,
+    snap_tol_m: float = 0.20,
+) -> Dict[float, Dict[str, Any]]:
+    """Lit la géom dalle directement depuis le DXF — convention Revit AIA :
+    le contour de la dalle ET les trémies sont sur le **layer `A-FLOR`**
+    (ou variantes) sous forme de LINEs séparées. On reconstruit les
+    boucles fermées via planar face-tracing et on classifie : la plus
+    grande boucle = contour outer, les autres = trous internes.
+
+    Use case observé sur P2 (poteaux-dalles avec trémie) : 10 LINEs
+    sur A-FLOR au N1 dont 4 forment le rectangle outer (19.5×16m) et
+    6 forment la trémie en U (3.5×7m, avec 2 gaps de ~15cm pour
+    landing-accesses d'escalier). `trace_floor_loops_2d(tol=0.20)`
+    capture les deux.
+
+    Returns:
+        `{level_elev → {"outer": [(x,y), ...], "holes": [[(x,y), ...], ...]}}`.
+        Niveaux sans loops détectées absents du dict.
+    """
+    from .dxf_context import _find_live_context
+    plan_level_elev = _plan_path_to_level_elev(kg)
+    nid = _find_live_context(kg)
+    if nid is None:
+        return {}
+    ctx = kg.get_node(nid)
+
+    out: Dict[float, Dict[str, Any]] = {}
+    for fi in ctx.get("files") or []:
+        if fi.get("kind") != "plan":
+            continue
+        plan_path = fi.get("path")
+        if not plan_path:
+            continue
+        elev = plan_level_elev.get(plan_path)
+        if elev is None:
+            continue
+        pp = Path(plan_path)
+        if not pp.exists():
+            continue
+        try:
+            ents, _meta = dwg_reader.parse(pp, scale_override=scale_override)
+        except Exception:  # noqa: BLE001
+            continue
+        # Take LINEs on A-FLOR* (exclude OVHD = projections, not slab edges).
+        segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        for e in ents:
+            if e.kind != "LINE":
+                continue
+            layer_upper = e.layer.upper()
+            if not layer_upper.startswith("A-FLOR"):
+                continue
+            if "OVHD" in layer_upper:
+                continue
+            if len(e.coords) < 2:
+                continue
+            segments.append((
+                (float(e.coords[0][0]), float(e.coords[0][1])),
+                (float(e.coords[1][0]), float(e.coords[1][1])),
+            ))
+        if not segments:
+            continue
+        result = dwg_face_tracing.trace_floor_loops_2d(
+            segments, snap_tol_m=snap_tol_m,
+        )
+        if result is None:
+            continue
+        out[round(float(elev), 3)] = result
+    return out
+
+
 def _collect_floor_holes_per_level(
     kg: ProjectKG,
     scale_override: Optional[float] = None,
@@ -4633,11 +4705,23 @@ def create_floors_many(
     # absents du dict.
     holes_by_elev = _collect_floor_holes_per_level(kg, scale_override)
 
+    # 3ter. Tente la lecture directe de la géom dalle depuis le DXF —
+    # convention Revit AIA met le contour ET les trémies sur layer A-FLOR
+    # comme LINEs séparées. Si détecté, c'est la source de vérité
+    # (priorité sur le face-tracing des murs, qui peut diverger : saillies,
+    # cantilever, retraits). Validé sur P2 poteaux-dalles avec trémie.
+    a_flor_loops_by_elev = _collect_a_flor_loops_per_level(kg, scale_override)
+
     # 4. Build per-level items : boundary, thickness, level_ref, holes.
     floor_items_raw: List[Dict[str, Any]] = []
     thicknesses_unique: Set[int] = set()
     holes_count_by_kind: Dict[str, int] = {}
-    boundary_methods: Dict[str, int] = {"face_tracing": 0, "convex_hull_fallback": 0}
+    boundary_methods: Dict[str, int] = {
+        "a_flor_lines": 0,  # priorité 1 — géom dalle directe depuis DXF
+        "face_tracing": 0,  # priorité 2 — contour mur via planar
+        "convex_hull_fallback": 0,  # priorité 3 — dernier recours
+    }
+    a_flor_holes_added = 0
     for elev in target_elevs:
         thk = thk_by_elev[elev]
         wall_pts: List[Tuple[float, float]] = []
@@ -4647,17 +4731,30 @@ def create_floors_many(
         hull = _convex_hull_2d(wall_pts)
         if len(hull) < 3:
             continue
-        # V2 : essaie face-tracing pour le contour extérieur réel (gère
-        # plans en L, ailes, retraits — vs convex hull qui surestime).
-        # Hybride : fallback sur convex hull si face-tracing échoue
-        # (typique : murs déconnectés, fragments, gaps géom > tol max).
-        outer_pts, boundary_method = dwg_face_tracing.trace_outer_boundary_with_fallback(
-            wall_segments=list(walls_by_level[elev]),
-            fallback=hull,
-        )
+
+        # Priorité 1 : géom dalle directe depuis A-FLOR LINEs si détectée.
+        # C'est la source de vérité — le DXF peut avoir des saillies /
+        # cantilever / retraits où la dalle diverge des murs.
+        a_flor_loops = a_flor_loops_by_elev.get(round(elev, 3))
+        boundary_method = None
+        a_flor_inner_holes: List[List[List[float]]] = []
+        if a_flor_loops and len(a_flor_loops["outer"]) >= 3:
+            hull = a_flor_loops["outer"]
+            a_flor_inner_holes = [
+                [[round(p[0], 4), round(p[1], 4)] for p in h]
+                for h in a_flor_loops["holes"]
+            ]
+            boundary_method = "a_flor_lines"
+            a_flor_holes_added += len(a_flor_inner_holes)
+        else:
+            # Priorité 2-3 : face-tracing sur murs + fallback convex hull.
+            outer_pts, fallback_method = dwg_face_tracing.trace_outer_boundary_with_fallback(
+                wall_segments=list(walls_by_level[elev]),
+                fallback=hull,
+            )
+            hull = outer_pts if fallback_method == "face_tracing" else hull
+            boundary_method = fallback_method
         boundary_methods[boundary_method] = boundary_methods.get(boundary_method, 0) + 1
-        # Adopte le résultat de face-tracing s'il a réussi, sinon hull.
-        hull = outer_pts if boundary_method == "face_tracing" else hull
         if len(hull) < 3:
             continue
         # Inflation isotrope (optionnelle).
@@ -4676,14 +4773,24 @@ def create_floors_many(
                 inflated.append((cx + vx * k, cy + vy * k))
             hull = inflated
         boundary = [[round(p[0], 4), round(p[1], 4)] for p in hull]
-        # Holes for this level (cages d'escalier / patios / atria). Stripped
-        # to just `points` for the floors.create_many contract ; `layer`/`kind`
-        # kept in the summary for visibility.
+        # Holes union :
+        # - closed polylines sur A-FLOR-STAIR/OPEN/PATIO (existing detection
+        #   par layer name)
+        # - inner faces reconstruites depuis A-FLOR LINEs (P2-style)
+        # Si A-FLOR LINEs ont déjà donné le outer (priority 1), les holes
+        # de cette source sont aussi pris ; sinon, juste les closed polylines.
         raw_holes = holes_by_elev.get(round(elev, 3), [])
-        holes_pts: List[List[List[float]]] = []
+        holes_pts: List[List[List[float]]] = list(a_flor_inner_holes)
         for h in raw_holes:
             holes_pts.append([[round(p[0], 4), round(p[1], 4)] for p in h["points"]])
             holes_count_by_kind[h["kind"]] = holes_count_by_kind.get(h["kind"], 0) + 1
+        if a_flor_inner_holes:
+            # A-FLOR LINE-based holes : on les compte sous "a_flor_inner"
+            # (pas de classification fine — la sémantique vient de la
+            # géom, pas du nom de layer).
+            holes_count_by_kind["a_flor_inner"] = (
+                holes_count_by_kind.get("a_flor_inner", 0) + len(a_flor_inner_holes)
+            )
         # Net area : outer (shoelace) − sum(hole areas).
         gross = _shoelace_area_2d(hull)
         net = gross

@@ -2031,6 +2031,7 @@
     ],
     "holes_count_by_kind": {},
     "boundary_methods": {
+      "a_flor_lines": 0,
       "face_tracing": 2,
       "convex_hull_fallback": 0
     },
