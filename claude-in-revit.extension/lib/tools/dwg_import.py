@@ -4652,7 +4652,7 @@ def create_floors_many(
         if type_ref is None:
             continue
         floors_items.append({
-            "type_ref": type_ref,
+            "floor_type_ref": type_ref,
             "level_ref": it["level_ref"],
             "boundary": it["boundary"],
             "area_m2": it["area_m2"],
