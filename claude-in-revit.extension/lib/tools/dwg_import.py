@@ -1762,6 +1762,22 @@ def detect_section_orientations(
     )
     plan_walls = [_wall_candidate_to_dict(w) for w in plan_classified.walls]
 
+    # Plan world bbox sur le contenu structurel (A-WALL + A-FLOR
+    # + S-COLS) — utilisé en fallback bbox-match si walls_crossed=0.
+    plan_xs: List[float] = []
+    plan_ys: List[float] = []
+    for e in plan_entities:
+        if e.layer in ("A-WALL", "A-FLOR") and e.kind == "LINE":
+            for pt in e.coords:
+                plan_xs.append(pt[0])
+                plan_ys.append(pt[1])
+        elif e.layer == "S-COLS" and e.kind in ("LINE", "INSERT"):
+            for pt in e.coords:
+                plan_xs.append(pt[0])
+                plan_ys.append(pt[1])
+    plan_world_x_bbox = (min(plan_xs), max(plan_xs)) if plan_xs else None
+    plan_world_y_bbox = (min(plan_ys), max(plan_ys)) if plan_ys else None
+
     # 2. Récupérer section_lines.
     if section_lines is None:
         from .dxf_context import _find_live_context
@@ -1798,18 +1814,58 @@ def detect_section_orientations(
             thickness_tol_m=thickness_tol_m,
             x_cut_tol_m=x_cut_tol_m,
         )
+
+        # Fallback bbox-match si pas de signal mur (P2 Coupe 3 : trait
+        # hors-bâtiment, 0 mur croisé, mais coupe contient quand même
+        # A-FLOR LINEs des dalles → on compare coupe X bbox à plan
+        # Y/X bbox projeté).
+        bbox_signal: Optional[str] = None
+        final_convention = verdict.convention
+        final_source = "walls"
+        if verdict.walls_crossed == 0:
+            # Plan extent along trait : Y bbox pour vertical, X bbox
+            # pour horizontal.
+            sp1_y = sl["plan_p1"][1]
+            sp2_y = sl["plan_p2"][1]
+            sp1_x = sl["plan_p1"][0]
+            sp2_x = sl["plan_p2"][0]
+            is_vertical_trait = abs(sp2_x - sp1_x) < abs(sp2_y - sp1_y)
+            plan_along_trait = (
+                plan_world_y_bbox if is_vertical_trait
+                else plan_world_x_bbox
+            )
+            # Coupe X bbox sur A-FLOR + A-WALL LINEs (= bordures de
+            # dalles/murs visibles en section, fiables pour le bbox).
+            # Exclure S-COLS INSERT qui peut extend hors-bâtiment.
+            coupe_xs: List[float] = []
+            for e in coupe_entities:
+                if e.layer in ("A-FLOR", "A-WALL") and e.kind == "LINE":
+                    for pt in e.coords:
+                        coupe_xs.append(pt[0])
+            coupe_x_bbox = (min(coupe_xs), max(coupe_xs)) if coupe_xs else None
+            if plan_along_trait is not None and coupe_x_bbox is not None:
+                bbox_signal, _diff = dwg_coherence.detect_x_axis_convention_via_bbox(
+                    plan_extent_along_trait=plan_along_trait,
+                    coupe_x_extent=coupe_x_bbox,
+                )
+                if bbox_signal is not None:
+                    final_convention = bbox_signal
+                    final_source = "bbox"
+
         orientations.append({
             "coupe_path": coupe_path,
             "name": sl.get("name"),
-            "convention": verdict.convention,
+            "convention": final_convention,
             "matches_identity": verdict.matches_identity,
             "matches_reversed": verdict.matches_reversed,
             "walls_crossed": verdict.walls_crossed,
             "confidence": verdict.confidence,
+            "bbox_signal": bbox_signal,
+            "source": final_source,
         })
-        if verdict.walls_crossed == 0 or verdict.confidence < 0.1:
+        if (verdict.walls_crossed == 0 and bbox_signal is None):
             ambiguous_count += 1
-        elif verdict.convention == "reversed":
+        elif final_convention == "reversed":
             reversed_count += 1
         else:
             identity_count += 1
@@ -7312,17 +7368,23 @@ def _meta_run_phase1_audit(
             }
             for a in assignment:
                 verdict = verdict_by_path.get(a["coupe_path"])
-                if (verdict is not None
-                        and verdict.get("walls_crossed", 0) > 0
-                        and verdict.get("confidence", 0.0) >= 0.1):
-                    # Signal solide : applique la convention détectée.
+                if verdict is None:
+                    a["x_axis_convention"] = None
+                    continue
+                wall_signal_solid = (
+                    verdict.get("walls_crossed", 0) > 0
+                    and verdict.get("confidence", 0.0) >= 0.1
+                )
+                bbox_signal = verdict.get("bbox_signal")
+                if wall_signal_solid:
+                    # Signal solide via murs : applique la convention.
                     a["x_axis_convention"] = verdict["convention"]
+                elif bbox_signal is not None:
+                    # Pas de mur croisé mais bbox A-FLOR/A-WALL en coupe
+                    # matche plan (cf. P2 Coupe 3 = reversed via slabs).
+                    a["x_axis_convention"] = bbox_signal
                 else:
-                    # Ambigu (0 mur croisé ou confidence trop basse) :
-                    # set None pour ne PAS appliquer de flip arbitraire.
-                    # Laisser Revit faire son default (= viewer's right).
-                    # Cas typique : un trait de coupe qui traverse une
-                    # zone sans mur (P2 Coupe 3 = poteaux+dalles only).
+                    # Vraiment ambigu : None → no flip, Revit's default.
                     a["x_axis_convention"] = None
         except Exception:  # noqa: BLE001 — détection non-fatale.
             # Si la détection échoue (parse error, etc.), garder None

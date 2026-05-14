@@ -306,15 +306,65 @@ class SectionXAxisConvention:
       `"reversed"` (DXF X = -world axis, cas P2 longitudinal).
     - `matches_identity` / `matches_reversed` : nb de murs plan
       retrouvés en coupe selon chaque convention.
-    - `confidence` : `(winner - loser) / max(walls_crossed, 1)`. ≥ 0.3
-      = signal clair ; entre 0 et 0.3 = à confirmer ; 0 = égalité ou
-      aucun mur croisé.
+    - `walls_crossed` : nb de murs plan croisés par le trait.
+    - `bbox_signal` : `"identity"`, `"reversed"` ou None — verdict du
+      bbox-match secondaire (sur slabs/walls X extent en coupe vs
+      plan Y/X extent). Fallback quand walls_crossed=0.
+    - `confidence` : `(winner - loser) / max(walls_crossed, 1)` pour le
+      signal primaire. 0 si fallback bbox uniquement.
+    - `source` : `"walls"`, `"bbox"` ou `"none"` (indique laquelle des
+      stratégies a déterminé la convention finale).
     """
     convention: str
     matches_identity: int
     matches_reversed: int
     walls_crossed: int
     confidence: float
+    bbox_signal: Optional[str] = None
+    source: str = "walls"
+
+
+def detect_x_axis_convention_via_bbox(
+    plan_extent_along_trait: Tuple[float, float],
+    coupe_x_extent: Tuple[float, float],
+    *,
+    tol_m: float = 1.0,
+) -> Tuple[Optional[str], float]:
+    """Détection alternative par comparaison de bbox.
+
+    Compare `coupe_x_extent` (= X extent du contenu A-FLOR/A-WALL en
+    coupe) à `plan_extent_along_trait` (= projection du contenu plan
+    sur l'axe perpendiculaire au trait : Y pour trait vertical, X pour
+    trait horizontal).
+
+    - **Identity** (DXF X = +world axis) : `coupe ≈ plan`.
+    - **Reversed** (DXF X = -world axis) : `coupe ≈ -plan` (= bornes
+      inversées et signe flippé).
+
+    Use case : signal de fallback quand `detect_section_x_axis_convention`
+    n'a aucun mur à matcher (P2 Coupe 3 = trait hors-mur, mais coupe
+    contient quand même les dalles → bbox A-FLOR informatif).
+
+    Args:
+        plan_extent_along_trait: `(min, max)` en mètres.
+        coupe_x_extent: `(min, max)` en mètres.
+        tol_m: tolérance d'écart (défaut 1m — un mur d'épaisseur typique).
+
+    Returns:
+        `("identity"|"reversed"|None, error_diff_m)`. None si l'écart
+        est ambigu (les 2 conventions matchent dans la tolérance).
+        `error_diff_m` = |winner_error - loser_error| (= confiance).
+    """
+    p_min, p_max = plan_extent_along_trait
+    c_min, c_max = coupe_x_extent
+    # identity: c_min ≈ p_min, c_max ≈ p_max.
+    id_err = abs(c_min - p_min) + abs(c_max - p_max)
+    # reversed: c_min ≈ -p_max, c_max ≈ -p_min.
+    rev_err = abs(c_min - (-p_max)) + abs(c_max - (-p_min))
+    diff = abs(id_err - rev_err)
+    if diff < tol_m:
+        return (None, diff)
+    return ("identity" if id_err < rev_err else "reversed", diff)
 
 
 def detect_section_x_axis_convention(

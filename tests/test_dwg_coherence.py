@@ -343,6 +343,33 @@ def test_detect_x_axis_defaults_identity_when_no_walls_crossed():
     assert v.confidence == 0.0
 
 
+def test_bbox_detect_identity_when_extents_match_signs():
+    """Coupe X extent matche plan extent en signe = identity."""
+    plan = (-13.42, 8.01)
+    coupe = (-13.42, 8.01)
+    conv, _ = dwg_coherence.detect_x_axis_convention_via_bbox(plan, coupe)
+    assert conv == "identity"
+
+
+def test_bbox_detect_reversed_when_extents_flipped():
+    """Coupe X extent = négatif du plan extent (= signs flippés) =
+    reversed. Cas P2 Coupe 3 : plan Y [-6.99, +9.01], coupe X
+    [-9.01, +6.99]."""
+    plan = (-6.99, 9.01)
+    coupe = (-9.01, 6.99)
+    conv, _ = dwg_coherence.detect_x_axis_convention_via_bbox(plan, coupe)
+    assert conv == "reversed"
+
+
+def test_bbox_detect_ambiguous_when_extents_nearly_equal():
+    """Si plan extent ≈ symétrique (e.g., bâtiment symétrique autour
+    de l'origine), les 2 conventions matchent → ambigu → None."""
+    plan = (-5.0, 5.0)
+    coupe = (-5.0, 5.0)  # = identity, but also -coupe = (-5, 5) = symmetric
+    conv, _ = dwg_coherence.detect_x_axis_convention_via_bbox(plan, coupe)
+    assert conv is None  # symétrique → ambigu
+
+
 def test_detect_x_axis_confidence_increases_with_match_margin():
     """Plus de murs matchent → plus de confiance. 3/3 matches en reversed
     et 0 en identity → confidence ≥ 0.3."""
