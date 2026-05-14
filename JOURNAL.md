@@ -138,6 +138,142 @@ graphe des murs (motivation pour face-tracing en Phase E).
   droite. À traiter via `ezdxf.LWPolyline.virtual_entities()` si
   besoin.
 
+### Phase E — Boundary face-tracing (vs convex hull)
+
+User : « Côté execute, j'ai besoin d'une approche robuste pour la
+création des dalles, qui tienne compte des limites réelles des dalles ».
+Suite logique de Phase D (trous). Le contour outer du convex hull
+surestime pour les plans en L / ailes / retraits. Solution propre :
+face-tracing sur le graphe planar des centerlines de murs.
+
+#### Algorithme
+
+Nouveau module `lib/dwg_face_tracing.py` (algorithme géométrique pur,
+mérite sa séparation des helpers DXF spécifiques) :
+
+1. **Snap endpoints** : fusionne les endpoints proches (clusters < tol)
+   en un vertex unique. Tolère les imprécisions DXF.
+2. **Split internal intersections** : pour chaque paire de segments
+   qui se croisent au milieu (X / T sans endpoint coïncidant), insère
+   un vertex au point d'intersection et split. Graphe planar pur après.
+3. **Trace faces via half-edge** : chaque segment devient 2 half-edges,
+   au niveau de chaque vertex on ordonne par angle CCW, on suit le
+   « next » au CCW autour du vertex après le twin → on revient au
+   half-edge de départ → face fermée.
+4. **Identify outer face** : aire signée la plus négative (la face
+   non-bornée wrap CW depuis l'intérieur). Inverse pour CCW.
+
+API :
+- `trace_outer_boundary_2d(wall_segments, snap_tol_m=0.01)` →
+  retourne contour CCW ou None si topologie incomplète.
+- `trace_outer_boundary_with_fallback(walls, fallback, snap_tol_m=0.05)` :
+  hybride qui essaie tolérances ×1, ×5, ×20 puis fallback (typiquement
+  convex hull). Retourne `(boundary, method)`.
+
+#### Intégration `dwg_create_floors_many`
+
+Remplace `_convex_hull_2d` par `trace_outer_boundary_with_fallback`.
+Nouveau champ retour `boundary_methods` (compteur par méthode), surfacé
+dans `_meta_phase2c_floors` pour traçabilité.
+
+#### Validation
+
+P7 golden régénéré :
+- Floor N0 : aire 158→144.5 m² (-9% de surplus hull), 5→7 verts.
+- Floor N1 : aire 159→110 m² (-30% de surplus hull), 7→6 verts.
+- Les deux contours fidèles aux murs maintenant.
+
+9 nouveaux tests dans `tests/test_face_tracing.py` (rectangle, L-shape,
+T-junction interne, X-junction split, disconnected, empty, hybride).
+
+### Phase F — Géom dalle depuis A-FLOR LINEs (priorité 1)
+
+User : « il y a effectivement des cas architecturaux où la géométrie
+de la dalle ne correspond pas à 100% à la géométrie des cloisons ou
+des murs extérieurs ». Confirmation que face-tracing sur murs n'est
+pas la source de vérité — saillies, retraits, cantilevers existent.
+
+#### Découverte sur P2 (poteaux-dalles avec trémie)
+
+Inspection de `claude-in-revit-projects/P2` (que l'user a indiqué
+contient un exemple poteaux-dalles + trémie) :
+
+- 3 niveaux (N0, N1, N2).
+- N0 : 4 LINEs sur `A-FLOR` formant un rectangle 19.5×16m parfait =
+  contour outer de la dalle.
+- N1 : 10 LINEs sur `A-FLOR` — 4 outer + 6 inner formant la trémie en
+  U (3.5×7m, avec 2 gaps de ~15cm pour landing-access escalier).
+- N2 : 8 LINEs sur `A-FLOR` — 4 outer + 4 inner trémie clean.
+- 0 closed polylines, 0 hatches.
+
+**Convention différente de l'AIA pure** que P7 montrait : les trémies
+sont représentées par LINEs séparées sur le même layer `A-FLOR` que le
+contour outer. Distinguées par geometry (face areas), pas par layer name.
+
+#### API
+
+Nouveau dans `dwg_face_tracing.py` :
+- `trace_floor_loops_2d(segments, snap_tol_m=0.20, min_face_area_m2=0.5)` :
+  trace toutes les boucles fermées + classifie par signed area.
+  Retourne `{"outer": [...], "holes": [[...], ...]}`. La plus grande
+  inner face = slab outline, les autres = trous.
+
+Nouveau dans `tools/dwg_import.py` :
+- `_collect_a_flor_loops_per_level(kg, scale_override, snap_tol_m=0.20)` :
+  pour chaque plan référencé dans DxfImportContext.files, extrait les
+  LINEs sur `A-FLOR*` (exclut OVHD), appelle `trace_floor_loops_2d`,
+  indexe par élévation de niveau.
+
+#### Hiérarchie de boundary dans `dwg_create_floors_many`
+
+1. **Priorité 1 — A-FLOR LINEs** (P2-style) : source de vérité quand
+   disponible (capture saillies/retraits/trémies réels).
+2. **Priorité 2 — Face-tracing sur murs** : si pas de A-FLOR détecté.
+3. **Priorité 3 — Convex hull fallback** : dernier recours.
+
+Compteur `boundary_methods.a_flor_lines` ajouté. Holes union :
+- Closed polylines sur `A-FLOR-STAIR/OPEN/PATIO` (priority 1.b)
+- Inner faces from A-FLOR LINEs (priority 1.a, classé `a_flor_inner`)
+
+`snap_tol_m=0.20` par défaut pour les A-FLOR LINEs : plus large que
+pour murs (où on snap à 1-5cm) car les trémies architecturales ont des
+gaps intentionnels (landing-accesses) de 15-30cm qu'il faut fermer.
+
+#### Validation
+
+P2 (test direct hors-fixture car projet pas encore copié) :
+- N0 : outer 19.5×16m, 0 trous (rez sans cage). ✓
+- N1 : outer 19.5×16m, 1 trou 3.5×7m (trémie U-shaped, 6 verts
+  après fermeture des gaps de 15cm via snap_tol=0.20). ✓
+- N2 : outer 19.5×16m, 1 trou 3.5×7m clean. ✓
+
+P7 : pas de A-FLOR LINEs formant un loop fermé (juste 2 saillies au N1
+sans connexion) → tombe sur priorité 2 (face-tracing murs). Comportement
+inchangé pour P7. Golden régénéré.
+
+4 nouveaux tests dans `test_face_tracing.py` : `floor_loops_outer_only`,
+`outer_plus_one_hole`, `handles_landing_gaps_in_tremie`,
+`returns_none_for_open_segments`. **644 tests verts (612 → 644 en
+fin de session w).**
+
+#### Reste à faire (Phase G suivante)
+
+- **Cross-validation slab via coupes** (user 2026-05-14) : utiliser
+  `read_section_floor_slabs.x_min_m/x_max_m` pour valider que le
+  contour A-FLOR matche bien l'extent réel du slab vu en section.
+  Flagger les divergences. Cf. task #32 ouverte.
+- **Copier P2 en fixture repo** + test integration end-to-end. Bug à
+  côté : `assign_coupes_to_traits` échoue sur P2 Coupe 3 (pas de
+  LINEs A-WALL — c'est une coupe qui ne traverse que des poteaux/sols).
+  À gérer gracieusement. Cf. task #33.
+- **Import DXF poteaux** (`S-COLS` layer AIA) : user a confirmé l'ordre
+  (face-tracing → colonnes → poutres). Cf. task #30.
+- **Import DXF poutres** (`S-BEAM` layer) : après colonnes. Cf. task #31.
+- **System prompt update** : bump `dwg_import_project_*` tier=3→2 après
+  validation user via dev pushbuttons. Cf. task #19.
+
+---
+
 ### Phase A — Règle de pré-validation pushbutton (process)
 
 Suite des crashes Refresh KG en début de session, l'user a formalisé une
