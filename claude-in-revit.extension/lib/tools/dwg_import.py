@@ -31,6 +31,7 @@ from .. import (
     dwg_classifier,
     dwg_coherence,
     dwg_elevation_reader,
+    dwg_face_tracing,
     dwg_plan_openings,
     dwg_reader,
     dwg_section_reader,
@@ -4636,6 +4637,7 @@ def create_floors_many(
     floor_items_raw: List[Dict[str, Any]] = []
     thicknesses_unique: Set[int] = set()
     holes_count_by_kind: Dict[str, int] = {}
+    boundary_methods: Dict[str, int] = {"face_tracing": 0, "convex_hull_fallback": 0}
     for elev in target_elevs:
         thk = thk_by_elev[elev]
         wall_pts: List[Tuple[float, float]] = []
@@ -4643,6 +4645,19 @@ def create_floors_many(
             wall_pts.append(p1)
             wall_pts.append(p2)
         hull = _convex_hull_2d(wall_pts)
+        if len(hull) < 3:
+            continue
+        # V2 : essaie face-tracing pour le contour extérieur réel (gère
+        # plans en L, ailes, retraits — vs convex hull qui surestime).
+        # Hybride : fallback sur convex hull si face-tracing échoue
+        # (typique : murs déconnectés, fragments, gaps géom > tol max).
+        outer_pts, boundary_method = dwg_face_tracing.trace_outer_boundary_with_fallback(
+            wall_segments=list(walls_by_level[elev]),
+            fallback=hull,
+        )
+        boundary_methods[boundary_method] = boundary_methods.get(boundary_method, 0) + 1
+        # Adopte le résultat de face-tracing s'il a réussi, sinon hull.
+        hull = outer_pts if boundary_method == "face_tracing" else hull
         if len(hull) < 3:
             continue
         # Inflation isotrope (optionnelle).
@@ -4774,6 +4789,7 @@ def create_floors_many(
         "types_reused": types_result["reused_count"],
         "types": types_result["types"],
         "holes_count_by_kind": holes_count_by_kind,
+        "boundary_methods": boundary_methods,
         "inner_floors": inner_floors,
         "note": note,
     }
@@ -5616,6 +5632,10 @@ def _meta_phase2c_floors(
         # Phase 2c V2 : trous détectés (cages d'escalier, patios, atria).
         # Vide si aucun trou (cas P7).
         "holes_count_by_kind": result.get("holes_count_by_kind") or {},
+        # Phase 2c V2 : méthode utilisée pour tracer le contour outer de
+        # chaque sol (face_tracing OK = plan en L bien tracé, convex_hull_fallback
+        # = murs fragmentés, hull surestime probablement).
+        "boundary_methods": result.get("boundary_methods") or {},
     }
 
 
