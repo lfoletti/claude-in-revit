@@ -1,0 +1,2591 @@
+{
+  "project_dir": "<P>",
+  "files": {
+    "plans": [
+      "<P>\\Projet8-Plan d'étage - Niveau 0.dxf",
+      "<P>\\Projet8-Plan d'étage - Niveau 1.dxf"
+    ],
+    "coupes": [
+      "<P>\\Projet8-Coupe - Coupe 1.dxf",
+      "<P>\\Projet8-Coupe - Coupe 2.dxf",
+      "<P>\\Projet8-Coupe - Coupe 3.dxf"
+    ],
+    "elevations": [
+      "<P>\\Projet8-Elévation - Elévation Est.dxf",
+      "<P>\\Projet8-Elévation - Elévation Nord.dxf",
+      "<P>\\Projet8-Elévation - Elévation Ouest.dxf",
+      "<P>\\Projet8-Elévation - Elévation Sud.dxf"
+    ]
+  },
+  "check_planset_integrity": {
+    "ok": true,
+    "severity": "warnings",
+    "gate_status": "needs_user",
+    "files_summary": {
+      "plan_count": 2,
+      "section_count": 3,
+      "elevation_count": 4,
+      "unknown_count": 0,
+      "files": [
+        {
+          "path": "<P>\\Projet8-Plan d'étage - Niveau 0.dxf",
+          "name": "Projet8-Plan d'étage - Niveau 0.dxf",
+          "kind": "plan",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Plan d'étage - Niveau 1.dxf",
+          "name": "Projet8-Plan d'étage - Niveau 1.dxf",
+          "kind": "plan",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+          "name": "Projet8-Coupe - Coupe 1.dxf",
+          "kind": "section",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+          "name": "Projet8-Coupe - Coupe 2.dxf",
+          "kind": "section",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+          "name": "Projet8-Coupe - Coupe 3.dxf",
+          "kind": "section",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Elévation - Elévation Est.dxf",
+          "name": "Projet8-Elévation - Elévation Est.dxf",
+          "kind": "elevation",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Elévation - Elévation Nord.dxf",
+          "name": "Projet8-Elévation - Elévation Nord.dxf",
+          "kind": "elevation",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Elévation - Elévation Ouest.dxf",
+          "name": "Projet8-Elévation - Elévation Ouest.dxf",
+          "kind": "elevation",
+          "source": "aia"
+        },
+        {
+          "path": "<P>\\Projet8-Elévation - Elévation Sud.dxf",
+          "name": "Projet8-Elévation - Elévation Sud.dxf",
+          "kind": "elevation",
+          "source": "aia"
+        }
+      ]
+    },
+    "checks": {
+      "setup": {
+        "severity": "clean",
+        "summary": {
+          "warnings_count": 0,
+          "plan_count": 2,
+          "section_count": 3,
+          "elevation_count": 4,
+          "unknown_count": 0
+        },
+        "issues": []
+      },
+      "source_consistency": {
+        "severity": "clean",
+        "summary": {
+          "distinct_sources": [
+            "aia"
+          ],
+          "files_count": 9,
+          "files_by_source": {
+            "aia": 9
+          }
+        },
+        "issues": []
+      },
+      "scale_drift": {
+        "severity": "warnings",
+        "summary": {
+          "coupes_checked": 3,
+          "errors_count": 0,
+          "warnings_count": 2
+        },
+        "issues": [
+          {
+            "kind": "drift_warning",
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "drift_pct": 31.28,
+            "marker_length_m": 14.8435,
+            "coupe_extent_m": 10.2,
+            "message": "Coupe '<P>\\Projet8-Coupe - Coupe 1.dxf': drift 31.3% notable (la coupe inclut souvent du contexte hors-bâtiment)."
+          },
+          {
+            "kind": "drift_warning",
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+            "drift_pct": 25.21,
+            "marker_length_m": 22.9967,
+            "coupe_extent_m": 17.2,
+            "message": "Coupe '<P>\\Projet8-Coupe - Coupe 2.dxf': drift 25.2% notable (la coupe inclut souvent du contexte hors-bâtiment)."
+          }
+        ]
+      },
+      "levels_consistency": {
+        "severity": "clean",
+        "summary": {
+          "coupes_count": 3,
+          "distinct_level_names": 3,
+          "elevation_conflicts": 0,
+          "subset_warnings": 0
+        },
+        "issues": []
+      },
+      "walls_reconciliation": {
+        "severity": "warnings",
+        "summary": {
+          "matches_ok": 0,
+          "thickness_mismatches": 0,
+          "no_section_wall_at_x": 1,
+          "ambiguous": 1,
+          "plan_walls_total": 14,
+          "plan_walls_not_crossed": 12,
+          "section_walls_unmatched": 17,
+          "section_lines_count": 3
+        },
+        "issues": [
+          {
+            "kind": "ambiguous_candidates",
+            "plan_wall_index": 6,
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+            "candidate_indices": [
+              3,
+              2
+            ],
+            "primary_thickness_m": 0.2
+          },
+          {
+            "kind": "no_section_wall_at_x",
+            "plan_wall_index": 10,
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+            "x_cut_expected_m": -3.4896
+          },
+          {
+            "kind": "section_walls_unmatched",
+            "count": 17,
+            "samples": [
+              {
+                "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+                "section_wall_index": 0,
+                "x_cut_m": -1.1745,
+                "thickness_m": 0.2,
+                "y_bottom_m": -0.0,
+                "y_top_m": 0.7862
+              },
+              {
+                "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+                "section_wall_index": 1,
+                "x_cut_m": -1.1745,
+                "thickness_m": 0.2,
+                "y_bottom_m": 1.2888,
+                "y_top_m": 3.7862
+              },
+              {
+                "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+                "section_wall_index": 2,
+                "x_cut_m": -1.1745,
+                "thickness_m": 0.2,
+                "y_bottom_m": 4.2888,
+                "y_top_m": 5.75
+              },
+              {
+                "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+                "section_wall_index": 3,
+                "x_cut_m": 8.8255,
+                "thickness_m": 0.2,
+                "y_bottom_m": 1.2888,
+                "y_top_m": 3.7862
+              },
+              {
+                "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+                "section_wall_index": 4,
+                "x_cut_m": 8.8255,
+                "thickness_m": 0.2,
+                "y_bottom_m": -0.0,
+                "y_top_m": 0.7862
+              }
+            ]
+          }
+        ]
+      },
+      "openings_matching": {
+        "severity": "warnings",
+        "summary": {
+          "coupes_checked": 3,
+          "total_matches": 6,
+          "total_unmatched_section": 12,
+          "total_unmatched_plan": 0
+        },
+        "issues": [
+          {
+            "kind": "unmatched_openings",
+            "section_name": "Projet8-Coupe - Coupe 1.dxf",
+            "section_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "match_count": 2,
+            "unmatched_section_count": 4,
+            "unmatched_plan_count": 0,
+            "message": "Projet8-Coupe - Coupe 1.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+          },
+          {
+            "kind": "unmatched_openings",
+            "section_name": "Projet8-Coupe - Coupe 2.dxf",
+            "section_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+            "match_count": 2,
+            "unmatched_section_count": 4,
+            "unmatched_plan_count": 0,
+            "message": "Projet8-Coupe - Coupe 2.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+          },
+          {
+            "kind": "unmatched_openings",
+            "section_name": "Projet8-Coupe - Coupe 3.dxf",
+            "section_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+            "match_count": 2,
+            "unmatched_section_count": 4,
+            "unmatched_plan_count": 0,
+            "message": "Projet8-Coupe - Coupe 3.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+          }
+        ]
+      },
+      "openings_plan_vs_elevation": {
+        "severity": "warnings",
+        "summary": {
+          "plan_total_inserts": 15,
+          "elevation_total_inserts": 26,
+          "count_diff_pct": 73.3,
+          "plan_block_ids_unique": 2,
+          "elevation_block_ids_unique": 3,
+          "missing_in_elevation_count": 0,
+          "missing_in_plan_count": 1
+        },
+        "issues": [
+          {
+            "kind": "block_ids_missing_in_plan",
+            "block_ids": [
+              "V2"
+            ],
+            "message": "1 block_id(s) présent(s) en élévation mais absent(s) des plans : V2. Soit fenêtres dessinées en élévation mais oubliées en plan, soit fenêtres d'un niveau non-exporté."
+          },
+          {
+            "kind": "opening_count_divergence",
+            "plan_total": 15,
+            "elevation_total": 26,
+            "diff_pct": 73.3,
+            "message": "Plan: 15 INSERT(s) A-GLAZ, Élévations cumulées: 26 → écart 73.3% (seuil warning 20%). Investigation conseillée avant de créer les fenêtres."
+          }
+        ]
+      }
+    },
+    "errors": [],
+    "warnings": [
+      {
+        "check": "scale_drift",
+        "kind": "drift_warning",
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+        "drift_pct": 31.28,
+        "marker_length_m": 14.8435,
+        "coupe_extent_m": 10.2,
+        "message": "Coupe '<P>\\Projet8-Coupe - Coupe 1.dxf': drift 31.3% notable (la coupe inclut souvent du contexte hors-bâtiment)."
+      },
+      {
+        "check": "scale_drift",
+        "kind": "drift_warning",
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "drift_pct": 25.21,
+        "marker_length_m": 22.9967,
+        "coupe_extent_m": 17.2,
+        "message": "Coupe '<P>\\Projet8-Coupe - Coupe 2.dxf': drift 25.2% notable (la coupe inclut souvent du contexte hors-bâtiment)."
+      },
+      {
+        "check": "walls_reconciliation",
+        "kind": "ambiguous_candidates",
+        "plan_wall_index": 6,
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+        "candidate_indices": [
+          3,
+          2
+        ],
+        "primary_thickness_m": 0.2
+      },
+      {
+        "check": "walls_reconciliation",
+        "kind": "no_section_wall_at_x",
+        "plan_wall_index": 10,
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "x_cut_expected_m": -3.4896
+      },
+      {
+        "check": "walls_reconciliation",
+        "kind": "section_walls_unmatched",
+        "count": 17,
+        "samples": [
+          {
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "section_wall_index": 0,
+            "x_cut_m": -1.1745,
+            "thickness_m": 0.2,
+            "y_bottom_m": -0.0,
+            "y_top_m": 0.7862
+          },
+          {
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "section_wall_index": 1,
+            "x_cut_m": -1.1745,
+            "thickness_m": 0.2,
+            "y_bottom_m": 1.2888,
+            "y_top_m": 3.7862
+          },
+          {
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "section_wall_index": 2,
+            "x_cut_m": -1.1745,
+            "thickness_m": 0.2,
+            "y_bottom_m": 4.2888,
+            "y_top_m": 5.75
+          },
+          {
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "section_wall_index": 3,
+            "x_cut_m": 8.8255,
+            "thickness_m": 0.2,
+            "y_bottom_m": 1.2888,
+            "y_top_m": 3.7862
+          },
+          {
+            "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+            "section_wall_index": 4,
+            "x_cut_m": 8.8255,
+            "thickness_m": 0.2,
+            "y_bottom_m": -0.0,
+            "y_top_m": 0.7862
+          }
+        ]
+      },
+      {
+        "check": "openings_matching",
+        "kind": "unmatched_openings",
+        "section_name": "Projet8-Coupe - Coupe 1.dxf",
+        "section_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "message": "Projet8-Coupe - Coupe 1.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+      },
+      {
+        "check": "openings_matching",
+        "kind": "unmatched_openings",
+        "section_name": "Projet8-Coupe - Coupe 2.dxf",
+        "section_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "message": "Projet8-Coupe - Coupe 2.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+      },
+      {
+        "check": "openings_matching",
+        "kind": "unmatched_openings",
+        "section_name": "Projet8-Coupe - Coupe 3.dxf",
+        "section_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "message": "Projet8-Coupe - Coupe 3.dxf: 2 match(es), 4 opening(s) coupe sans plan, 0 opening(s) plan sans coupe."
+      },
+      {
+        "check": "openings_plan_vs_elevation",
+        "kind": "block_ids_missing_in_plan",
+        "block_ids": [
+          "V2"
+        ],
+        "message": "1 block_id(s) présent(s) en élévation mais absent(s) des plans : V2. Soit fenêtres dessinées en élévation mais oubliées en plan, soit fenêtres d'un niveau non-exporté."
+      },
+      {
+        "check": "openings_plan_vs_elevation",
+        "kind": "opening_count_divergence",
+        "plan_total": 15,
+        "elevation_total": 26,
+        "diff_pct": 73.3,
+        "message": "Plan: 15 INSERT(s) A-GLAZ, Élévations cumulées: 26 → écart 73.3% (seuil warning 20%). Investigation conseillée avant de créer les fenêtres."
+      }
+    ],
+    "note": "**Audit avec avertissements** (10 warning(s)). Présenter à l'user via `ui_confirm_choices` pour décider si on continue. Les warnings ne bloquent PAS la création modèle mais doivent être traçables pour la suite (typiquement : openings unmatched, drift d'échelle modéré, niveaux manquants dans certaines coupes)."
+  },
+  "inspect_sections": {
+    "ok": true,
+    "files": [
+      {
+        "path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+        "name": "Projet8-Coupe - Coupe 1.dxf",
+        "kind": "section",
+        "kind_evidence": {
+          "trigger": "A-FLOR-LEVL with horizontal lines",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 98,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": -0.0,
+            "line_x_range_m": [
+              -6.1181,
+              13.8451
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -6.1181,
+              13.8451
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -6.1181,
+              13.8451
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        }
+      },
+      {
+        "path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "name": "Projet8-Coupe - Coupe 2.dxf",
+        "kind": "section",
+        "kind_evidence": {
+          "trigger": "A-FLOR-LEVL with horizontal lines",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 78,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": 0.0,
+            "line_x_range_m": [
+              -20.6415,
+              6.9267
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -20.6415,
+              6.9267
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -20.6415,
+              6.9267
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 6.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        }
+      },
+      {
+        "path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+        "name": "Projet8-Coupe - Coupe 3.dxf",
+        "kind": "section",
+        "kind_evidence": {
+          "trigger": "A-FLOR-LEVL with horizontal lines",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 96,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": 0.0,
+            "line_x_range_m": [
+              -21.35,
+              6.7664
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -21.35,
+              6.7664
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -21.35,
+              6.7664
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 6.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        }
+      },
+      {
+        "path": "<P>\\Projet8-Elévation - Elévation Est.dxf",
+        "name": "Projet8-Elévation - Elévation Est.dxf",
+        "kind": "elevation",
+        "kind_evidence": {
+          "trigger": "filename contains 'elevation' + A-FLOR-LEVL signature",
+          "direction": "Est",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 52,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": -0.0,
+            "line_x_range_m": [
+              -34.5966,
+              17.8026
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -34.5966,
+              17.8026
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -34.5966,
+              17.8026
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 8,
+        "openings_with_id_count": 8,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 5.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 5.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 4,
+          "V2": 2
+        },
+        "direction": "Est",
+        "note": "Unknown DXF type — neither A-FLOR-LEVL nor A-AREA-IDEN signature found. Layers: []"
+      },
+      {
+        "path": "<P>\\Projet8-Elévation - Elévation Nord.dxf",
+        "name": "Projet8-Elévation - Elévation Nord.dxf",
+        "kind": "elevation",
+        "kind_evidence": {
+          "trigger": "filename contains 'elevation' + A-FLOR-LEVL signature",
+          "direction": "Nord",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 44,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": -0.0,
+            "line_x_range_m": [
+              -17.5553,
+              29.5705
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -17.5553,
+              29.5705
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -17.5553,
+              29.5705
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": -6.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        },
+        "direction": "Nord",
+        "note": "Unknown DXF type — neither A-FLOR-LEVL nor A-AREA-IDEN signature found. Layers: []"
+      },
+      {
+        "path": "<P>\\Projet8-Elévation - Elévation Ouest.dxf",
+        "name": "Projet8-Elévation - Elévation Ouest.dxf",
+        "kind": "elevation",
+        "kind_evidence": {
+          "trigger": "filename contains 'elevation' + A-FLOR-LEVL signature",
+          "direction": "Ouest",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 51,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": 0.0,
+            "line_x_range_m": [
+              -22.1109,
+              22.0018
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -22.1109,
+              22.0018
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -22.1109,
+              22.0018
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        },
+        "direction": "Ouest",
+        "note": "Unknown DXF type — neither A-FLOR-LEVL nor A-AREA-IDEN signature found. Layers: []"
+      },
+      {
+        "path": "<P>\\Projet8-Elévation - Elévation Sud.dxf",
+        "name": "Projet8-Elévation - Elévation Sud.dxf",
+        "kind": "elevation",
+        "kind_evidence": {
+          "trigger": "filename contains 'elevation' + A-FLOR-LEVL signature",
+          "direction": "Sud",
+          "lines_count": 3,
+          "mtext_count": 6
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 46,
+        "levels": [
+          {
+            "name": "Niveau 0",
+            "elevation_m": 0.0,
+            "y_dxf_m": 0.0,
+            "line_x_range_m": [
+              -29.576,
+              29.5577
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 1",
+            "elevation_m": 3.0,
+            "y_dxf_m": 3.0,
+            "line_x_range_m": [
+              -29.576,
+              29.5577
+            ],
+            "source": "mtext_label+value"
+          },
+          {
+            "name": "Niveau 2",
+            "elevation_m": 6.0,
+            "y_dxf_m": 6.0,
+            "line_x_range_m": [
+              -29.576,
+              29.5577
+            ],
+            "source": "mtext_label+value"
+          }
+        ],
+        "openings_count": 6,
+        "openings_with_id_count": 6,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 0.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V2",
+            "x_dxf_m": 0.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 6.0,
+            "y_dxf_m": 3.0,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 2,
+          "V1": 2,
+          "V2": 2
+        },
+        "direction": "Sud",
+        "note": "Unknown DXF type — neither A-FLOR-LEVL nor A-AREA-IDEN signature found. Layers: []"
+      },
+      {
+        "path": "<P>\\Projet8-Plan d'étage - Niveau 0.dxf",
+        "name": "Projet8-Plan d'étage - Niveau 0.dxf",
+        "kind": "plan",
+        "kind_evidence": {
+          "trigger": "filename suggests plan + no A-FLOR-LEVL signature",
+          "file_keyword": "plan"
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 77,
+        "openings_count": 5,
+        "openings_with_id_count": 5,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": -15.4896,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 90.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": -6.3896,
+            "y_dxf_m": -1.1745,
+            "rotation_deg": 180.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 0.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": -6.4896,
+            "y_dxf_m": 8.8255,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 5
+        }
+      },
+      {
+        "path": "<P>\\Projet8-Plan d'étage - Niveau 1.dxf",
+        "name": "Projet8-Plan d'étage - Niveau 1.dxf",
+        "kind": "plan",
+        "kind_evidence": {
+          "trigger": "filename suggests plan + no A-FLOR-LEVL signature",
+          "file_keyword": "plan"
+        },
+        "units_factor_to_m": 0.001,
+        "total_entities": 82,
+        "openings_count": 10,
+        "openings_with_id_count": 10,
+        "openings": [
+          {
+            "block_id": "255854",
+            "x_dxf_m": -15.4896,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 90.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": -6.3896,
+            "y_dxf_m": -1.1745,
+            "rotation_deg": 180.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 0.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "255854",
+            "x_dxf_m": -6.4896,
+            "y_dxf_m": 8.8255,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": -6.3896,
+            "y_dxf_m": -1.1745,
+            "rotation_deg": 180.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 0.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": 1.5104,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 270.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": -6.4896,
+            "y_dxf_m": 8.8255,
+            "rotation_deg": 0.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          },
+          {
+            "block_id": "V1",
+            "x_dxf_m": -9.4896,
+            "y_dxf_m": 5.8255,
+            "rotation_deg": 90.0,
+            "width_m": 0.6,
+            "height_m": 0.95
+          }
+        ],
+        "openings_by_block_id": {
+          "255854": 5,
+          "V1": 5
+        }
+      }
+    ],
+    "section_to_plan_matches": [
+      {
+        "section_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+        "section_name": "Projet8-Coupe - Coupe 1.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "distinct_block_ids": [
+          "255854"
+        ]
+      },
+      {
+        "section_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "section_name": "Projet8-Coupe - Coupe 2.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "distinct_block_ids": [
+          "255854"
+        ]
+      },
+      {
+        "section_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+        "section_name": "Projet8-Coupe - Coupe 3.dxf",
+        "match_count": 2,
+        "unmatched_section_count": 4,
+        "unmatched_plan_count": 0,
+        "distinct_block_ids": [
+          "255854"
+        ]
+      }
+    ],
+    "note": "Read-only inspection. To actually create Revit elements, use levels_create_many for niveaux, then dwg_import_walls for the plan walls. Geo-référencement plan↔coupe (mapping x_coupe → axe_plan) reste à demander à l'utilisateur."
+  },
+  "find_section_markers": {
+    "ok": true,
+    "file": "<P>\\Projet8-Plan d'étage - Niveau 0.dxf",
+    "section_count": 3,
+    "elevation_count": 0,
+    "all_inferred_confidently": true,
+    "needs_user_for_view_dir": [],
+    "markers": [
+      {
+        "kind": "section",
+        "p1_m": [
+          -18.7901,
+          5.8423
+        ],
+        "p2_m": [
+          4.2066,
+          5.8423
+        ],
+        "length_m": 22.9967,
+        "is_vertical": false,
+        "is_horizontal": true,
+        "inferred_view_dir": "up",
+        "view_dir_candidates": [
+          "up",
+          "down"
+        ],
+        "associated_blocks": [
+          {
+            "block_name": "Coupe - Extrémité de la ligne de coupe - Pleine-2974-Niveau 0",
+            "x_m": -18.7901,
+            "y_m": 5.8423,
+            "rotation_deg": 0.0,
+            "endpoint": "p1",
+            "kind_detected": "section"
+          }
+        ],
+        "source_layer": "G-ANNO-SYMB"
+      },
+      {
+        "kind": "section",
+        "p1_m": [
+          -18.0816,
+          1.3591
+        ],
+        "p2_m": [
+          4.3669,
+          1.3591
+        ],
+        "length_m": 22.4485,
+        "is_vertical": false,
+        "is_horizontal": true,
+        "inferred_view_dir": "up",
+        "view_dir_candidates": [
+          "up",
+          "down"
+        ],
+        "associated_blocks": [
+          {
+            "block_name": "Coupe - Extrémité de la ligne de coupe - Pleine-2974-Niveau 0",
+            "x_m": -18.0816,
+            "y_m": 1.3591,
+            "rotation_deg": 0.0,
+            "endpoint": "p1",
+            "kind_detected": "section"
+          }
+        ],
+        "source_layer": "G-ANNO-SYMB"
+      },
+      {
+        "kind": "section",
+        "p1_m": [
+          -5.7426,
+          -3.5582
+        ],
+        "p2_m": [
+          -5.7426,
+          11.2853
+        ],
+        "length_m": 14.8435,
+        "is_vertical": true,
+        "is_horizontal": false,
+        "inferred_view_dir": "left",
+        "view_dir_candidates": [
+          "left",
+          "right"
+        ],
+        "associated_blocks": [
+          {
+            "block_name": "Coupe - Extrémité de la ligne de coupe - Pleine-2974-Niveau 0",
+            "x_m": -5.7426,
+            "y_m": -3.5582,
+            "rotation_deg": 89.99999999999991,
+            "endpoint": "p1",
+            "kind_detected": "section"
+          }
+        ],
+        "source_layer": "G-ANNO-SYMB"
+      }
+    ],
+    "note": "Toutes les directions de regard ont été inférées avec confiance depuis la rotation des marqueurs (signal clair dans le DXF). **PROCÉDER DIRECTEMENT** avec `dxf_context_register_section_line` sans demander confirmation user — les directions du dessin sont suffisantes. Ne demander à l'user que si une action ultérieure est destructrice ou ambiguë."
+  },
+  "assign_coupes_to_traits": {
+    "ok": true,
+    "assignment": [
+      {
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+        "coupe_name": "Projet8-Coupe - Coupe 1.dxf",
+        "marker_index": 2,
+        "marker_length_m": 14.8435,
+        "coupe_extent_m": 10.2,
+        "drift_m": 4.6435,
+        "drift_pct": 31.28
+      },
+      {
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 2.dxf",
+        "coupe_name": "Projet8-Coupe - Coupe 2.dxf",
+        "marker_index": 0,
+        "marker_length_m": 22.9967,
+        "coupe_extent_m": 17.2,
+        "drift_m": 5.7967,
+        "drift_pct": 25.21
+      },
+      {
+        "coupe_path": "<P>\\Projet8-Coupe - Coupe 3.dxf",
+        "coupe_name": "Projet8-Coupe - Coupe 3.dxf",
+        "marker_index": 1,
+        "marker_length_m": 22.4485,
+        "coupe_extent_m": 17.2,
+        "drift_m": 5.2485,
+        "drift_pct": 23.38
+      }
+    ],
+    "total_drift_m": 15.6887,
+    "alternative_swaps_drift_m": [
+      15.6887,
+      15.6887,
+      20.4017,
+      20.4017,
+      20.4017,
+      20.4017
+    ],
+    "note": "Assignment optimal par minimum drift total. Si l'ordre est **différent** de l'ordre des `coupe_paths` (ex: coupe_paths[0] → marker_index=1), c'est un swap évité. L'agent doit utiliser ce mapping pour `dxf_context_register_section_line` et `views_link_cad`, pas l'ordre alphabétique des fichiers."
+  },
+  "levels_reconcile_with_dxf": {
+    "ok": true,
+    "coupe_path": "<P>\\Projet8-Coupe - Coupe 1.dxf",
+    "coupe_levels_count": 3,
+    "project_levels_count": 0,
+    "matches": [],
+    "name_only_matches": [],
+    "elev_only_matches": [],
+    "missing_in_project": [
+      {
+        "name": "Niveau 0",
+        "elevation_m": 0.0
+      },
+      {
+        "name": "Niveau 1",
+        "elevation_m": 3.0
+      },
+      {
+        "name": "Niveau 2",
+        "elevation_m": 6.0
+      }
+    ],
+    "extra_in_project": [],
+    "suggested_actions": [
+      {
+        "action": "create_level",
+        "name": "Niveau 0",
+        "elevation_m": 0.0,
+        "rationale": "Niveau présent dans la coupe DXF, absent du projet."
+      },
+      {
+        "action": "create_level",
+        "name": "Niveau 1",
+        "elevation_m": 3.0,
+        "rationale": "Niveau présent dans la coupe DXF, absent du projet."
+      },
+      {
+        "action": "create_level",
+        "name": "Niveau 2",
+        "elevation_m": 6.0,
+        "rationale": "Niveau présent dans la coupe DXF, absent du projet."
+      }
+    ],
+    "alignment_complete": false,
+    "summary_for_dialog": "+ 3 niveau(x) à CRÉER :\n    • Niveau 0 @ 0.00 m\n    • Niveau 1 @ 3.00 m\n    • Niveau 2 @ 6.00 m",
+    "note": "Reconciliation incomplète. **Présenter le `summary_for_dialog` à l'utilisateur via UN SEUL dialog GROUPÉ** (`ui_confirm_choices` avec options 'Appliquer tout', 'Annuler') — pas un dialog par action. Si l'user confirme, appliquer les `suggested_actions` via `levels_create_many` (pour create_level) + `levels_set_elevation`/`levels_set_name` (pour modify/rename) en respectant l'ordre."
+  },
+  "kg_seed": {
+    "levels_created": [
+      {
+        "llm_id": "level_001",
+        "name": "Niveau 0",
+        "elevation": 0.0
+      },
+      {
+        "llm_id": "level_002",
+        "name": "Niveau 1",
+        "elevation": 3.0
+      },
+      {
+        "llm_id": "level_003",
+        "name": "Niveau 2",
+        "elevation": 6.0
+      }
+    ],
+    "section_lines": 3,
+    "linked_views": 9,
+    "files_registered": 9
+  },
+  "extract_wall_thicknesses_many": {
+    "ok": true,
+    "per_file": [
+      {
+        "file_path": "<P>\\Projet8-Plan d'étage - Niveau 0.dxf",
+        "walls_count": 14,
+        "thickness_buckets": [
+          {
+            "cm": 10,
+            "count": 1,
+            "type_name": "DXF_WALL_10cm",
+            "wall_indices": [
+              13
+            ]
+          },
+          {
+            "cm": 20,
+            "count": 13,
+            "type_name": "DXF_WALL_20cm",
+            "wall_indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12
+            ]
+          }
+        ],
+        "rejected_count": 10
+      },
+      {
+        "file_path": "<P>\\Projet8-Plan d'étage - Niveau 1.dxf",
+        "walls_count": 13,
+        "thickness_buckets": [
+          {
+            "cm": 10,
+            "count": 3,
+            "type_name": "DXF_WALL_10cm",
+            "wall_indices": [
+              10,
+              11,
+              12
+            ]
+          },
+          {
+            "cm": 20,
+            "count": 10,
+            "type_name": "DXF_WALL_20cm",
+            "wall_indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ]
+          }
+        ],
+        "rejected_count": 12
+      }
+    ],
+    "global_distribution": [
+      {
+        "cm": 10,
+        "total_count": 4,
+        "files_count": 2,
+        "type_name": "DXF_WALL_10cm"
+      },
+      {
+        "cm": 20,
+        "total_count": 23,
+        "files_count": 2,
+        "type_name": "DXF_WALL_20cm"
+      }
+    ],
+    "distinct_buckets_cm": [
+      10,
+      20
+    ],
+    "bucket_cm": 1
+  },
+  "create_continuous_walls_many": {
+    "ok": true,
+    "files_count": 2,
+    "walls_imported_total": 19,
+    "walls_per_file": {
+      "<P>\\Projet8-Plan d'étage - Niveau 0.dxf": 9,
+      "<P>\\Projet8-Plan d'étage - Niveau 1.dxf": 10
+    },
+    "fusion_events": 7,
+    "fusion_events_detail": [
+      {
+        "gap_m": 2.05,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          -15.48955381009138,
+          8.825473373766348
+        ],
+        "p2": [
+          -0.989553810091396,
+          8.825473373766302
+        ]
+      },
+      {
+        "gap_m": 2.05,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          1.510446189908604,
+          8.825473373766293
+        ],
+        "p2": [
+          1.510446189908603,
+          2.375473373766268
+        ]
+      },
+      {
+        "gap_m": 2.575,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          1.510446189908604,
+          8.825473373766293
+        ],
+        "p2": [
+          1.510446189908603,
+          -1.1745266262337068
+        ]
+      },
+      {
+        "gap_m": 2.05,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          1.5104461899086035,
+          -1.1745266262337064
+        ],
+        "p2": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ]
+      },
+      {
+        "gap_m": 2.05,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          -15.48955381009139,
+          2.8254733737663127
+        ],
+        "p2": [
+          -15.48955381009138,
+          8.825473373766348
+        ]
+      },
+      {
+        "gap_m": 1.575,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          1.510446189908604,
+          8.825473373766293
+        ],
+        "p2": [
+          1.510446189908603,
+          -1.1745266262337068
+        ]
+      },
+      {
+        "gap_m": 2.05,
+        "thickness_m": 0.2,
+        "confidence": 1.0,
+        "p1": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ],
+        "p2": [
+          -9.489553810091387,
+          8.825473373766329
+        ]
+      }
+    ],
+    "walls_filtered_via_vote": 0,
+    "filtered_walls_detail": [],
+    "walls_suspect_low_3d_consensus": [
+      {
+        "llm_id": "wall_004",
+        "p1": [
+          -3.49,
+          2.825
+        ],
+        "p2": [
+          1.41,
+          2.825
+        ],
+        "thickness_m": 0.2,
+        "score": 1,
+        "section_yes": 0,
+        "elevation_yes_confident": 0
+      },
+      {
+        "llm_id": "wall_014",
+        "p1": [
+          -15.39,
+          2.925
+        ],
+        "p2": [
+          -9.39,
+          2.925
+        ],
+        "thickness_m": 0.1,
+        "score": 1,
+        "section_yes": 0,
+        "elevation_yes_confident": 0
+      }
+    ],
+    "walls_score_distribution": {
+      "4": 5,
+      "3": 8,
+      "1": 2,
+      "5": 4
+    },
+    "types_created": 2,
+    "types_reused": 0,
+    "types": [
+      {
+        "thickness_m": 0.2,
+        "name": "DXF_WALL_20cm",
+        "llm_id": "walltype_001",
+        "created": true,
+        "revit_id": null
+      },
+      {
+        "thickness_m": 0.1,
+        "name": "DXF_WALL_10cm",
+        "llm_id": "walltype_002",
+        "created": true,
+        "revit_id": null
+      }
+    ],
+    "elevations_loaded": [
+      "Est",
+      "Nord",
+      "Ouest",
+      "Sud"
+    ],
+    "thickness_distribution_global": {
+      "10cm": 4,
+      "20cm": 15
+    },
+    "inner_walls": {
+      "ok": true,
+      "count": 19,
+      "first_llm_id": "wall_001",
+      "last_llm_id": "wall_019",
+      "contiguous": true,
+      "note": "All 19 llm_ids are contiguous from wall_001 to wall_019. Use catalog_list_<type> or query_get_node(llm_id) for details on any specific one."
+    },
+    "note": "**Walls-only V3.4** : 19 murs continus créés (7 fusions via vote élévation), 2 types DXF custom. **2 suspect(s) à score 3D < 2** (= confirmés seulement par le plan, aucune coupe ni élévation pertinente ne les valide) — `llm_id` exposés pour suppression manuelle ciblée par l'user. Pas d'openings — étape 1 du pipeline décomposé."
+  },
+  "add_openings_to_walls_many": {
+    "ok": true,
+    "plan_openings_detected": 15,
+    "openings_doors_created": 0,
+    "openings_windows_created": 13,
+    "openings_orphan": 0,
+    "openings_unmatched": 0,
+    "openings_oversize_for_wall": 2,
+    "openings_oversize_examples": [
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "host_wall_ref": "wall_015",
+        "wall_length_m": 4.1,
+        "pos_on_wall_m": 1.0,
+        "opening_width_m": 2.1
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "host_wall_ref": "wall_015",
+        "wall_length_m": 4.1,
+        "pos_on_wall_m": 1.0,
+        "opening_width_m": 2.1
+      }
+    ],
+    "orientation_stats": {
+      "EW": 6,
+      "NS": 9,
+      "unknown": 0
+    },
+    "width_source_stats": {
+      "plan_disagrees_with_elev": 15
+    },
+    "sill_source_stats": {
+      "section_elev_match": 15
+    },
+    "width_disagreements": [
+      {
+        "block_id": "255854",
+        "level": 0.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 0.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 0.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 0.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 0.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "255854",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      },
+      {
+        "block_id": "V1",
+        "level": 3.0,
+        "plan_width_m": 2.1,
+        "disagreement_cm": 10.0
+      }
+    ],
+    "sill_disagreements": [],
+    "head_disagreements": [],
+    "elevation_match_stats": {
+      "Nord": 2,
+      "Sud": 2,
+      "Est": 0,
+      "Ouest": 0
+    },
+    "elevation_total_per_direction": {
+      "Est": 6,
+      "Nord": 6,
+      "Sud": 6
+    },
+    "elevation_orphans_per_direction": {
+      "Est": 6,
+      "Nord": 4,
+      "Sud": 4
+    },
+    "elevation_unmatched_plan_count": 11,
+    "elevation_position_disagreements": [],
+    "opening_types_created": 1,
+    "opening_types_reused": 0,
+    "opening_types": [
+      {
+        "ok": true,
+        "llm_id": "familytype_001",
+        "name": "DXF_WIN_210x99cm",
+        "kind": "window",
+        "width_m": 2.1,
+        "height_m": 0.99,
+        "created": true,
+        "revit_id": null
+      }
+    ],
+    "inner_openings": {
+      "ok": true,
+      "count": 13,
+      "first_llm_id": "window_001",
+      "last_llm_id": "window_013",
+      "contiguous": true,
+      "note": "All 13 llm_ids are contiguous from window_001 to window_013. Use catalog_list_<type> or query_get_node(llm_id) for details on any specific one."
+    },
+    "note": "Phase 2b : 0 portes + 13 fenêtres hostées via vote orientation, 1 types DXF custom créés / 0 réutilisés. 0 orphelins (pas de mur hôte trouvé), 0 non matchés, 2 rejetés (trop larges pour leur mur — évite l'erreur Revit 'ne coupent rien'). Orientations : EW=6, NS=9, unknown=0. Cross-val dims plan↔élév : largeur 0match/15désaccord, allège 15match/0désaccord/0élev-fallback, linteau 0désaccord. Cross-val position élév : 11 plan-openings non vus en élévation, 14 inserts élévation orphelins (somme toutes directions), 0 désaccords position > 10cm."
+  },
+  "create_floors_many": {
+    "ok": true,
+    "floors_created_count": 2,
+    "floors_per_level": {
+      "0.0": 1,
+      "3.0": 1
+    },
+    "types_created": 1,
+    "types_reused": 0,
+    "types": [
+      {
+        "ok": true,
+        "llm_id": "floortype_001",
+        "name": "DXF_FLOOR_25cm",
+        "thickness_m": 0.25,
+        "created": true,
+        "revit_id": null
+      }
+    ],
+    "inner_floors": {
+      "ok": true,
+      "count": 2,
+      "llm_ids": [
+        "floor_001",
+        "floor_002"
+      ]
+    },
+    "note": "Phase 2c : 2 sol(s) créé(s) sur 2 niveau(x). 1 FloorType DXF créé(s) / 0 réutilisé(s). Épaisseurs : [25]."
+  },
+  "kg_final": {
+    "Level": [
+      {
+        "llm_id": "level_001",
+        "name": "Niveau 0",
+        "elevation": 0.0
+      },
+      {
+        "llm_id": "level_002",
+        "name": "Niveau 1",
+        "elevation": 3.0
+      },
+      {
+        "llm_id": "level_003",
+        "name": "Niveau 2",
+        "elevation": 6.0
+      }
+    ],
+    "WallType": [
+      {
+        "llm_id": "walltype_001",
+        "name": "DXF_WALL_20cm",
+        "total_thickness": 0.2
+      },
+      {
+        "llm_id": "walltype_002",
+        "name": "DXF_WALL_10cm",
+        "total_thickness": 0.1
+      }
+    ],
+    "Wall": [
+      {
+        "llm_id": "wall_001",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ],
+        "p2": [
+          -9.489553810091394,
+          2.825473373766293
+        ],
+        "length": 4.0,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_002",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -9.489553810091394,
+          2.825473373766293
+        ],
+        "p2": [
+          -15.48955381009139,
+          2.8254733737663127
+        ],
+        "length": 5.9999999999999964,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_003",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -3.4895538100913983,
+          8.725473373766311
+        ],
+        "p2": [
+          -3.489553810091408,
+          2.825473373766273
+        ],
+        "length": 5.900000000000038,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_004",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -3.4895538100914076,
+          2.825473373766273
+        ],
+        "p2": [
+          1.4104461899086034,
+          2.8254733737662585
+        ],
+        "length": 4.900000000000011,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_005",
+        "type_ref": "walltype_002",
+        "level_ref": "level_001",
+        "p1": [
+          -0.989553810091397,
+          8.7254733737663
+        ],
+        "p2": [
+          1.4104461899086025,
+          8.725473373766294
+        ],
+        "length": 2.3999999999999995,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_006",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -15.48955381009138,
+          8.825473373766348
+        ],
+        "p2": [
+          -0.989553810091396,
+          8.825473373766302
+        ],
+        "length": 14.499999999999984,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_007",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          1.510446189908604,
+          8.825473373766293
+        ],
+        "p2": [
+          1.510446189908603,
+          -1.1745266262337068
+        ],
+        "length": 10.0,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_008",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          1.5104461899086035,
+          -1.1745266262337064
+        ],
+        "p2": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ],
+        "length": 11.0,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_009",
+        "type_ref": "walltype_001",
+        "level_ref": "level_001",
+        "p1": [
+          -15.48955381009139,
+          2.8254733737663127
+        ],
+        "p2": [
+          -15.48955381009138,
+          8.825473373766348
+        ],
+        "length": 6.0000000000000355,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_010",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          1.5104461899086035,
+          8.825473373766293
+        ],
+        "p2": [
+          -4.439553810091394,
+          8.825473373766314
+        ],
+        "length": 5.9499999999999975,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_011",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          -15.48955381009138,
+          8.825473373766346
+        ],
+        "p2": [
+          -15.48955381009139,
+          2.8254733737663127
+        ],
+        "length": 6.000000000000034,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_012",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          -3.489553810091408,
+          2.8254733737662727
+        ],
+        "p2": [
+          -3.4895538100913983,
+          8.725473373766311
+        ],
+        "length": 5.9000000000000385,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_013",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          1.410446189908603,
+          2.8254733737662585
+        ],
+        "p2": [
+          -3.489553810091408,
+          2.825473373766273
+        ],
+        "length": 4.900000000000011,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_014",
+        "type_ref": "walltype_002",
+        "level_ref": "level_002",
+        "p1": [
+          -15.389553810091389,
+          2.925473373766312
+        ],
+        "p2": [
+          -9.389553810091392,
+          2.9254733737662932
+        ],
+        "length": 5.9999999999999964,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_015",
+        "type_ref": "walltype_002",
+        "level_ref": "level_002",
+        "p1": [
+          -5.4895538100913885,
+          8.925473373766316
+        ],
+        "p2": [
+          -9.589553810091388,
+          8.925473373766328
+        ],
+        "length": 4.1,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_016",
+        "type_ref": "walltype_002",
+        "level_ref": "level_002",
+        "p1": [
+          -15.38955381009138,
+          8.725473373766349
+        ],
+        "p2": [
+          -4.439553810091395,
+          8.725473373766315
+        ],
+        "length": 10.949999999999985,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_017",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          1.5104461899086035,
+          -1.1745266262337064
+        ],
+        "p2": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ],
+        "length": 11.0,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_018",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          1.510446189908604,
+          8.825473373766293
+        ],
+        "p2": [
+          1.510446189908603,
+          -1.1745266262337068
+        ],
+        "length": 10.0,
+        "height": 3.0
+      },
+      {
+        "llm_id": "wall_019",
+        "type_ref": "walltype_001",
+        "level_ref": "level_002",
+        "p1": [
+          -9.489553810091397,
+          -1.1745266262337068
+        ],
+        "p2": [
+          -9.489553810091387,
+          8.825473373766329
+        ],
+        "length": 10.000000000000036,
+        "height": 3.0
+      }
+    ],
+    "FamilyType": [
+      {
+        "llm_id": "familytype_001",
+        "family_name": "DXF Generic Window",
+        "type_name": "DXF_WIN_210x99cm",
+        "category": "Windows",
+        "dimensions": {
+          "width_m": 2.1,
+          "height_m": 0.99
+        }
+      }
+    ],
+    "Window": [
+      {
+        "llm_id": "window_001",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_009",
+        "position": [
+          -15.489553810091385,
+          5.8255
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_002",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_008",
+        "position": [
+          -6.389600000000001,
+          -1.1745266262337066
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_003",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_007",
+        "position": [
+          1.5104461899086032,
+          0.8254999999999999
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_004",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_007",
+        "position": [
+          1.5104461899086037,
+          5.8255
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_005",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_006",
+        "position": [
+          -6.489600000000001,
+          8.82547337376632
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_006",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_011",
+        "position": [
+          -15.489553810091385,
+          5.8255
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_007",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_017",
+        "position": [
+          -6.389600000000001,
+          -1.1745266262337066
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_008",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_018",
+        "position": [
+          1.5104461899086032,
+          0.8254999999999999
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_009",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_018",
+        "position": [
+          1.5104461899086037,
+          5.8255
+        ],
+        "sill_height": 0.8,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_010",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_017",
+        "position": [
+          -6.389600000000001,
+          -1.1745266262337066
+        ],
+        "sill_height": 0.7605,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_011",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_018",
+        "position": [
+          1.5104461899086032,
+          0.8254999999999999
+        ],
+        "sill_height": 0.7605,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_012",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_018",
+        "position": [
+          1.5104461899086037,
+          5.8255
+        ],
+        "sill_height": 0.7605,
+        "head_height": 0.0
+      },
+      {
+        "llm_id": "window_013",
+        "type_ref": "familytype_001",
+        "host_wall_ref": "wall_019",
+        "position": [
+          -9.48955381009139,
+          5.8255
+        ],
+        "sill_height": 0.7605,
+        "head_height": 0.0
+      }
+    ],
+    "Door": [],
+    "FloorType": [
+      {
+        "llm_id": "floortype_001",
+        "name": "DXF_FLOOR_25cm",
+        "total_thickness": 0.25
+      }
+    ],
+    "Floor": [
+      {
+        "llm_id": "floor_001",
+        "type_ref": "floortype_001",
+        "level_ref": "level_001",
+        "boundary": [
+          [
+            -15.4896,
+            2.8255
+          ],
+          [
+            -9.4896,
+            -1.1745
+          ],
+          [
+            1.5104,
+            -1.1745
+          ],
+          [
+            1.5104,
+            8.8255
+          ],
+          [
+            -15.4896,
+            8.8255
+          ]
+        ],
+        "area_m2": 158.0
+      },
+      {
+        "llm_id": "floor_002",
+        "type_ref": "floortype_001",
+        "level_ref": "level_002",
+        "boundary": [
+          [
+            -15.4896,
+            2.8255
+          ],
+          [
+            -9.4896,
+            -1.1745
+          ],
+          [
+            1.5104,
+            -1.1745
+          ],
+          [
+            1.5104,
+            8.8255
+          ],
+          [
+            -5.4896,
+            8.9255
+          ],
+          [
+            -9.5896,
+            8.9255
+          ],
+          [
+            -15.4896,
+            8.8255
+          ]
+        ],
+        "area_m2": 159.055
+      }
+    ]
+  }
+}
