@@ -52,6 +52,92 @@ plus que `audit + ui_confirm + execute` (4 round-trips au lieu de 13).
   injecte des linked_views synthétiques pour que la fusion vote-élévation
   tourne en mode test → mêmes comptes que runtime Revit.
 
+### Phase D — Trous de dalle (cages d'escalier, patios, atria)
+
+User : « Côté execute, j'ai besoin d'une approche robuste pour la création
+des dalles, qui tienne compte des limites réelles des dalles et des trous
+intérieurs, par exemple pour les cages d'escalier ou les patios. »
+
+#### Décomposition du problème
+
+Deux problèmes orthogonaux :
+1. **Boundary mal tracé** (plans en L, ailes, retraits) — résolu par
+   face-tracing sur graphe de murs. À faire ensuite.
+2. **Trous intérieurs ignorés** (cages, patios) — résolu par détection
+   de closed polylines sur layers AIA dédiés. **Cette phase.**
+
+Le boundary face-tracing est gros (algo planar non-trivial). Les trous
+sont plus déterministes (lecture layer DXF). Impact visuel immédiat :
+sans, la dalle ferme le trou de l'escalier → catastrophe 3D. Donc trous
+en premier.
+
+#### Découverte importante (inspection P7)
+
+DXF n'a pas d'objet « Floor ». C'est un format primitive. La sémantique
+vient de la convention de **nom de layer** + closure des polylignes.
+`HATCH` aurait pu encoder un sol avec outer + inner paths nativement
+(structure parfaite pour notre cas), mais **Revit AIA n'exporte JAMAIS
+en HATCH** — 0 hatches dans P7. Il exporte des LINEs et LWPOLYLINEs.
+
+De plus, P7 N1 a 2 LINEs sur layer `A-FLOR` mais ce ne sont PAS le
+contour du sol — ce sont des saillies/balcons. Le contour extérieur
+n'est pas exportable directement du DXF, doit être tracé depuis le
+graphe des murs (motivation pour face-tracing en Phase E).
+
+#### Architecture livrée
+
+3 commits thématiques :
+
+**Commit 1 — API holes** (`e66df62`) :
+- `dwg_section_reader.FloorHole` dataclass + `read_floor_holes_from_plan(entities)` :
+  détecte les closed polylines sur layers AIA dédiés (`A-FLOR-STAIR`,
+  `A-FLOR-OPEN`, `A-FLOR-PATIO`, `A-FLOR-ATRIUM`) ou via keywords
+  fallback français (`escalier`/`trémie`/`patio`/`cour`/`atrium`/`trou`).
+  Exclut `A-FLOR-OVHD` (projections, NOT a hole) par défaut.
+- `project_kg.Floor.holes` (attr optionnel, ajout schema)
+- `floors.create_many` : accepte `holes` optionnel dans chaque item,
+  ajoute les hole loops à la `ClrList[CurveLoop]` AVANT `Floor.Create`,
+  aire nette = outer − Σ holes
+- Fixture synthétique `tests/fixtures/synthetic_holes/floor_with_holes.dxf`
+  (généré via `generate.py`) : rectangle 12×8m + trémie 2×3m + patio
+  2×2m + bruit OVHD
+- 10 tests dans `tests/test_floor_holes.py` (read_floor_holes,
+  create_many avec holes, area nette, validation, keyword fallback,
+  skip open polylines, skip < 3 vertices)
+
+**Commit 2 — Pipeline integration** (`d2269bd`) :
+- `_collect_floor_holes_per_level(kg)` dans `dwg_import.py` : lit chaque
+  plan référencé dans DxfImportContext.files, mappe à son level via
+  `_plan_path_to_level_elev`, accumule holes par élévation
+- `create_floors_many` intègre holes dans la pipeline (collected once,
+  passed through to floors_create_many sub-tool)
+- Nouveau champ retour `holes_count_by_kind` (compteur par kind)
+- `_meta_phase2c_floors` surface holes dans le résumé
+- `dev_import_execute` pushbutton affiche les trous dans le dialog
+- Golden P7 régénéré (champ ajouté, P7 = {} car pas de trous)
+
+#### Validation
+
+- P7 : 0 trous détectés (correct, bâtiment simple sans circulation).
+- Synthetic fixture : 2 trous détectés (stair + patio), 0 false
+  positive sur P7 (qui a des LINEs sur A-FLOR — saillies/balcons, pas
+  des trous), keyword fallback français passe, skip open polylines +
+  < 3 vertices.
+- 631 tests verts (621 → 631 = +10 floor_holes tests).
+
+#### Reste à faire (Phase E suivante)
+
+- **Boundary face-tracing** : algorithme planar face-tracing sur le
+  graphe de murs pour tracer le vrai contour extérieur (vs convex
+  hull actuel qui fail pour plans en L). Cf. task #27 ouvert.
+- **Test end-to-end avec un projet réel** ayant cages/patios : user
+  va créer un fichier test. Le code marchera grâce à la convention
+  AIA standard et au fallback keywords.
+- **Holes avec arcs (bulges)** : V0 ignore les bulges dans les
+  polylignes. Si une trémie/patio a un coin arrondi → segmenté en
+  droite. À traiter via `ezdxf.LWPolyline.virtual_entities()` si
+  besoin.
+
 ### Phase A — Règle de pré-validation pushbutton (process)
 
 Suite des crashes Refresh KG en début de session, l'user a formalisé une
