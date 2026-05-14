@@ -1,0 +1,6 @@
+title: Reset DXF
+tooltip: |
+  Soft-delete tous les Wall/Window/Door/Floor + types DXF_* dans le KG et Revit.
+  Préserve Levels, Rooms, DxfImportContext, Views.
+  Confirmation requise avant suppression.
+author: Lauro Foletti
