@@ -338,11 +338,6 @@ Supprimés. Restent dans `LLM.tab/development.panel/` :
   (detect+report) ou B (auto-creation StairsEditScope fragile).
 - **Toitures pentues** — actuellement dalle plate au niveau max,
   pas de vraie `Roof` Revit.
-- **Convention X axis ambiguë (0 mur croisé)** : pour Coupe 3 de
-  P2, détection a abouti à `identity` par défaut (ambiguous, 0 mur).
-  Si convention réelle = reversed → mirror appliqué dans le mauvais
-  sens. À mitiger en V1 (fallback : tester aussi avec sols / poteaux
-  pour confidence supplémentaire, ou warning visible).
 - **Module `wall_inter_level_dedup`** conservé dead-code mais avec
   20 tests. À utiliser comme outillage d'audit (pas auto-suppression)
   dans une future itération.
@@ -350,6 +345,69 @@ Supprimés. Restent dans `LLM.tab/development.panel/` :
   code est conservé mais Revit l'ignore (cf. Phase E). Pourrait
   être retiré ; gardé comme documentation du bug et pour le
   diagnostic `intended vs actual`.
+
+### Phase F — Auto-détection Y extent ViewSections (commit `e503ab1`)
+
+User a montré une vue Revit où le contenu DXF (semelles de fondation
+en vert) débordait sous le `bottom_elev_m=0` par défaut, hors du
+frustum officiel. Trait observé : « la hauteur des viewsections
+pourrait correspondre à celles des dxf ».
+
+Fix : `_coupe_y_extent_m(path)` lit le Y bbox des LINEs A-WALL ∪
+A-FLOR ∪ A-FLOR-LEVL ∪ S-COLS ∪ S-STRS du DXF coupe. `_meta_create_
+section_views` set per-item `bottom_elev_m = Y_min - 0.5m`,
+`top_elev_m = Y_max + 0.5m`. `views.create_section_many` accepte les
+2 params per-item avec fallback aux top-level params (backward compat).
+P2 : extent détecté `(-0.75, +6.5)` → bottom passe de 0 à -0.75 →
+fondations sous Z=0 incluses.
+
+### Phase G — Fix mirror Coupe 3 P2 + détection bbox fallback (commits `7d6d74d`, `e61673c`)
+
+User a observé après run avec orientations + Y extent : Coupe 3
+P2 toujours miroitée (« je confirme, elle est miroitée »).
+
+#### Cause racine
+
+Coupe 3 = trait transversal à X=-1.23 (= EST de la dalle qui s'étend
+de X=-13.52 à X=-2.83). Donc trait hors-bâtiment → 0 mur croisé.
+`detect_section_x_axis_convention` retourne `walls_crossed=0,
+confidence=0.0`, le code defaultait à `"identity"` → calculait
+`basis_x_match=False` → mirror appliqué à tort. Convention réelle
+= `reversed` (comme Coupe 2, source Revit cohérent).
+
+#### Fix conservateur (commit `7d6d74d`)
+
+Quand détection ambiguë (`walls_crossed=0` ou `confidence<0.1`) :
+set `x_axis_convention=None` au lieu de `"identity"`. Avec None,
+`need_mirror=False` → pas de flip, Revit fait son default (= la
+convention qui marche en pratique pour les transversales de P2).
+
+#### Fix positif (commit `e61673c`) — extension bbox
+
+User : « je pense qu'il faut étendre à floor slabs ». Implémenté
+`dwg_coherence.detect_x_axis_convention_via_bbox(plan_extent_along
+_trait, coupe_x_extent)` : compare bbox A-FLOR + A-WALL en coupe
+au Y/X bbox plan (= projection sur l'axe perpendiculaire au trait).
+Sur P2 Coupe 3 : plan Y=[-6.99, 9.01], coupe A-FLOR X=[-9.01, 6.99]
+= exactement le négatif → détection `reversed` sans aucun mur croisé.
+
+Intégré dans `dwg_detect_section_orientations` comme fallback quand
+walls_crossed=0. Audit consomme par priorité : walls > bbox > None.
+Diagnostic enrichi : `bbox_signal` + `source` (`walls`/`bbox`/`none`).
+
+### État final & reste à faire (mise à jour)
+
+- 4 commits pushés sur origin/main : `825b123`, `e503ab1`,
+  `7d6d74d`, `e61673c`.
+- 732 tests verts (vs 729 fin Phase E).
+- P2 import complet : 12 murs / 12 fenêtres / 3 sols / 90 poteaux
+  / 4 coupes (orientations correctes, Y extent matchant DXF).
+- Toutes les conventions X axis P2 détectées positivement
+  (Coupe 1 identity, 2/3/4 reversed) — plus de `None` ambigu.
+
+Reste ouvert pour V1+ : escaliers (parenthèse non-fermée), UC8
+compliance, toitures pentues, élévation côté validation 3D
+(actuellement coupes seules pour les colonnes).
 
 ---
 
