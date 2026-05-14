@@ -1,0 +1,6 @@
+title: DEV Audit Import
+tooltip: |
+  Pré-validation manuelle de `dwg_import_project_audit(directory)`.
+  Folder picker → run audit read-only → affiche plan consolidé.
+  Stage 2 de la validation (cf. CLAUDE.md "Process de développement").
+author: Lauro Foletti

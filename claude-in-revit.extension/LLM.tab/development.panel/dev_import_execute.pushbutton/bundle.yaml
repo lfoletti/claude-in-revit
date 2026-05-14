@@ -1,0 +1,7 @@
+title: DEV Execute Import
+tooltip: |
+  Pré-validation manuelle de `dwg_import_project_execute(directory, level_actions)`.
+  Folder picker → run audit → confirme actions niveaux → run execute → affiche résumé.
+  Stage 2 de la validation (cf. CLAUDE.md "Process de développement").
+  ATTENTION : crée des éléments Revit. Undo (Ctrl+Z) pour annuler après inspection.
+author: Lauro Foletti
