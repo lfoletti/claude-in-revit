@@ -54,6 +54,20 @@ def _shoelace_area(boundary: List[List[float]]) -> float:
     return abs(s) / 2.0
 
 
+def _net_floor_area(
+    outer: List[List[float]],
+    holes: Optional[List[List[List[float]]]] = None,
+) -> float:
+    """Aire nette = outer_area − Σ hole_areas. Approximation : suppose que
+    chaque hole est entièrement contenu dans l'outer (pas de débordement) ;
+    Revit fail de toute façon à la création si ce n'est pas le cas.
+    """
+    a = _shoelace_area(outer)
+    if holes:
+        a -= sum(_shoelace_area(h) for h in holes)
+    return max(a, 0.0)
+
+
 def _validate_boundary(boundary: Any, item_idx: Optional[int] = None) -> List[List[float]]:
     """Validate + normalise: list of [x, y] pairs in m.
 
@@ -98,14 +112,22 @@ def _record_in_kg(
     floor_type_ref: str,
     boundary: List[List[float]],
     area_m2: float,
+    holes: Optional[List[List[List[float]]]] = None,
 ) -> str:
-    """KG-side creation. Returns the new floor's llm_id."""
-    llm_id = kg.add_node("Floor", {
+    """KG-side creation. Returns the new floor's llm_id.
+
+    `holes` : optionnel, liste de polylignes fermées dans le plan. Stocké
+    en attr optionnel si non-vide ; sinon omis (dalle pleine).
+    """
+    attrs: Dict[str, Any] = {
         "type_ref": floor_type_ref,
         "level_ref": level_ref,
         "boundary": [list(p) for p in boundary],
         "area_m2": float(area_m2),
-    })
+    }
+    if holes:
+        attrs["holes"] = [[list(p) for p in h] for h in holes]
+    llm_id = kg.add_node("Floor", attrs)
     kg.add_edge(llm_id, level_ref, "at_level")
     kg.add_edge(llm_id, floor_type_ref, "is_type")
     return llm_id
@@ -134,6 +156,7 @@ def _validate_floor_item(kg: ProjectKG, item: Any, idx: int) -> Dict[str, Any]:
     level_ref = item.get("level_ref")
     floor_type_ref = item.get("floor_type_ref")
     boundary = item.get("boundary")
+    holes_raw = item.get("holes") or []
     if not level_ref or not isinstance(level_ref, str):
         raise ValueError("items[{}]: level_ref required (str)".format(idx))
     if not floor_type_ref or not isinstance(floor_type_ref, str):
@@ -147,10 +170,23 @@ def _validate_floor_item(kg: ProjectKG, item: Any, idx: int) -> Dict[str, Any]:
             "items[{}]: unknown floor_type_ref {}".format(idx, floor_type_ref)
         )
     normalised_boundary = _validate_boundary(boundary, item_idx=idx)
+    # holes : optional list of polylines (each closed, ≥ 3 vertices). Validés
+    # via le même _validate_boundary que l'outer (mêmes contraintes).
+    if not isinstance(holes_raw, list):
+        raise ValueError("items[{}]: holes must be a list".format(idx))
+    normalised_holes: List[List[List[float]]] = []
+    for h_idx, h in enumerate(holes_raw):
+        try:
+            normalised_holes.append(_validate_boundary(h, item_idx=idx))
+        except ValueError as exc:
+            raise ValueError(
+                "items[{}].holes[{}]: {}".format(idx, h_idx, exc)
+            ) from exc
     return {
         "level_ref": level_ref,
         "floor_type_ref": floor_type_ref,
         "boundary": normalised_boundary,
+        "holes": normalised_holes,
     }
 
 
@@ -323,13 +359,14 @@ def create_many(
     if doc is None:
         llm_ids: List[str] = []
         for spec in specs:
-            area = _shoelace_area(spec["boundary"])
+            area = _net_floor_area(spec["boundary"], spec.get("holes"))
             llm_ids.append(_record_in_kg(
                 kg,
                 level_ref=spec["level_ref"],
                 floor_type_ref=spec["floor_type_ref"],
                 boundary=spec["boundary"],
                 area_m2=area,
+                holes=spec.get("holes") or None,
             ))
         return bulk_summary(llm_ids)
 
@@ -358,16 +395,20 @@ def create_many(
             level_eid = ElementId(kg.get_revit_id(spec["level_ref"]))
             ft_eid = ElementId(kg.get_revit_id(spec["floor_type_ref"]))
             loops = ClrList[CurveLoop]()
+            # Outer boundary en premier (convention Floor.Create), holes ensuite.
             loops.Add(_build_curve_loop(spec["boundary"]))
+            for h in spec.get("holes") or []:
+                loops.Add(_build_curve_loop(h))
             floor = Floor.Create(doc, loops, ft_eid, level_eid)
             revit_id = int(floor.Id.Value)
-            area = _shoelace_area(spec["boundary"])
+            area = _net_floor_area(spec["boundary"], spec.get("holes"))
             llm_id = _record_in_kg(
                 kg,
                 level_ref=spec["level_ref"],
                 floor_type_ref=spec["floor_type_ref"],
                 boundary=spec["boundary"],
                 area_m2=area,
+                holes=spec.get("holes") or None,
             )
             kg.set_revit_id(llm_id, revit_id)
             stamp_llm_id(floor, llm_id)

@@ -1147,6 +1147,134 @@ class SectionFloorSlab:
     x_max_m: float
 
 
+# ----- Floor holes (Phase 2c, V2 : trémies / patios / atria) -----------
+
+
+@dataclass
+class FloorHole:
+    """Une closed polyline lue sur un layer de trou dans un plan DXF.
+
+    Le `kind` est inféré du nom de layer :
+    - `"stair"` (cage d'escalier, trémie) — `A-FLOR-STAIR` ou contient "stair"/"escalier"/"trémie".
+    - `"opening"` (trou générique, conduit, etc.) — `A-FLOR-OPEN` ou "open"/"trou".
+    - `"patio"` (cour intérieure) — `A-FLOR-PATIO` ou "patio"/"cour".
+    - `"atrium"` — `A-FLOR-ATRIUM` ou "atrium".
+    - `"overhead"` — `A-FLOR-OVHD` ou "ovhd"/"overhead"/"soffite" : projection
+      d'un élément en surplomb, **PAS UN TROU**. Capté ici par sécurité +
+      preview, mais le caller doit exclure via `include_overhead=False`.
+
+    `points` : sommets (x_m, y_m) dans le plan. Le contour est implicitement
+    fermé (le dernier point reboucle sur le premier, comme une LWPOLYLINE
+    `closed=True`).
+    """
+    layer: str
+    kind: str
+    points: List[Tuple[float, float]]
+    is_overhead: bool = False
+
+
+# Mapping layer AIA exact → kind. Insensible à la casse (matched .upper()).
+_FLOOR_HOLE_LAYERS_AIA: Dict[str, str] = {
+    "A-FLOR-STAIR": "stair",
+    "A-FLOR-OPEN":  "opening",
+    "A-FLOR-PATIO": "patio",
+    "A-FLOR-ATRIUM": "atrium",
+    "A-FLOR-OVHD":  "overhead",  # NOT a hole — caller filters.
+}
+
+# Fallback : keywords matched dans le nom de layer (lower-case). Ordre
+# important : check "trémie" / "escalier" AVANT "overhead" pour éviter
+# mismatch sur des noms comme "ESCALIER-OVHD".
+_FLOOR_HOLE_KEYWORDS: List[Tuple[str, str]] = [
+    ("stair", "stair"),
+    ("escalier", "stair"),
+    ("tremie", "stair"),
+    ("trémie", "stair"),
+    ("patio", "patio"),
+    ("cour", "patio"),
+    ("atrium", "atrium"),
+    ("opening", "opening"),
+    ("trou", "opening"),
+    ("ovhd", "overhead"),
+    ("overhead", "overhead"),
+    ("soffite", "overhead"),
+]
+
+
+def read_floor_holes_from_plan(
+    entities: List[DwgEntity],
+    *,
+    include_overhead: bool = False,
+    min_vertices: int = 3,
+) -> List[FloorHole]:
+    """Énumère les closed polylines marquant des trous dans la dalle.
+
+    DXF n'a pas d'objet "Floor" structuré — un trou de dalle est conventionnellement
+    une `LWPOLYLINE` (ou `POLYLINE`) **fermée** sur un layer AIA dédié
+    (`A-FLOR-STAIR`, `A-FLOR-OPEN`, etc.). Cette fonction collecte ces polylignes
+    et infère leur sémantique depuis le nom de layer (match exact AIA, fallback
+    mots-clés pour exports non-standard).
+
+    Args:
+        entities: liste des `DwgEntity` du plan, telle que retournée par
+            `dwg_reader.parse(plan_path)[0]`.
+        include_overhead: si False (défaut), filtre `A-FLOR-OVHD` (projections
+            d'éléments en surplomb — ne sont PAS des trous de dalle).
+        min_vertices: minimum de sommets pour considérer la polyligne valide
+            (3 = triangle, sécurité contre les artefacts de polyligne dégénérée).
+
+    Returns:
+        Liste de `FloorHole`. Vide si aucun trou détecté (cas P7 simple).
+
+    Limitations V0 :
+    - Ignore les bulges (arcs paramétrés dans les polylignes) — le contour
+      est approximé en segments droits. Suffisant pour escaliers / patios
+      rectangulaires ; à étendre si besoin de courbes.
+    - Ignore les entités `HATCH` (qui auraient pu encoder outer+inner natif
+      mais que Revit AIA n'utilise pas en pratique — vérifié sur P7).
+    - Suppose que chaque polyligne fermée sur un layer hole est UN trou
+      indépendant. Pas de logique de regroupement (trous concentriques, etc.).
+    """
+    holes: List[FloorHole] = []
+    for e in entities:
+        if e.kind not in ("LWPOLYLINE", "POLYLINE"):
+            continue
+        if not e.attrs.get("closed"):
+            continue
+        if len(e.coords) < min_vertices:
+            continue
+
+        layer = e.layer
+        layer_upper = layer.upper()
+        layer_lower = layer.lower()
+        kind: Optional[str] = None
+
+        # Pass 1 : exact AIA layer name (case-insensitive).
+        if layer_upper in _FLOOR_HOLE_LAYERS_AIA:
+            kind = _FLOOR_HOLE_LAYERS_AIA[layer_upper]
+        else:
+            # Pass 2 : keyword fallback.
+            for kw, k in _FLOOR_HOLE_KEYWORDS:
+                if kw in layer_lower:
+                    kind = k
+                    break
+
+        if kind is None:
+            continue
+
+        is_overhead = kind == "overhead"
+        if is_overhead and not include_overhead:
+            continue
+
+        # Strip Z, keep (x, y).
+        pts = [(float(p[0]), float(p[1])) for p in e.coords]
+        holes.append(FloorHole(
+            layer=layer, kind=kind, points=pts, is_overhead=is_overhead,
+        ))
+
+    return holes
+
+
 def read_section_floor_slabs(
     entities: List[DwgEntity],
     min_thickness_m: float = 0.05,

@@ -55,7 +55,12 @@ NODE_TYPES: Dict[str, Dict[str, Set[str]]] = {
     # (`HOST_AREA_COMPUTED`).
     "Floor": {
         "required": {"type_ref", "level_ref", "boundary", "area_m2"},
-        "optional": set(),
+        # `holes` : liste de polylignes fermées (trous : cages d'escalier,
+        # patios, atria) en mètres dans le plan du level. Index 0 du Floor
+        # Revit-side = outer boundary, holes indices > 0. Si absent ou [],
+        # dalle pleine (cas P7). cf. `dwg_section_reader.FloorHole` +
+        # JOURNAL session w Phase D.
+        "optional": {"holes"},
     },
     # FloorType — un FloorType Revit. `total_thickness` est en mètres,
     # parallèle à WallType. Différencié de WallType pour que
