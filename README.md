@@ -59,4 +59,4 @@ Le runtime de production cible PyRevit dans Revit ; la `.venv` locale sert pour 
 
 ## Licence
 
-À définir.
+MIT
