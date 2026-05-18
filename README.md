@@ -1,4 +1,4 @@
-# Claude in Revit                                                                 
+# Claude in Revit (en chantier)                                                                
 
 `claude-in-revit` est une extension PyRevit pensée comme un point de rencontre entre le modèle BIM et des corpus externes — réglementations, typologies architecturales, références projet — compilés sous forme de graphes. L'agent les traverse pour produire des réponses qu'aucune macro ne sortirait : audits de conformité circonstanciés avec citations, croisements multi-corpus, programmes argumentés contre référentiel. Le LLM y agit moins en exécuteur qu'en *liant* entre BIM, règle métier et corpus de référence — les capacités d'orchestration des modèles récents (chaînage d'outils, raisonnement sur corpus longs) rendent possible cette approche aujourd'hui.
 
